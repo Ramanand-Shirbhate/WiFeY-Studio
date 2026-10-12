@@ -1,0 +1,9 @@
+# Security
+.env
+
+# PyInstaller & Build Caches
+build/
+dist/
+build_cache/
+core_cache/
+*.spec

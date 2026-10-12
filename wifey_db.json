@@ -1,0 +1,22 @@
+{
+    "devices": {
+        "node_1": {
+            "fleet": "Ramanand",
+            "version": "v_base_001",
+            "last_seen": 1791607026.309042,
+            "auth_token": "secret_abc123"
+        },
+        "node_2": {
+            "fleet": "Ramanand",
+            "version": "v_base_001",
+            "last_seen": 1791606810.3999279,
+            "auth_token": "secret_abc123"
+        }
+    },
+    "manifest": {
+        "Ramanand": {
+            "fleet_version": "v_3df20641",
+            "nodes": {}
+        }
+    }
+}
