@@ -22,7 +22,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- WINDOWS SUBPROCESS NO-CONSOLE FLAG ---
-# Prevents black CMD windows from flashing when the app runs hidden.
 CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 
 # --- AUTOMATED DEPENDENCY SETUP STATE ---
@@ -35,13 +34,52 @@ SETUP_STATE = {
     "cli_path": None
 }
 
+def create_windows_shortcuts():
+    """Silently creates Desktop and Start Menu shortcuts on Windows."""
+    if os.name != 'nt':
+        return 
+        
+    # Only create shortcuts if running as a compiled .exe
+    if not getattr(sys, 'frozen', False):
+        return 
+
+    exe_path = sys.executable
+    
+    # Use VBScript to reliably find the Desktop and Start Menu across all Windows languages
+    vbs_script = f"""
+    Set oWS = WScript.CreateObject("WScript.Shell")
+    sDesktop = oWS.SpecialFolders("Desktop")
+    sPrograms = oWS.SpecialFolders("Programs")
+    
+    Set oLink = oWS.CreateShortcut(sDesktop & "\\WiFeY Studio.lnk")
+    oLink.TargetPath = "{exe_path}"
+    oLink.WorkingDirectory = "{os.path.dirname(exe_path)}"
+    oLink.Description = "WiFeY Studio OTA Compiler"
+    oLink.Save
+    
+    Set oLink2 = oWS.CreateShortcut(sPrograms & "\\WiFeY Studio.lnk")
+    oLink2.TargetPath = "{exe_path}"
+    oLink2.WorkingDirectory = "{os.path.dirname(exe_path)}"
+    oLink2.Description = "WiFeY Studio OTA Compiler"
+    oLink2.Save
+    """
+    
+    vbs_path = os.path.join(os.environ.get('TEMP', os.getcwd()), 'create_wifey_shortcut.vbs')
+    try:
+        with open(vbs_path, 'w') as f:
+            f.write(vbs_script)
+        # Run the script silently
+        subprocess.run(['cscript.exe', '//Nologo', vbs_path], creationflags=CREATE_NO_WINDOW)
+        os.remove(vbs_path)
+    except Exception as e:
+        pass # Fail silently to prevent crashing the installer
+
 def download_file_with_progress(url, dest):
     def hook(count, block_size, total_size):
         if total_size > 0:
             percent = int(count * block_size * 100 / total_size)
             SETUP_STATE["progress"] = min(100, percent)
     
-    # Bypasses local certificate issues often encountered in compiled PyInstaller bundles
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -52,7 +90,6 @@ def setup_environment_thread():
         SETUP_STATE["stage"] = "Checking for Arduino CLI..."
         cli_global = shutil.which("arduino-cli")
         
-        # Isolate the installation to the user's hidden AppData folder
         LOCAL_APP_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'WiFeY_Studio')
         os.makedirs(LOCAL_APP_DIR, exist_ok=True)
         LOCAL_CLI_PATH = os.path.join(LOCAL_APP_DIR, 'arduino-cli.exe')
@@ -80,7 +117,6 @@ def setup_environment_thread():
         SETUP_STATE["cli_path"] = cli_executable
         SETUP_STATE["progress"] = 100
         
-        # Configure ESP32 Architecture natively
         SETUP_STATE["stage"] = "Configuring ESP32 Board Manager..."
         subprocess.run([cli_executable, "config", "init"], capture_output=True, creationflags=CREATE_NO_WINDOW) 
         subprocess.run([cli_executable, "config", "set", "board_manager.additional_urls", "https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json"], capture_output=True, creationflags=CREATE_NO_WINDOW)
@@ -106,6 +142,10 @@ def setup_environment_thread():
                 SETUP_STATE["log"] += line
             process.wait()
             
+        # --- NEW SHORTCUT CREATION CALL ---
+        SETUP_STATE["stage"] = "Creating App Shortcuts..."
+        create_windows_shortcuts()
+        
         SETUP_STATE["stage"] = "Setup Complete!"
         SETUP_STATE["progress"] = 100
         SETUP_STATE["log"] += "\nAll dependencies verified! Launching WiFeY Studio...\n"
@@ -846,7 +886,6 @@ PROVISION_HTML = """
 
 @app.route('/')
 def index():
-    # Show loading screen on first run, redirect to IDE otherwise
     if not SETUP_STATE["done"]:
         return render_template_string(SETUP_HTML)
     return render_template_string(IDE_HTML, ngrok_url=NGROK_URL)
@@ -970,7 +1009,6 @@ def compile_code():
         else:
             final_code = user_code if is_wrapped else generate_wrapped_code(ssid, passw, api_url, topic, user_code, version_id)
             
-            # Using the localized isolated CLI executable downloaded during setup!
             cli_path = SETUP_STATE["cli_path"]
             fqbn = "esp32:esp32:esp32"
             
@@ -987,7 +1025,6 @@ def compile_code():
                 output_dir = os.path.join(temp_dir, "output")
                 os.makedirs(output_dir, exist_ok=True)
 
-                # Added CREATE_NO_WINDOW to prevent sudden black CMD windows popups on the user's screen
                 compile_res = subprocess.run([cli_path, "compile", "--fqbn", fqbn, "--build-cache-path", CORE_CACHE_DIR, "--output-dir", output_dir, sketch_file], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
                 if compile_res.returncode != 0: 
                     return jsonify({"logs": "\n".join(logs) + "\n\n❌ COMPILATION FAILED:\n" + compile_res.stderr})
@@ -1082,26 +1119,22 @@ def flash_route():
 if __name__ == '__main__':
     import webview
     
-    # 1. Prevent PyInstaller stdout crash
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w")
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w")
 
-    # 2. Start Flask Server in background
     def start_server():
         app.run(host='127.0.0.1', port=5000, debug=False, use_reloader=False)
 
     server_thread = threading.Thread(target=start_server, daemon=True)
     server_thread.start()
 
-    # 3. Start Automated Dependency Setup in background
     setup_thread = threading.Thread(target=setup_environment_thread, daemon=True)
     setup_thread.start()
 
     time.sleep(1.0)
 
-    # 4. Launch Native Desktop Window (Increased sizes to fit 1.3 zoom)
     webview.create_window(
         title='WiFeY Studio', 
         url='http://127.0.0.1:5000', 
