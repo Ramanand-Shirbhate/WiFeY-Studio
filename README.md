@@ -17,8 +17,7 @@ Built with a hybrid Python/Flask backend and a native desktop UI (via PyWebView)
 ## ⚙️ Configuration (Required)
 
 Because this tool interacts with secure cloud infrastructure, you must provide your own API keys. 
-
-**Do not upload your keys to GitHub!** Create a file named `.env` in the exact same directory as your script (or `.exe`) and add your credentials:
+Create a file named `.env` in the exact same directory as your script (or `.exe`) and add your credentials:
 
 ```env
 # .env
