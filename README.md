@@ -37,7 +37,7 @@ WiFeY Studio is an open-source, lightweight desktop IDE and Over-The-Air (OTA) m
                                                 │
                                          (Pre-Signed URL)
                                                 │
-  ┌───────────────────┐   Manifest Check       │
+  ┌───────────────────┐   Manifest Check        │
   │    ESP32 Node     │ ────────────────────────┘
   │ (Pull OTA Client) │ <--- Download Binary
   └───────────────────┘
