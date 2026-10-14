@@ -14,7 +14,7 @@ import urllib.request
 import ssl
 import serial
 import serial.tools.list_ports
-from flask import Flask, render_template_string, request, jsonify, Response
+from flask import Flask, render_template_string, request, jsonify, Response, send_file
 import boto3
 from botocore.config import Config
 from dotenv import load_dotenv
@@ -35,17 +35,12 @@ SETUP_STATE = {
 }
 
 def create_windows_shortcuts():
-    """Silently creates Desktop and Start Menu shortcuts on Windows."""
     if os.name != 'nt':
         return 
-        
-    # Only create shortcuts if running as a compiled .exe
     if not getattr(sys, 'frozen', False):
         return 
 
     exe_path = sys.executable
-    
-    # Use VBScript to reliably find the Desktop and Start Menu across all Windows languages
     vbs_script = f"""
     Set oWS = WScript.CreateObject("WScript.Shell")
     sDesktop = oWS.SpecialFolders("Desktop")
@@ -63,16 +58,14 @@ def create_windows_shortcuts():
     oLink2.Description = "WiFeY Studio OTA Compiler"
     oLink2.Save
     """
-    
     vbs_path = os.path.join(os.environ.get('TEMP', os.getcwd()), 'create_wifey_shortcut.vbs')
     try:
         with open(vbs_path, 'w') as f:
             f.write(vbs_script)
-        # Run the script silently
         subprocess.run(['cscript.exe', '//Nologo', vbs_path], creationflags=CREATE_NO_WINDOW)
         os.remove(vbs_path)
     except Exception as e:
-        pass # Fail silently to prevent crashing the installer
+        pass 
 
 def download_file_with_progress(url, dest):
     def hook(count, block_size, total_size):
@@ -142,7 +135,6 @@ def setup_environment_thread():
                 SETUP_STATE["log"] += line
             process.wait()
             
-        # --- NEW SHORTCUT CREATION CALL ---
         SETUP_STATE["stage"] = "Creating App Shortcuts..."
         create_windows_shortcuts()
         
@@ -177,16 +169,8 @@ R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 R2_BUCKET = os.getenv("R2_BUCKET", "wifey-firmware")
 
-CACHE_DIR = os.path.join(os.getcwd(), "build_cache")
 CORE_CACHE_DIR = os.path.join(os.getcwd(), "core_cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(CORE_CACHE_DIR, exist_ok=True)
-
-COMPILED_CACHE = {}
-for filename in os.listdir(CACHE_DIR):
-    if filename.endswith(".bin"):
-        v_id = filename.replace(".bin", "")
-        COMPILED_CACHE[v_id] = os.path.join(CACHE_DIR, filename)
 
 DEVICE_DATABASE = {
     "node_1": {"auth_token": "secret_abc123"},
@@ -237,7 +221,7 @@ MASTER_CPP_TEMPLATE = """#include <WiFi.h>
 
 const char* ssid = "{WIFI_SSID}";
 const char* password = "{WIFI_PASS}";
-const char* api_url = "{API_BASE_URL}/api/manifest?device={DEVICE_ID}";
+const char* api_url = "{API_BASE_URL}/api/manifest?fleet={FLEET_ID}&device={DEVICE_ID}";
 const char* auth_token = "{AUTH_TOKEN}";
 const char* current_version = "{CURRENT_VERSION}";
 
@@ -403,12 +387,14 @@ def generate_wrapped_code(ssid, passw, api_url, topic, user_code, version_id="v_
     wifi_fail_action = "ESP.restart();" if uses_wifi else "break; // Offline fallback"
     
     parts = topic.split('/')
+    fleet_id = parts[0] if len(parts) > 0 else "DefaultFleet"
     device_id = parts[2] if len(parts) >= 3 else "node_1"
     
     final_code = MASTER_CPP_TEMPLATE
     final_code = final_code.replace('{WIFI_SSID}', ssid)
     final_code = final_code.replace('{WIFI_PASS}', passw)
     final_code = final_code.replace('{API_BASE_URL}', api_url)
+    final_code = final_code.replace('{FLEET_ID}', fleet_id)
     final_code = final_code.replace('{DEVICE_ID}', device_id)
     final_code = final_code.replace('{AUTH_TOKEN}', "secret_abc123")
     final_code = final_code.replace('{CURRENT_VERSION}', version_id)
@@ -418,32 +404,66 @@ def generate_wrapped_code(ssid, passw, api_url, topic, user_code, version_id="v_
     final_code = final_code.replace('{WIFI_FAIL_ACTION}', wifi_fail_action)
     return final_code
 
-# --- SPLASH SCREEN LOADER HTML ---
+# --- BRAND NEW SPLASH SCREEN ---
 SETUP_HTML = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WiFeY Studio Setup</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        ardBg: '#181818',
+                        ardPanel: '#1e1e1e',
+                        ardBorder: '#333333',
+                        ardTeal: '#00979C',
+                        ardTextMain: '#cccccc',
+                        ardTextMuted: '#858585'
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace'],
+                    }
+                }
+            }
+        }
+    </script>
     <style>
-        body { background: #0f172a; color: white; font-family: 'Segoe UI', sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; zoom: 1.3;}
-        .loader { border: 4px solid #334155; border-top: 4px solid #3b82f6; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin-bottom: 20px;}
+        body { background-color: #181818; color: #cccccc; }
+        .loader { border: 3px solid #333333; border-top: 3px solid #00979C; border-radius: 50%; width: 28px; height: 28px; animation: spin 1s linear infinite; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        .progress-container { width: 80%; max-width: 400px; background: #1e293b; border-radius: 8px; overflow: hidden; margin-bottom: 10px; border: 1px solid #334155;}
-        .progress-bar { height: 10px; background: #3b82f6; width: 0%; transition: 0.3s; }
-        .log-box { background: #000; color: #10b981; padding: 15px; font-family: monospace; width: 80%; max-width: 600px; height: 180px; overflow-y: auto; font-size: 12px; border-radius: 6px; border: 1px solid #334155; white-space: pre-wrap; margin-bottom: 30px;}
-        .glow { text-shadow: 0 0 10px rgba(59, 130, 246, 0.5); }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #1e1e1e; }
+        ::-webkit-scrollbar-thumb { background: #424242; border-radius: 4px; }
     </style>
 </head>
-<body>
-    <h2 style="margin-bottom: 5px; color: #3b82f6;" class="glow">WiFeY Studio Setup</h2>
-    <p style="color: #94a3b8; font-size: 13px; margin-top: 0; margin-bottom: 30px;">Downloading core compilers. This only happens on the very first launch.</p>
+<body class="h-screen w-screen flex flex-col items-center justify-center font-sans antialiased">
     
-    <div class="loader" id="spinner"></div>
-    <div id="status-text" style="font-weight: bold; margin-bottom: 10px;">Initializing...</div>
-    
-    <div class="progress-container"><div class="progress-bar" id="pbar"></div></div>
-    
-    <div class="log-box" id="logs">Starting...</div>
+    <div class="bg-ardPanel border border-ardBorder p-8 rounded-lg shadow-2xl flex flex-col items-center w-[90%] max-w-[600px]">
+        <div class="flex items-center gap-3 mb-2">
+            <i class="ph ph-cpu text-4xl text-ardTeal"></i>
+            <h2 class="text-3xl font-semibold text-white tracking-wide"><span class="text-ardTeal">WiFeY</span> Studio</h2>
+        </div>
+        <p class="text-ardTextMuted text-sm mb-8 text-center">Downloading core compilers. This only happens on the very first launch.</p>
+        
+        <div class="flex items-center gap-4 mb-4 w-full px-4">
+            <div class="loader flex-shrink-0" id="spinner"></div>
+            <div id="status-text" class="font-medium text-white text-sm flex-1">Initializing...</div>
+        </div>
+        
+        <div class="w-full bg-[#181818] rounded-full h-1.5 mb-6 overflow-hidden border border-ardBorder relative">
+            <div id="pbar" class="bg-ardTeal h-1.5 rounded-full transition-all duration-300 w-0"></div>
+        </div>
+        
+        <div id="logs" class="w-full h-40 bg-[#181818] border border-ardBorder rounded p-4 font-mono text-xs text-ardTextMuted overflow-y-auto whitespace-pre-wrap">Starting...</div>
+    </div>
 
     <script>
         setInterval(() => {
@@ -462,9 +482,10 @@ SETUP_HTML = """
                 }
                 if (data.error) {
                     document.getElementById('status-text').innerText = "Setup Failed! Check Logs.";
-                    document.getElementById('status-text').style.color = "#ef4444";
+                    document.getElementById('status-text').classList.add("text-red-400");
                     document.getElementById('spinner').style.display = "none";
-                    document.getElementById('pbar').style.background = "#ef4444";
+                    document.getElementById('pbar').classList.remove("bg-ardTeal");
+                    document.getElementById('pbar').classList.add("bg-red-500");
                 }
             });
         }, 800);
@@ -473,206 +494,420 @@ SETUP_HTML = """
 </html>
 """
 
-# --- IDE HTML ---
+# --- NEW IDE HTML (Arduino v2 Style + WiFeY Branding + UI Fixes) ---
 IDE_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WiFeY Studio | Cloud OTA Compiler</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    
+    <script>
+        // INJECTED CONFIGURATION FROM FLASK
+        const NGROK_API_URL = "{{ ngrok_url }}"; 
+        let activeBinFile = null; 
+        let serialEventSource = null;
+        let currentTopic = "ARES-1 Nodes/fleet/update"; 
+    </script>
+
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        ardBg: '#181818',       
+                        ardPanel: '#1e1e1e',    
+                        ardBorder: '#333333',   
+                        ardTeal: '#00979C',     
+                        ardHover: '#2a2d2e',    
+                        ardTextMain: '#cccccc',
+                        ardTextMuted: '#858585'
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace'],
+                    }
+                }
+            }
+        }
+    </script>
     <style>
-        :root { --bg: #0f172a; --panel: #1e293b; --text: #f8fafc; --accent: #3b82f6; --accent-hover: #2563eb; --warning: #ef4444; --success: #10b981;}
-        body { font-family: 'Segoe UI', sans-serif; background-color: var(--bg); color: var(--text); margin: 0; padding: 20px; display: flex; justify-content: center; zoom: 1.3; }
-        .dashboard { display: grid; grid-template-columns: 320px 1fr; gap: 20px; max-width: 1400px; width: 100%; }
-        .panel { background: var(--panel); padding: 25px; border-radius: 12px; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5); }
-        h2 { margin-top: 0; font-size: 1.5rem; border-bottom: 1px solid #334155; padding-bottom: 10px; color: var(--accent); }
-        label { display: block; font-size: 0.85rem; font-weight: bold; margin: 15px 0 5px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px;}
-        input, select { width: 100%; padding: 10px; background: #0f172a; border: 1px solid #334155; color: white; border-radius: 6px; box-sizing: border-box; font-size: 14px; transition: 0.3s;}
-        input:focus, select:focus { border-color: var(--accent); outline: none; }
-        .flex-row { display: flex; gap: 8px; align-items: center; }
-        .btn-icon { background: #334155; color: white; border: none; border-radius: 6px; cursor: pointer; padding: 0 12px; height: 38px; font-size: 16px; display: flex; align-items: center; justify-content: center;}
-        .btn-icon:hover { background: #475569; }
-        
-        .custom-select-container { position: relative; width: 100%; font-size: 14px; }
-        .custom-select-trigger { background: #0f172a; border: 1px solid #334155; color: white; padding: 10px; border-radius: 6px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
-        .custom-select-options { position: absolute; top: 100%; left: 0; right: 0; background: #1e293b; border: 1px solid #334155; border-radius: 6px; margin-top: 5px; z-index: 10; display: none; max-height: 250px; overflow-y: auto; box-shadow: 0 10px 15px rgba(0,0,0,0.5); }
-        .custom-select-options.open { display: block; }
-        .custom-option { display: flex; justify-content: space-between; align-items: center; transition: background 0.2s; border-bottom: 1px solid #334155; }
-        .option-text { flex: 1; padding: 12px 10px; cursor: pointer; }
-        .option-text:hover { background: #334155; }
-        .delete-icon { color: var(--warning); font-size: 18px; padding: 12px 15px; cursor: pointer; font-weight: bold; }
-        .add-new { color: var(--accent); font-weight: bold; justify-content: center; padding: 12px; cursor: pointer; }
-        
-        .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); backdrop-filter: blur(3px); display: none; justify-content: center; align-items: center; z-index: 100; }
-        .modal-box { background: var(--panel); padding: 25px; border-radius: 10px; width: 90%; max-width: 500px; border: 1px solid #334155; }
-        .modal-box h3 { margin-top: 0; color: white; }
-        .modal-buttons { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
-        
-        .tabs { display: flex; border-bottom: 2px solid #334155; margin-bottom: 15px; gap: 5px; }
-        .tab-btn { background: transparent; color: #94a3b8; border: none; padding: 10px 20px; cursor: pointer; font-weight: bold; border-radius: 6px 6px 0 0; }
-        .tab-btn.active { background: var(--accent); color: white; }
-        .editor-header { display: flex; justify-content: space-between; align-items: flex-end; }
-        .btn-small { background: #334155; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: bold; margin-bottom: 15px;}
-        textarea { width: 100%; height: 500px; padding: 15px; background: #0f172a; border: 1px solid #334155; color: #ffffff; border-radius: 6px; box-sizing: border-box; font-family: 'Courier New', monospace; font-size: 14px; resize: vertical; }
-        textarea:focus { border-color: var(--accent); outline: none; }
-        
-        .btn-group { display: flex; flex-direction: column; gap: 10px; margin-top: 30px; }
-        button.action { padding: 12px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 14px; display: flex; justify-content: center; gap: 8px;}
-        .btn-primary { background: var(--accent); color: white; }
-        .btn-outline { background: transparent; border: 1px solid #10b981; color: #10b981; text-decoration: none; align-items: center; }
-        .btn-outline:hover { background: rgba(16, 185, 129, 0.1); }
-        
-        #terminal { margin-top: 20px; background: #000; color: var(--success); padding: 15px; border-radius: 6px; font-family: monospace; white-space: pre-wrap; font-size: 13px; min-height: 120px; max-height: 300px; overflow-y: auto; border: 1px solid #334155;}
-        .ngrok-badge { background: #10b981; color: #000; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; margin-left: 10px; }
+        body { background-color: #181818; color: #cccccc; overflow: hidden;}
+        ::-webkit-scrollbar { width: 10px; height: 10px; }
+        ::-webkit-scrollbar-track { background: #1e1e1e; }
+        ::-webkit-scrollbar-thumb { background: #424242; border: 2px solid #1e1e1e; border-radius: 5px; }
+        ::-webkit-scrollbar-thumb:hover { background: #4f4f4f; }
+        .editor-textarea { resize: none; outline: none; tab-size: 4; line-height: 1.5rem; }
+        .line-numbers { line-height: 1.5rem; }
+        .view-hidden { display: none !important; }
+        .flat-input { background-color: transparent; border: 1px solid transparent; outline: none; transition: all 0.2s; }
+        .flat-input:hover { border-color: #333333; background-color: #2a2d2e; }
+        .flat-input:focus { border-color: #00979C; background-color: #1e1e1e; }
+        .dropdown-content { display: none; }
+        .dropdown-content.show { display: block; }
     </style>
 </head>
-<body>
-    <div class="dashboard">
-        <div class="panel">
-            <h2>WiFeY Studio <span class="ngrok-badge">ONLINE</span></h2>
-            <label>Wi-Fi SSID</label>
-            <input type="text" id="ssid" placeholder="Network Name">
-            <label>Wi-Fi Password</label>
-            <div class="flex-row">
-                <input type="password" id="pass" placeholder="********">
-                <button class="btn-icon" onclick="togglePass()">👁️</button>
-            </div>
-            
-            <label>Auto-Ngrok URL (Don't Change)</label>
-            <input type="text" id="api_url" value="{{ ngrok_url }}" readonly style="color: #94a3b8; background: #1e293b;">
-            
-            <label>Target Fleet / Device Topic</label>
-            <div class="custom-select-container" id="custom-select-container">
-                <div class="custom-select-trigger" onclick="toggleDropdown(event)">
-                    <span id="selected_topic_text">Select a topic...</span>
-                    <span>▼</span>
+<body class="h-screen w-screen flex flex-col text-sm antialiased selection:bg-ardTeal selection:text-white">
+
+    <input type="file" id="bin-file-input" accept=".bin" class="hidden" onchange="handleBinLoad(event)">
+
+    <!-- TOP ACTION BAR -->
+    <header class="h-12 bg-ardBg border-b border-ardBorder flex items-center justify-between px-3 flex-shrink-0 z-20">
+        <div class="flex items-center gap-3">
+            <div class="relative">
+                <button class="w-8 h-8 rounded flex items-center justify-center hover:bg-ardHover outline-none menu-btn text-ardTextMuted hover:text-white transition-colors" onclick="toggleDropdown('menu-file', event)" title="File Options">
+                    <i class="ph ph-folder-open text-xl pointer-events-none"></i>
+                </button>
+                <div id="menu-file" class="dropdown-content absolute top-full left-0 mt-1 w-48 bg-[#252526] border border-ardBorder shadow-xl z-50 py-1 rounded">
+                    <button class="w-full text-left px-4 py-1.5 hover:bg-ardTeal hover:text-white flex items-center group">
+                        <i class="ph ph-file-plus mr-2 text-lg text-ardTextMuted group-hover:text-white"></i> New Sketch
+                    </button>
+                    <div class="h-px bg-[#333] my-1"></div>
+                    <button class="w-full text-left px-4 py-1.5 hover:bg-ardTeal hover:text-white flex items-center group" onclick="triggerLoadBin()">
+                        <i class="ph ph-upload-simple mr-2 text-lg text-ardTextMuted group-hover:text-white"></i> Load .bin...
+                    </button>
+                    <button class="w-full text-left px-4 py-1.5 hover:bg-ardTeal hover:text-white flex items-center group" onclick="triggerSaveBin()">
+                        <i class="ph ph-download-simple mr-2 text-lg text-ardTextMuted group-hover:text-white"></i> Save .bin...
+                    </button>
                 </div>
-                <div class="custom-select-options" id="custom_options_list"></div>
-            </div>
-            <input type="hidden" id="topic_val">
-            
-            <div class="btn-group">
-                <button class="action btn-primary" id="btn-compile" onclick="compileAndPublish()">🚀 OTA Compile & Update</button>
-                <a href="/provision" class="action btn-outline">🔌 Open USB Provisioning Tool</a>
-            </div>
-        </div>
-        
-        <div class="panel">
-            <div class="editor-header">
-                <div class="tabs">
-                    <button class="tab-btn active" id="tab-input" onclick="switchTab('input')">Raw Input (.ino)</button>
-                    <button class="tab-btn" id="tab-wrapped" onclick="switchTab('wrapped')">Preview Wrapped Code</button>
-                    <button class="tab-btn" id="tab-serial" onclick="switchTab('serial')" style="color: #3b82f6;">🔌 Serial Monitor</button>
-                </div>
-                <button class="btn-small" onclick="stripComments()" id="btn-strip">🧹 Strip Comments</button>
-            </div>
-            
-            <textarea id="input_code" spellcheck="false">
-int ledPin = 2;
-void setup() {
-  pinMode(ledPin, OUTPUT);
-  Serial.println("Hello from WiFeY OTA Architecture!");
-}
-void loop() {
-  digitalWrite(ledPin, HIGH);
-  delay(1000);
-  digitalWrite(ledPin, LOW);
-  delay(1000);
-}
-</textarea>
-            <textarea id="wrapped_code" spellcheck="false" style="display: none;"></textarea>
-            
-            <div id="view-serial" style="display: none;">
-                <div style="display: flex; gap: 10px; margin-bottom: 15px;">
-                    <button class="btn-icon" onclick="loadSerialPorts()" title="Refresh Ports">🔄</button>
-                    <select id="serial_port"><option value="">Loading...</option></select>
-                    <select id="serial_baud" style="width: 120px;">
-                        <option value="9600">9600</option>
-                        <option value="115200" selected>115200</option>
-                    </select>
-                    <button class="btn-small btn-primary" id="btn-serial-connect" onclick="connectSerial()" style="margin-bottom:0;">Connect</button>
-                    <button class="btn-small" id="btn-serial-disconnect" onclick="disconnectSerial()" style="display:none; background:#ef4444; margin-bottom:0;">Disconnect</button>
-                    <button class="btn-small" onclick="document.getElementById('serial_out').innerHTML=''" style="margin-bottom:0;">Clear Log</button>
-                </div>
-                <div id="serial_out" style="background:#000; color:#10b981; padding:15px; border-radius:6px; font-family:monospace; height:435px; overflow-y:auto; white-space:pre-wrap; border:1px solid #334155;"></div>
             </div>
 
-            <div id="terminal">Waiting for commands... Smart Build Cache is active.</div>
-        </div>
-    </div>
-    
-    <div class="modal-overlay" id="modal-add" onclick="closeModalOnOutsideClick(event, 'modal-add')">
-        <div class="modal-box">
-            <h3>Add New Topic</h3>
-            <input type="text" id="new_topic_input" placeholder="e.g. Ramanand/devices/node_2/update">
-            <div class="modal-buttons">
-                <button class="btn-small" style="background: transparent; border: 1px solid #334155; margin-bottom: 0;" onclick="closeModal('modal-add')">Cancel</button>
-                <button class="btn-small btn-primary" style="margin-bottom: 0;" onclick="confirmAddTopic()">Add Topic</button>
+            <div class="h-5 w-px bg-ardBorder mx-1"></div>
+
+            <div class="flex items-center gap-2">
+                <button class="w-8 h-8 rounded-full bg-ardTeal text-white flex items-center justify-center hover:brightness-110 active:opacity-40 transition-all shadow-md" title="Verify (Compile)" onclick="simulateAction('Verifying')">
+                    <i class="ph ph-check text-xl"></i>
+                </button>
+                <button class="w-8 h-8 rounded-full bg-ardTeal text-white flex items-center justify-center hover:brightness-110 active:opacity-40 transition-all shadow-md" title="Upload / OTA" onclick="simulateAction('Uploading')">
+                    <i class="ph ph-arrow-right text-xl"></i>
+                </button>
+                <div id="action-progress-container" class="w-24 h-1.5 bg-[#333] rounded-full overflow-hidden hidden ml-1 flex-shrink-0 relative">
+                    <div id="action-progress-bar" class="h-full bg-yellow-400 w-0 transition-all duration-200 ease-out absolute left-0 top-0"></div>
+                </div>
+            </div>
+
+            <div class="h-5 w-px bg-ardBorder mx-1"></div>
+
+            <div class="relative">
+                <button id="fleet-selector-btn" class="flex items-center gap-2 px-3 py-1.5 rounded hover:bg-ardHover border border-transparent hover:border-ardBorder transition-colors text-sm group" onclick="toggleDropdown('fleet-dropdown', event)">
+                    <i class="ph ph-cpu text-ardTeal"></i>
+                    <span class="font-medium text-white">ARES-1 Nodes</span>
+                    <i class="ph ph-caret-down text-ardTextMuted group-hover:text-white transition-colors"></i>
+                </button>
+                <div id="fleet-dropdown" class="dropdown-content absolute top-full left-0 mt-1 w-80 bg-[#252526] border border-ardBorder rounded shadow-xl z-50 py-2">
+                    <div class="px-3 py-1.5 text-xs font-semibold text-ardTextMuted uppercase tracking-wider">Select Target Devices</div>
+                    <div class="mt-2">
+                        <div class="flex items-center justify-between px-3 py-1.5 bg-[#2a2d2e] border-y border-[#333]">
+                            <span class="font-medium text-white">ARES-1 Nodes</span>
+                            <span class="text-xs bg-emerald-500/10 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/20">4/5 ✅</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="h-5 w-px bg-ardBorder"></div>
+            
+            <div class="flex items-center gap-2">
+                <i class="ph ph-wifi-high text-ardTextMuted"></i>
+                <input type="text" id="top-wifi-ssid" placeholder="SSID" value="Wi-Fi_Network" class="flat-input text-xs px-2 py-1 w-28 rounded placeholder-gray-600">
+                <div class="relative flex items-center">
+                    <input type="password" id="top-wifi-pass" placeholder="Password" value="dummy" class="flat-input text-xs px-2 py-1 w-28 rounded pr-6 placeholder-gray-600">
+                    <button type="button" onclick="togglePassword('top-wifi-pass')" class="absolute right-1 text-ardTextMuted hover:text-white">
+                        <i class="ph ph-eye text-xs"></i>
+                    </button>
+                </div>
             </div>
         </div>
-    </div>
-    <div class="modal-overlay" id="modal-delete" onclick="closeModalOnOutsideClick(event, 'modal-delete')">
-        <div class="modal-box">
-            <h3>Remove Topic</h3>
-            <p style="color: #94a3b8; font-size: 14px;">Are you sure you want to remove <strong id="delete_topic_name" style="color: white;"></strong> from the list?</p>
-            <div class="modal-buttons">
-                <button class="btn-small" style="background: transparent; border: 1px solid #334155; margin-bottom: 0;" onclick="closeModal('modal-delete')">Cancel</button>
-                <button class="btn-small" style="background: #ef4444; margin-bottom: 0;" onclick="confirmDeleteTopic()">Remove</button>
+
+        <div class="flex items-center gap-3">
+            <div class="flex items-center gap-1.5 px-2 py-0.5 rounded bg-ardHover text-xs text-ardTextMuted">
+                <span class="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_5px_#10b981]"></span>
+                Online
+            </div>
+            <div class="flex items-center gap-2">
+                <i class="ph ph-cpu text-2xl text-ardTeal"></i>
+                <span class="font-semibold tracking-wide text-white"><span class="text-ardTeal">WiFeY</span> Studio</span>
+            </div>
+        </div>
+    </header>
+
+    <div class="flex-1 flex overflow-hidden">
+        
+        <!-- Sidebar -->
+        <aside class="w-12 bg-ardBg border-r border-ardBorder flex flex-col items-center py-3 gap-4 flex-shrink-0 z-10 relative">
+            <button onclick="switchMainView('view-editor')" id="nav-editor" class="nav-btn p-2 rounded text-ardTeal bg-ardHover relative group" title="Editor">
+                <i class="ph ph-files text-2xl"></i>
+            </button>
+            <button onclick="switchMainView('view-usb')" id="nav-usb" class="nav-btn p-2 rounded text-ardTextMuted hover:text-white hover:bg-ardHover relative group transition-colors" title="USB Provisioning">
+                <i class="ph ph-usb text-2xl"></i>
+            </button>
+        </aside>
+
+        <!-- Main Content Area -->
+        <div class="flex-1 flex flex-col min-w-0 bg-ardPanel">
+            
+            <!-- Views Container (Flex-1 allows it to fill space above Bottom Panel) -->
+            <div class="flex-1 flex flex-col min-h-0 relative">
+                
+                <!-- VIEW: EDITOR -->
+                <main id="view-editor" class="flex-1 flex flex-col overflow-hidden">
+                    <div class="flex items-center h-9 bg-[#1e1e1e] overflow-x-auto select-none px-2 shadow-[0_1px_0_0_#333]">
+                        <button onclick="switchEditorTab('tab-raw')" id="btn-tab-raw" class="editor-tab h-full flex items-center px-4 gap-2 text-sm text-white bg-[#1e1e1e] border-t-2 border-ardTeal">
+                            <i class="ph ph-file-code text-ardTeal"></i> Raw Input
+                        </button>
+                        <button onclick="switchEditorTab('tab-wrap')" id="btn-tab-wrap" class="editor-tab h-full flex items-center px-4 gap-2 text-sm text-ardTextMuted hover:text-white border-t-2 border-transparent bg-transparent transition-colors">
+                            <i class="ph ph-file-text"></i> Preview Wrapped
+                        </button>
+                    </div>
+
+                    <div id="tab-raw" class="editor-content flex-1 flex overflow-hidden bg-ardPanel">
+                        <div class="w-12 text-right pr-3 py-4 font-mono text-xs text-[#6e7681] bg-ardPanel select-none border-r border-ardBorder line-numbers flex flex-col">
+                            <span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span>
+                        </div>
+                        <textarea class="editor-textarea flex-1 p-4 bg-transparent text-[#d4d4d4] font-mono text-sm whitespace-pre" spellcheck="false">int ledPin = 2;
+void setup() {
+  pinMode(ledPin, OUTPUT);
+  Serial.println("Hello from WiFeY Studio OTA Architecture!");
+}
+void loop() {
+  digitalWrite(ledPin, HIGH); delay(1000);
+  digitalWrite(ledPin, LOW); delay(1000);
+}</textarea>
+                    </div>
+
+                    <div id="tab-wrap" class="editor-content flex-1 flex overflow-hidden bg-ardPanel view-hidden">
+                        <div class="w-12 text-right pr-3 py-4 font-mono text-xs text-[#6e7681] bg-ardPanel select-none border-r border-ardBorder line-numbers flex flex-col">
+                            <span>1</span>
+                        </div>
+                        <textarea class="editor-textarea flex-1 p-4 bg-transparent text-[#d4d4d4] font-mono text-sm whitespace-pre" readonly spellcheck="false">/* Click tab again to load smart preview... */</textarea>
+                    </div>
+                </main>
+
+                <!-- VIEW: USB PROVISIONING -->
+                <main id="view-usb" class="flex-1 overflow-y-auto p-8 view-hidden">
+                    <div class="max-w-4xl mx-auto w-full flex flex-col gap-6 pb-8">
+                        <div class="border-b border-ardBorder pb-4">
+                            <h2 class="text-2xl font-semibold text-white flex items-center gap-2">
+                                <i class="ph ph-usb text-ardTeal"></i> Direct USB Provisioning
+                            </h2>
+                            <p class="text-sm text-ardTextMuted mt-1">Configure fleets and flash physical devices via serial port.</p>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div class="bg-ardBg border border-ardBorder rounded-lg p-5 flex flex-col shadow-lg">
+                                <h3 class="text-sm font-semibold text-white mb-4 uppercase tracking-wider flex items-center gap-2">
+                                    <i class="ph ph-cpu text-ardTeal"></i> Device Flash Settings
+                                </h3>
+                                
+                                <div class="space-y-4 flex-1">
+                                    <div>
+                                        <label class="block text-xs font-medium text-ardTextMuted mb-1.5">Target COM Port</label>
+                                        <div class="flex gap-2">
+                                            <select id="prov_port" class="min-w-0 flex-1 bg-[#1e1e1e] border border-ardBorder text-white rounded focus:border-ardTeal block p-2 outline-none text-sm cursor-pointer"></select>
+                                            <button onclick="loadSerialPorts()" class="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded border border-ardBorder bg-[#1e1e1e] p-0 text-ardTextMuted transition-colors hover:bg-ardHover hover:text-white">
+                                                <i class="ph ph-arrows-clockwise"></i>
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-medium text-ardTextMuted mb-1.5">Assign Fleet Name</label>
+                                        <input type="text" id="prov_fleet_id" value="ARES-1" class="w-full bg-[#1e1e1e] border border-ardBorder text-white rounded focus:border-ardTeal block p-2 outline-none text-sm font-mono">
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-medium text-ardTextMuted mb-1.5">Assign Device ID (Unique)</label>
+                                        <input type="text" id="prov_device_id" value="node_1" class="w-full bg-[#1e1e1e] border border-ardBorder text-white rounded focus:border-ardTeal block p-2 outline-none text-sm font-mono">
+                                    </div>
+                                </div>
+
+                                <div class="pt-6 mt-4 border-t border-ardBorder">
+                                    <button onclick="flashDevice()" class="w-full flex items-center justify-center gap-2 py-3 px-4 bg-white hover:bg-gray-200 text-black text-sm rounded transition-colors font-semibold shadow-lg active:scale-[0.98]">
+                                        <i class="ph ph-lightning text-lg text-ardTeal"></i> Compile & Provision via USB
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </main>
+            </div>
+
+            <!-- Bottom Panel (Fixed height, persists across views) -->
+            <div class="h-64 flex flex-col border-t border-ardBorder bg-[#1e1e1e] flex-shrink-0 z-10">
+                <div class="flex items-center h-8 bg-ardBg px-2 border-b border-ardBorder select-none shadow-[0_1px_0_0_#333]">
+                    <button onclick="switchPanelTab('panel-out')" id="btn-panel-out" class="panel-tab flex items-center px-3 h-full text-xs text-white border-b border-ardTeal">
+                        Output
+                    </button>
+                    <button onclick="switchPanelTab('panel-serial')" id="btn-panel-serial" class="panel-tab flex items-center px-3 h-full text-xs text-ardTextMuted hover:text-white border-b border-transparent transition-colors">
+                        Serial Monitor
+                    </button>
+                </div>
+
+                <!-- Panel Content: Output -->
+                <div id="panel-out" class="panel-content flex-1 p-3 overflow-y-auto font-mono text-xs text-[#cccccc] bg-[#1e1e1e]">
+                    <div class="text-[#858585]">Environment initialized. Ready.</div>
+                </div>
+
+                <!-- Panel Content: Serial Monitor -->
+                <div id="panel-serial" class="panel-content flex-1 flex flex-col view-hidden bg-[#1e1e1e]">
+                    <div class="flex items-center gap-2 p-1.5 border-b border-ardBorder bg-[#252526]">
+                        <select id="serial_port" class="flat-input text-xs py-1 px-2 rounded bg-transparent w-40 text-white cursor-pointer">
+                            <option disabled selected>Loading Ports...</option>
+                        </select>
+                        
+                        <select id="serial_baud" class="flat-input text-xs py-1 px-2 rounded bg-transparent text-white cursor-pointer w-28">
+                            <option>9600</option>
+                            <option selected>115200</option>
+                        </select>
+                        
+                        <div class="h-4 w-px bg-[#444] mx-1"></div>
+                        
+                        <button id="btn-serial-connect" onclick="connectSerial()" class="flex items-center gap-1.5 px-3 py-1 rounded text-xs border border-[#333] hover:border-emerald-500 text-emerald-400 hover:bg-emerald-500/10 transition-colors">
+                            <i class="ph ph-plug"></i> Connect
+                        </button>
+                        <button id="btn-serial-disconnect" onclick="disconnectSerial()" class="flex items-center gap-1.5 px-3 py-1 rounded text-xs border border-[#333] hover:border-red-500 text-[#858585] hover:text-red-400 hover:bg-red-500/10 transition-colors" style="display:none;">
+                            <i class="ph ph-plugs"></i> Disconnect
+                        </button>
+
+                        <div class="flex-1"></div>
+
+                        <button onclick="document.getElementById('serial_out').innerHTML=''" class="flex items-center gap-1.5 px-3 py-1 rounded text-xs border border-[#333] hover:border-[#555] text-ardTextMuted hover:text-white transition-colors">
+                            <i class="ph ph-prohibit"></i> Clear
+                        </button>
+                    </div>
+                    
+                    <div id="serial_out" class="flex-1 p-3 overflow-y-auto font-mono text-xs text-[#cccccc] whitespace-pre-wrap"><span class="text-[#858585] italic">--- Serial Monitor Not Connected ---</span></div>
+                </div>
             </div>
         </div>
     </div>
 
     <script>
-        let activeTab = 'input';
-        let topicToDelete = "";
-        let serialEventSource = null;
-        
+        // Keep the app at its default scale.
+        window.addEventListener('keydown', function(e) {
+            if ((e.ctrlKey || e.metaKey) && (e.key === '=' || e.key === '+' || e.key === '-')) {
+                e.preventDefault();
+            }
+        });
+
         window.onload = () => {
-            if(localStorage.getItem('wifi_ssid')) document.getElementById('ssid').value = localStorage.getItem('wifi_ssid');
-            if(localStorage.getItem('wifi_pass')) document.getElementById('pass').value = localStorage.getItem('wifi_pass');
-            loadTopics();
             loadSerialPorts();
         }
-        
-        function switchTab(tab) {
-            activeTab = tab;
-            document.getElementById('tab-input').classList.toggle('active', tab === 'input');
-            document.getElementById('tab-wrapped').classList.toggle('active', tab === 'wrapped');
-            document.getElementById('tab-serial').classList.toggle('active', tab === 'serial');
-            
-            document.getElementById('input_code').style.display = tab === 'input' ? 'block' : 'none';
-            document.getElementById('wrapped_code').style.display = tab === 'wrapped' ? 'block' : 'none';
-            document.getElementById('view-serial').style.display = tab === 'serial' ? 'block' : 'none';
-            document.getElementById('btn-strip').style.display = tab === 'serial' ? 'none' : 'block';
-            
-            if (tab === 'wrapped') fetchPreview();
-            if (tab === 'serial') loadSerialPorts();
+
+        // --- Core UI Logic ---
+        function togglePassword(inputId) {
+            const input = document.getElementById(inputId);
+            const icon = input.nextElementSibling.querySelector('i');
+            if (input.type === 'password') { input.type = 'text'; icon.className = 'ph ph-eye-slash text-xs'; } 
+            else { input.type = 'password'; icon.className = 'ph ph-eye text-xs'; }
         }
-        
+
+        function switchMainView(viewId) {
+            document.getElementById('view-editor').classList.add('view-hidden');
+            document.getElementById('view-usb').classList.add('view-hidden');
+            document.getElementById(viewId).classList.remove('view-hidden');
+            document.querySelectorAll('.nav-btn').forEach(btn => {
+                btn.classList.remove('text-ardTeal', 'bg-ardHover');
+                btn.classList.add('text-ardTextMuted');
+            });
+            const activeBtn = document.getElementById(viewId === 'view-editor' ? 'nav-editor' : 'nav-usb');
+            activeBtn.classList.remove('text-ardTextMuted');
+            activeBtn.classList.add('text-ardTeal', 'bg-ardHover');
+            if(viewId === 'view-usb') loadSerialPorts();
+        }
+
+        function switchEditorTab(tabId) {
+            document.querySelectorAll('.editor-content').forEach(el => el.classList.add('view-hidden'));
+            document.querySelectorAll('.editor-tab').forEach(el => {
+                el.classList.remove('text-white', 'border-ardTeal', 'bg-[#1e1e1e]');
+                el.classList.add('text-ardTextMuted', 'border-transparent', 'bg-transparent');
+            });
+            document.getElementById(tabId).classList.remove('view-hidden');
+            const activeBtn = document.getElementById('btn-' + tabId);
+            activeBtn.classList.remove('text-ardTextMuted', 'border-transparent', 'bg-transparent');
+            activeBtn.classList.add('text-white', 'border-ardTeal', 'bg-[#1e1e1e]');
+            if(tabId === 'tab-wrap') fetchPreview();
+        }
+
+        function switchPanelTab(tabId) {
+            document.querySelectorAll('.panel-content').forEach(el => el.classList.add('view-hidden'));
+            document.querySelectorAll('.panel-tab').forEach(el => {
+                el.classList.remove('text-white', 'border-ardTeal');
+                el.classList.add('text-ardTextMuted', 'border-transparent');
+            });
+            document.getElementById(tabId).classList.remove('view-hidden');
+            const activeBtn = document.getElementById('btn-' + tabId);
+            activeBtn.classList.remove('text-ardTextMuted', 'border-transparent');
+            activeBtn.classList.add('text-white', 'border-ardTeal');
+        }
+
+        function toggleDropdown(dropdownId, event) {
+            if(event) event.stopPropagation();
+            closeAllMenus();
+            document.getElementById(dropdownId).classList.toggle("show");
+        }
+        function closeAllMenus() {
+            var dropdowns = document.getElementsByClassName("dropdown-content");
+            for (var i = 0; i < dropdowns.length; i++) dropdowns[i].classList.remove('show');
+        }
+        window.onclick = function(event) {
+            if (!event.target.closest('#fleet-selector-btn') && !event.target.closest('.dropdown-content') && !event.target.closest('.menu-btn')) {
+                closeAllMenus();
+            }
+        }
+
+        function logToOutput(msg) {
+            const outputPanel = document.getElementById('panel-out');
+            const logEntry = document.createElement('div');
+            if (msg.includes("[Build]") || msg.includes("SUCCESS")) logEntry.className = "text-ardTeal mt-1";
+            else if (msg.includes("[System]")) logEntry.className = "text-emerald-400 mt-1";
+            else if (msg.includes("[File]")) logEntry.className = "text-yellow-400 mt-1";
+            else if (msg.includes("Error") || msg.includes("❌")) logEntry.className = "text-red-400 mt-1";
+            else logEntry.className = "text-[#cccccc] mt-1";
+            logEntry.textContent = msg;
+            outputPanel.appendChild(logEntry);
+            outputPanel.scrollTop = outputPanel.scrollHeight;
+            switchPanelTab('panel-out');
+        }
+
+        // --- Fetch & Hardware Logic ---
+        function fetchPreview() {
+            const rawCode = document.querySelector('#tab-raw textarea').value;
+            const payload = {
+                ssid: document.getElementById('top-wifi-ssid').value,
+                pass: document.getElementById('top-wifi-pass').value,
+                api_url: NGROK_API_URL, topic: currentTopic, code: rawCode
+            };
+            document.querySelector('#tab-wrap textarea').value = "Generating smart preview...";
+            fetch('/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+            .then(res => res.json()).then(data => { document.querySelector('#tab-wrap textarea').value = data.code; })
+            .catch(err => { document.querySelector('#tab-wrap textarea').value = "// Error: " + err; });
+        }
+
         function loadSerialPorts() {
             fetch('/api/ports').then(r=>r.json()).then(ports => {
-                let sel = document.getElementById('serial_port');
-                sel.innerHTML = ports.length ? '' : '<option value="">No USB Devices Found</option>';
-                ports.forEach(p => { sel.innerHTML += `<option value="${p.device}">${p.device} - ${p.desc}</option>`; });
+                let sel1 = document.getElementById('serial_port');
+                let sel2 = document.getElementById('prov_port');
+                const html = ports.length ? ports.map(p => `<option value="${p.device}">${p.device} - ${p.desc}</option>`).join('') : '<option value="">No Devices</option>';
+                if(sel1) sel1.innerHTML = html;
+                if(sel2) sel2.innerHTML = html;
             });
         }
-        
+
         function connectSerial() {
             const port = document.getElementById('serial_port').value;
             const baud = document.getElementById('serial_baud').value;
             if(!port) return alert("Please select a COM port first.");
-            
-            fetch('/api/serial/connect', {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({port: port, baud: baud})
-            }).then(r=>r.json()).then(res => {
+            fetch('/api/serial/connect', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({port: port, baud: baud}) })
+            .then(r=>r.json()).then(res => {
                 if(res.error) { alert("Failed to connect: " + res.error); return; }
-                
                 document.getElementById('btn-serial-connect').style.display = 'none';
-                document.getElementById('btn-serial-disconnect').style.display = 'inline-block';
+                document.getElementById('btn-serial-disconnect').style.display = 'inline-flex';
                 const out = document.getElementById('serial_out');
-                out.innerHTML += `\\n[*] -------------------------------------\\n[*] Connected to ${port} at ${baud} baud\\n[*] -------------------------------------\\n`;
-                
+                out.innerHTML += `\\n[*] Connected to ${port} at ${baud} baud\\n`;
                 serialEventSource = new EventSource('/api/serial/stream');
                 serialEventSource.onmessage = function(e) {
                     const data = JSON.parse(e.data);
@@ -681,203 +916,133 @@ void loop() {
                 };
             });
         }
-        
-        function disconnectSerial() {
+
+        function disconnectSerial(quiet = false) {
             fetch('/api/serial/disconnect', {method: 'POST'}).then(() => {
                 if(serialEventSource) { serialEventSource.close(); serialEventSource = null; }
-                document.getElementById('btn-serial-connect').style.display = 'inline-block';
+                document.getElementById('btn-serial-connect').style.display = 'inline-flex';
                 document.getElementById('btn-serial-disconnect').style.display = 'none';
-                document.getElementById('serial_out').innerHTML += `\\n[*] Connection Closed.\\n`;
+                if (!quiet) document.getElementById('serial_out').innerHTML += `\\n[*] Connection Closed.\\n`;
             });
         }
 
-        function loadTopics() {
-            const list = document.getElementById('custom_options_list');
-            let topics = JSON.parse(localStorage.getItem('wifey_topics')) || ["Ramanand/devices/node_1/update", "Ramanand/fleet/update"];
-            list.innerHTML = '';
-            topics.forEach(t => {
-                let div = document.createElement('div');
-                div.className = 'custom-option';
-                let deleteHTML = topics.length > 1 ? `<div class="delete-icon" onclick="openDeleteModal(event, '${t}')">&times;</div>` : '';
-                div.innerHTML = `<div class="option-text" onclick="selectTopic('${t}')">${t}</div> ${deleteHTML}`;
-                list.appendChild(div);
-            });
-            let addDiv = document.createElement('div');
-            addDiv.className = 'custom-option add-new';
-            addDiv.innerText = '+ Add New Topic';
-            addDiv.onclick = openAddModal;
-            list.appendChild(addDiv);
-            let lastTopic = localStorage.getItem('last_topic');
-            if(!lastTopic || !topics.includes(lastTopic)) lastTopic = topics[0];
-            if(lastTopic) selectTopic(lastTopic);
-        }
-        function toggleDropdown(e) { document.getElementById('custom_options_list').classList.toggle('open'); e.stopPropagation(); }
-        document.addEventListener('click', function(e) {
-            let container = document.getElementById('custom-select-container');
-            if (!container.contains(e.target)) document.getElementById('custom_options_list').classList.remove('open');
-        });
-        function selectTopic(t) {
-            document.getElementById('selected_topic_text').innerText = t;
-            document.getElementById('topic_val').value = t;
-            localStorage.setItem('last_topic', t);
-            document.getElementById('custom_options_list').classList.remove('open');
-        }
-        function openAddModal() { document.getElementById('custom_options_list').classList.remove('open'); document.getElementById('modal-add').style.display = 'flex'; }
-        function confirmAddTopic() { let nt = document.getElementById('new_topic_input').value.trim(); if(nt !== "") { let topics = JSON.parse(localStorage.getItem('wifey_topics')) || []; if(!topics.includes(nt)) { topics.push(nt); localStorage.setItem('wifey_topics', JSON.stringify(topics)); loadTopics(); selectTopic(nt); } } closeModal('modal-add'); }
-        function openDeleteModal(e, t) { e.stopPropagation(); topicToDelete = t; document.getElementById('custom_options_list').classList.remove('open'); document.getElementById('delete_topic_name').innerText = t; document.getElementById('modal-delete').style.display = 'flex'; }
-        function confirmDeleteTopic() { let topics = JSON.parse(localStorage.getItem('wifey_topics')); topics = topics.filter(t => t !== topicToDelete); localStorage.setItem('wifey_topics', JSON.stringify(topics)); loadTopics(); closeModal('modal-delete'); }
-        function closeModal(id) { document.getElementById(id).style.display = 'none'; }
-        function closeModalOnOutsideClick(e, id) { if (e.target.id === id) closeModal(id); }
-        function togglePass() { const pwd = document.getElementById('pass'); pwd.type = pwd.type === "password" ? "text" : "password"; }
-        
-        function stripComments() {
-            const ta = activeTab === 'input' ? document.getElementById('input_code') : document.getElementById('wrapped_code');
-            let code = ta.value;
-            code = code.replace(/\\/\\*[\\s\\S]*?\\*\\//g, ''); 
-            code = code.replace(/([^:])\\/\\/.*/g, '$1'); 
-            code = code.replace(/^\\/\\/.*/gm, ''); 
-            code = code.replace(/^\\s*[\\r\\n]/gm, '');
-            ta.value = code;
-        }
-        
-        function fetchPreview() {
-            document.getElementById('wrapped_code').value = "Generating smart preview...";
-            const data = {
-                ssid: document.getElementById('ssid').value, pass: document.getElementById('pass').value,
-                api_url: document.getElementById('api_url').value.replace(/\\/$/, ''), topic: document.getElementById('topic_val').value,
-                code: document.getElementById('input_code').value
-            };
-            fetch('/preview', { 
-                method: 'POST', 
-                headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' }, 
-                body: JSON.stringify(data) 
-            })
-            .then(res => res.json()).then(data => document.getElementById('wrapped_code').value = data.code)
-            .catch(err => document.getElementById('wrapped_code').value = "// Preview failed: " + err);
-        }
-        
-        function compileAndPublish() {
-            const topicVal = document.getElementById('topic_val').value;
-            localStorage.setItem('wifi_ssid', document.getElementById('ssid').value);
-            localStorage.setItem('wifi_pass', document.getElementById('pass').value);
-            localStorage.setItem('last_topic', topicVal);
-
-            const data = {
-                ssid: document.getElementById('ssid').value, pass: document.getElementById('pass').value,
-                api_url: document.getElementById('api_url').value.replace(/\\/$/, ''), topic: topicVal,
-                code: activeTab === 'wrapped' ? document.getElementById('wrapped_code').value : document.getElementById('input_code').value, 
-                is_wrapped: activeTab === 'wrapped'
-            };
-            const term = document.getElementById('terminal');
-            term.innerText = "[*] Analyzing code hash for cache hit...";
-            document.getElementById('btn-compile').style.opacity = '0.5';
-            document.getElementById('btn-compile').style.pointerEvents = 'none';
-            
-            fetch('/compile', { 
-                method: 'POST', 
-                headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' }, 
-                body: JSON.stringify(data) 
-            })
-            .then(res => res.json()).then(resData => { term.innerText = resData.logs; document.getElementById('btn-compile').style.opacity = '1'; document.getElementById('btn-compile').style.pointerEvents = 'auto'; })
-            .catch(err => { term.innerText = "❌ System Error: " + err; document.getElementById('btn-compile').style.opacity = '1'; document.getElementById('btn-compile').style.pointerEvents = 'auto'; });
-        }
-    </script>
-</body>
-</html>
-"""
-
-# --- ISOLATED PROVISIONING HTML ---
-PROVISION_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>WiFeY Global USB Provisioning</title>
-    <style>
-        body { font-family: Arial, sans-serif; background: #0f172a; margin: 0; padding: 20px; color: #f8fafc; zoom: 1.3; }
-        .container { max-width: 600px; margin: auto; background: #1e293b; padding: 30px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); border: 1px solid #334155; }
-        h2 { border-bottom: 1px solid #334155; padding-bottom: 10px; color: #3b82f6; margin-top: 0; }
-        label { font-weight: bold; display: block; margin-top: 15px; font-size: 14px; color: #94a3b8; }
-        input, select { width: 100%; padding: 10px; margin-top: 5px; background: #0f172a; border: 1px solid #334155; color: white; border-radius: 4px; box-sizing: border-box; }
-        button { background: #3b82f6; color: white; border: none; padding: 12px 20px; border-radius: 4px; cursor: pointer; font-size: 16px; width: 100%; margin-top: 20px; font-weight: bold; }
-        button:hover { background: #2563eb; }
-        #output { margin-top: 20px; background: #000; color: #10b981; padding: 15px; border-radius: 4px; font-family: monospace; white-space: pre-wrap; display: none; border: 1px solid #334155;}
-        .btn-secondary { background: transparent; border: 1px solid #3b82f6; color: #3b82f6; text-decoration: none; display: block; text-align: center; padding: 12px 20px; border-radius: 4px; margin-top: 10px; font-weight: bold; font-size: 16px; transition: 0.2s; box-sizing: border-box; }
-        .btn-secondary:hover { background: rgba(59, 130, 246, 0.1); }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>🌐 WiFeY USB Provisioning Tool</h2>
-        <p style="font-size: 13px; color: #94a3b8; margin-top: -5px;">Uploads the secure bootloader to new devices.</p>
-        
-        <label>Select COM Port:</label>
-        <select id="port">
-            {% for p in ports %}
-            <option value="{{ p.device }}">{{ p.device }} - {{ p.description }}</option>
-            {% endfor %}
-        </select>
-
-        <label>Wi-Fi SSID (Use Hotspot to bypass Captive Portals):</label>
-        <input type="text" id="ssid" placeholder="Network Name">
-
-        <label>Wi-Fi Password:</label>
-        <input type="password" id="pass" placeholder="Password">
-
-        <label>Public API URL (From Ngrok):</label>
-        <input type="text" id="api_url" value="{{ ngrok_url }}" readonly style="color: #94a3b8;">
-
-        <label>Device ID (e.g., node_1, node_2):</label>
-        <input type="text" id="device_id" placeholder="node_1">
-        
-        <label>Secret Auth Token (Gatekeeper Key):</label>
-        <input type="text" id="auth_token" value="secret_abc123" readonly style="color: #94a3b8;">
-
-        <button id="btn-flash" onclick="flashDevice()">Compile & Provision via USB</button>
-        <a href="/" class="btn-secondary">⬅️ Back to Main IDE</a>
-        <div id="output"></div>
-    </div>
-
-    <script>
-        window.onload = () => {
-            ['ssid', 'pass', 'device_id'].forEach(id => {
-                if(localStorage.getItem('prov_v3_' + id)) {
-                    document.getElementById(id).value = localStorage.getItem('prov_v3_' + id);
-                }
-            });
-        }
+        // --- The Flash & Auto-Reconnect Logic ---
+        let pendingSerialReconnect = false;
+        let savedSerialPort = "";
+        let savedSerialBaud = "";
 
         function flashDevice() {
+            const port = document.getElementById('prov_port').value;
+            if(!port) return alert("Select a COM port first.");
+            
+            if (serialEventSource) {
+                savedSerialPort = document.getElementById('serial_port').value;
+                savedSerialBaud = document.getElementById('serial_baud').value;
+                if (savedSerialPort === port) {
+                    pendingSerialReconnect = true;
+                    disconnectSerial(true); 
+                }
+            }
+            
             const data = {
-                port: document.getElementById('port').value,
-                ssid: document.getElementById('ssid').value,
-                pass: document.getElementById('pass').value,
-                api_url: document.getElementById('api_url').value.replace(/\\/$/, ''),
-                device_id: document.getElementById('device_id').value,
-                auth_token: document.getElementById('auth_token').value
+                port: port,
+                ssid: document.getElementById('top-wifi-ssid').value,
+                pass: document.getElementById('top-wifi-pass').value,
+                api_url: NGROK_API_URL,
+                fleet_id: document.getElementById('prov_fleet_id').value,
+                device_id: document.getElementById('prov_device_id').value,
+                auth_token: "secret_abc123"
+            };
+            
+            logToOutput("[System] Hardware Flashing initiated via USB...");
+            
+            fetch('/flash', { method: 'POST', headers: { 'Content-Type': 'application/json'}, body: JSON.stringify(data) })
+            .then(res => res.json()).then(result => {
+                logToOutput(result.logs);
+                if (pendingSerialReconnect) {
+                    logToOutput("[System] Reconnecting Serial Monitor in 2 seconds...");
+                    setTimeout(() => {
+                        document.getElementById('serial_port').value = savedSerialPort;
+                        document.getElementById('serial_baud').value = savedSerialBaud;
+                        connectSerial();
+                        pendingSerialReconnect = false;
+                        switchPanelTab('panel-serial');
+                    }, 2000);
+                }
+            })
+            .catch(err => {
+                logToOutput(`[System] Error: ${err}`);
+                pendingSerialReconnect = false;
+            });
+        }
+
+        // --- Build & Deploy Logic ---
+        function simulateAction(actionType) {
+            if (actionType === 'Verifying') triggerSaveBin();
+            else if (actionType === 'Uploading') deployLoadedBin();
+        }
+
+        function triggerSaveBin() {
+            closeAllMenus();
+            const container = document.getElementById('action-progress-container');
+            const bar = document.getElementById('action-progress-bar');
+            container.classList.remove('hidden'); bar.style.width = '50%';
+            logToOutput("[Build] Starting compilation on local server...");
+
+            const rawCode = document.querySelector('#tab-raw textarea').value;
+            const payload = {
+                ssid: document.getElementById('top-wifi-ssid').value,
+                pass: document.getElementById('top-wifi-pass').value,
+                api_url: NGROK_API_URL, topic: currentTopic, code: rawCode
             };
 
-            ['ssid', 'pass', 'device_id'].forEach(key => localStorage.setItem('prov_v3_' + key, data[key]));
+            fetch('/api/build', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+            .then(async response => {
+                bar.style.width = '100%';
+                setTimeout(() => container.classList.add('hidden'), 500);
 
-            const out = document.getElementById('output');
-            const btn = document.getElementById('btn-flash');
-            out.style.display = 'block';
-            out.innerText = "Flashing in progress... Applying Upload Speed fix. Check terminal logs.";
-            btn.style.opacity = '0.5'; btn.style.pointerEvents = 'none';
+                if (response.headers.get("content-type").includes("application/json")) {
+                    const data = await response.json(); logToOutput(data.logs); return;
+                }
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url; a.download = "wifey_firmware.bin";
+                document.body.appendChild(a); a.click(); a.remove();
+                window.URL.revokeObjectURL(url);
+                logToOutput("[System] Binary compiled and downloaded to your machine successfully.");
+            })
+            .catch(err => { container.classList.add('hidden'); logToOutput(`[System] Compile Error: ${err}`); });
+        }
 
-            fetch('/flash', {
-                method: 'POST',
-                headers: { 
-                    'Content-Type': 'application/json',
-                    'ngrok-skip-browser-warning': 'true'
-                },
-                body: JSON.stringify(data)
-            }).then(res => res.json()).then(result => {
-                out.innerText = result.logs;
-                btn.style.opacity = '1'; btn.style.pointerEvents = 'auto';
-            }).catch(err => {
-                out.innerText = "Error: " + err;
-                btn.style.opacity = '1'; btn.style.pointerEvents = 'auto';
-            });
+        function triggerLoadBin() { document.getElementById('bin-file-input').click(); closeAllMenus(); }
+        function handleBinLoad(event) {
+            const file = event.target.files[0];
+            if (file) {
+                activeBinFile = file;
+                logToOutput(`[File] Loaded binary file: ${file.name} (${(file.size / 1024).toFixed(2)} KB)`);
+                logToOutput(`[System] Ready to flash. Click the right-arrow icon to deploy to fleet.`);
+                event.target.value = ''; 
+            }
+        }
+
+        function deployLoadedBin() {
+            if (!activeBinFile) { logToOutput("[System] ❌ No binary loaded. Click File -> Load .bin first."); return; }
+            const container = document.getElementById('action-progress-container');
+            const bar = document.getElementById('action-progress-bar');
+            container.classList.remove('hidden'); bar.style.width = '40%';
+            logToOutput("[Deploy] Pushing staged binary to Cloudflare R2...");
+
+            const formData = new FormData();
+            formData.append('bin_file', activeBinFile);
+            formData.append('topic', currentTopic); 
+
+            fetch('/api/deploy', { method: 'POST', body: formData })
+            .then(res => res.json()).then(data => {
+                bar.style.width = '100%'; setTimeout(() => container.classList.add('hidden'), 500);
+                logToOutput(data.logs); activeBinFile = null; 
+            })
+            .catch(err => { container.classList.add('hidden'); logToOutput(`[System] Deploy Error: ${err}`); });
         }
     </script>
 </body>
@@ -893,11 +1058,6 @@ def index():
 @app.route('/api/setup_status')
 def setup_status():
     return jsonify(SETUP_STATE)
-
-@app.route('/provision')
-def provision_page():
-    ports = serial.tools.list_ports.comports()
-    return render_template_string(PROVISION_HTML, ports=ports, ngrok_url=NGROK_URL)
 
 @app.route('/api/ports', methods=['GET'])
 def get_ports():
@@ -950,6 +1110,7 @@ def preview_code():
 
 @app.route('/api/manifest', methods=['GET'])
 def api_manifest():
+    fleet_id = request.args.get('fleet', 'DefaultFleet')
     device_id = request.args.get('device')
     auth_header = request.headers.get('Authorization')
     device_info = DEVICE_DATABASE.get(device_id, {"auth_token": "secret_abc123"})
@@ -958,109 +1119,93 @@ def api_manifest():
         return jsonify({"error": "Unauthorized"}), 401
 
     target_version = "v_base_001"
-    fleet = "Ramanand"
     
-    for f_name, f_data in VERSION_MANIFEST.items():
+    if fleet_id in VERSION_MANIFEST:
+        f_data = VERSION_MANIFEST[fleet_id]
         if device_id in f_data.get("nodes", {}):
-            fleet = f_name
             target_version = f_data["nodes"][device_id]
-            break
-        elif f_name in VERSION_MANIFEST:
-            fleet = f_name
+        else:
             target_version = f_data.get("fleet_version", "v_base_001")
 
     try:
         s3_client = get_s3_client()
         download_url = s3_client.generate_presigned_url(
-            'get_object', Params={'Bucket': R2_BUCKET, 'Key': f'{fleet}/firmware.bin'}, ExpiresIn=900
+            'get_object', Params={'Bucket': R2_BUCKET, 'Key': f'{fleet_id}/firmware.bin'}, ExpiresIn=900
         )
     except:
         download_url = ""
 
     return jsonify({"target_version": target_version, "download_url": download_url})
 
-@app.route('/compile', methods=['POST'])
-def compile_code():
+@app.route('/api/build', methods=['POST'])
+def build_binary():
     try:
         data = request.json
-        ssid, passw, api_url, topic = data.get('ssid'), data.get('pass'), data.get('api_url'), data.get('topic')
+        ssid, passw = data.get('ssid'), data.get('pass')
+        api_url, topic = data.get('api_url'), data.get('topic')
         user_code = data.get('code')
-        is_wrapped = data.get('is_wrapped', False)
-        logs = []
 
-        if is_wrapped:
-            dummy_code = user_code
-        else:
-            dummy_code = generate_wrapped_code(ssid, passw, api_url, topic, user_code, "DUMMY_VERSION")
+        final_code = generate_wrapped_code(ssid, passw, api_url, topic, user_code, "manual_build")
         
-        code_hash = hashlib.md5(dummy_code.encode('utf-8')).hexdigest()[:8]
-        version_id = f"v_{code_hash}"
+        cli_path = SETUP_STATE.get("cli_path") or shutil.which("arduino-cli")
+        fqbn = "esp32:esp32:esp32"
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sketch_name = "WiFeYSketch"
+            sketch_dir = os.path.join(temp_dir, sketch_name)
+            os.makedirs(sketch_dir)
+            
+            sketch_file = os.path.join(sketch_dir, f"{sketch_name}.ino")
+            with open(sketch_file, "w", encoding="utf-8") as f:
+                f.write(final_code)
 
-        bin_path = os.path.join(CACHE_DIR, f"{version_id}.bin")
-        skip_compile = version_id in COMPILED_CACHE and os.path.exists(bin_path)
+            output_dir = os.path.join(temp_dir, "output")
+            os.makedirs(output_dir, exist_ok=True)
 
+            compile_res = subprocess.run([cli_path, "compile", "--fqbn", fqbn, "--build-cache-path", CORE_CACHE_DIR, "--output-dir", output_dir, sketch_file], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
+            
+            if compile_res.returncode != 0: 
+                return jsonify({"error": True, "logs": "❌ COMPILATION FAILED:\n" + compile_res.stderr})
+            
+            compiled_bin = os.path.join(output_dir, f"{sketch_name}.ino.bin")
+            
+            return send_file(compiled_bin, as_attachment=True, download_name="wifey_firmware.bin", mimetype="application/octet-stream")
+            
+    except Exception as e:
+        return jsonify({"error": True, "logs": f"❌ Server Crash: {str(e)}"})
+
+@app.route('/api/deploy', methods=['POST'])
+def deploy_binary():
+    try:
+        if 'bin_file' not in request.files:
+            return jsonify({"error": True, "logs": "No binary file provided."})
+            
+        bin_file = request.files['bin_file']
+        topic = request.form.get('topic')
+        version_id = f"v_{int(time.time())}" 
+        
         parts = topic.split('/')
-        company = parts[0] if len(parts) > 0 else "Ramanand"
+        company = parts[0] if len(parts) > 0 else "DefaultFleet"
         is_fleet_update = "fleet" in topic
         device_id = parts[2] if len(parts) >= 3 else "node_1"
 
-        if skip_compile:
-            logs.append(f"[*] ⚡ CACHE HIT! Version '{version_id}' is already compiled. Bypassing arduino-cli.")
+        s3_client = get_s3_client()
+        remote_filename = f"{company}/firmware.bin"
+        s3_client.put_object(Bucket=R2_BUCKET, Key=remote_filename, Body=bin_file.read(), ContentType="application/octet-stream")
+        
+        if company not in VERSION_MANIFEST:
+            VERSION_MANIFEST[company] = {"fleet_version": "v_base_001", "nodes": {}}
+        
+        if is_fleet_update:
+            VERSION_MANIFEST[company]["fleet_version"] = version_id
+            VERSION_MANIFEST[company]["nodes"] = {} 
         else:
-            final_code = user_code if is_wrapped else generate_wrapped_code(ssid, passw, api_url, topic, user_code, version_id)
-            
-            cli_path = SETUP_STATE["cli_path"]
-            fqbn = "esp32:esp32:esp32"
-            
-            with tempfile.TemporaryDirectory() as temp_dir:
-                sketch_name = "CloudSketch"
-                sketch_dir = os.path.join(temp_dir, sketch_name)
-                os.makedirs(sketch_dir)
-                
-                sketch_file = os.path.join(sketch_dir, f"{sketch_name}.ino")
-                with open(sketch_file, "w", encoding="utf-8") as f:
-                    f.write(final_code)
+            VERSION_MANIFEST[company]["nodes"][device_id] = version_id
 
-                logs.append("[*] Compiling new sketch with arduino-cli...")
-                output_dir = os.path.join(temp_dir, "output")
-                os.makedirs(output_dir, exist_ok=True)
-
-                compile_res = subprocess.run([cli_path, "compile", "--fqbn", fqbn, "--build-cache-path", CORE_CACHE_DIR, "--output-dir", output_dir, sketch_file], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
-                if compile_res.returncode != 0: 
-                    return jsonify({"logs": "\n".join(logs) + "\n\n❌ COMPILATION FAILED:\n" + compile_res.stderr})
-                
-                compiled_bin = os.path.join(output_dir, f"{sketch_name}.ino.bin")
-                shutil.copy(compiled_bin, bin_path)
-                COMPILED_CACHE[version_id] = bin_path
-                logs.append("[✓] Compilation successful and saved to local cache!")
-
-        logs.append("[*] Uploading binary to Cloudflare R2...")
-        try:
-            s3_client = get_s3_client()
-            remote_filename = f"{company}/firmware.bin"
-            with open(bin_path, "rb") as bin_file:
-                s3_client.put_object(Bucket=R2_BUCKET, Key=remote_filename, Body=bin_file, ContentType="application/octet-stream")
-            
-            if company not in VERSION_MANIFEST:
-                VERSION_MANIFEST[company] = {"fleet_version": "v_base_001", "nodes": {}}
-            
-            if is_fleet_update:
-                VERSION_MANIFEST[company]["fleet_version"] = version_id
-                VERSION_MANIFEST[company]["nodes"] = {} 
-                logs.append(f"[✓] Fleet Manifest updated: {company} -> {version_id} (All node overrides cleared)")
-            else:
-                VERSION_MANIFEST[company]["nodes"][device_id] = version_id
-                logs.append(f"[✓] Node Manifest updated: {device_id} -> {version_id}")
-
-            logs.append(f"[✓] Uploaded binary to R2: {remote_filename}")
-            logs.append(f"\n🎉 SUCCESS! Version {version_id} published. Nodes targeting '{topic}' will pull it on next check-in.")
-        except Exception as e:
-            return jsonify({"logs": "\n".join(logs) + f"\n❌ R2 Upload Failed: {str(e)}"})
-
-        return jsonify({"logs": "\n".join(logs)})
+        return jsonify({"error": False, "logs": f"🎉 SUCCESS! Version {version_id} manually published to '{topic}'."})
         
     except Exception as e:
-        return jsonify({"logs": f"❌ Server Code Crash: {str(e)}"})
+        return jsonify({"error": True, "logs": f"❌ Deploy Failed: {str(e)}"})
 
 @app.route('/flash', methods=['POST'])
 def flash_route():
@@ -1070,7 +1215,7 @@ def flash_route():
     close_serial_connection()
     time.sleep(1.5) 
     
-    cli_path = SETUP_STATE["cli_path"]
+    cli_path = SETUP_STATE.get("cli_path") or shutil.which("arduino-cli")
     fqbn = "esp32:esp32:esp32"
 
     if not data.get('port'):
@@ -1080,11 +1225,12 @@ def flash_route():
     user_loop = 'static unsigned long p=0; if(millis()-p>=1000){p=millis(); Serial.println("Working...");}'
 
     full_code = MASTER_CPP_TEMPLATE
-    full_code = full_code.replace("{WIFI_SSID}", data['ssid'])
-    full_code = full_code.replace("{WIFI_PASS}", data['pass'])
-    full_code = full_code.replace("{API_BASE_URL}", data['api_url'])
-    full_code = full_code.replace("{DEVICE_ID}", data['device_id'])
-    full_code = full_code.replace("{AUTH_TOKEN}", data['auth_token'])
+    full_code = full_code.replace("{WIFI_SSID}", data.get('ssid', ''))
+    full_code = full_code.replace("{WIFI_PASS}", data.get('pass', ''))
+    full_code = full_code.replace("{API_BASE_URL}", data.get('api_url', ''))
+    full_code = full_code.replace("{FLEET_ID}", data.get('fleet_id', 'DefaultFleet'))
+    full_code = full_code.replace("{DEVICE_ID}", data.get('device_id', 'node_1'))
+    full_code = full_code.replace("{AUTH_TOKEN}", data.get('auth_token', ''))
     full_code = full_code.replace("{CURRENT_VERSION}", "v_base_001")
     full_code = full_code.replace("{USER_GLOBALS}", "")
     full_code = full_code.replace("{USER_SETUP}", user_setup)
@@ -1115,7 +1261,6 @@ def flash_route():
 
     return jsonify({"logs": "\n".join(logs)})
 
-
 if __name__ == '__main__':
     import webview
     
@@ -1141,7 +1286,7 @@ if __name__ == '__main__':
         width=1600, 
         height=1000,
         min_size=(1200, 800),
-        background_color='#0f172a'
+        background_color='#181818'
     )
     
     webview.start()
