@@ -1,9 +1,18 @@
-# Security
+# Secrets and Local Database
 .env
+wifey_db.json
+*.tmp
 
-# PyInstaller & Build Caches
+# Arduino CLI & App Caches
+core_cache/
+build_cache/
+
+# PyInstaller Build Outputs
 build/
 dist/
-build_cache/
-core_cache/
 *.spec
+*.exe
+
+# Python specifics
+__pycache__/
+*.pyc

@@ -8,13 +8,16 @@ WiFeY Studio is an open-source, lightweight desktop IDE and Over-The-Air (OTA) m
 
 ## 🌟 Key Features
 
-* **Zero-Config Toolchain Setup:** Automatically downloads and configures `arduino-cli`, the ESP32 board index, Xtensa toolchains, and `ArduinoJson` on first launch.
-* **Ultra-Fast Smart Build Cache:** Caches compiled cores persistently, reducing compile times from 30+ seconds down to **2–5 seconds**.
+* **Zero-Config Fast Toolchain Setup:** Automatically detects local or global `arduino-cli`, with fast-track instant initialization and automated downloads for ESP32 board index, Xtensa toolchains, and `ArduinoJson`.
+* **Ultra-Fast Multi-Core Build Cache:** Utilizes all CPU cores (`-j 0`) and smart persistent build caching, cutting compile times to just seconds.
+* **Persistent Fleet & Device Registry:** Live SQLite/JSON device database (`wifey_db.json`) tracking connected ESP32 nodes, target versions, check-in history, and online status.
 * **Pull-Based OTA Architecture:** ESP32 nodes check a lightweight JSON manifest endpoint over HTTPS to pull down update binaries only when a new version is published.
 * **Cloudflare R2 Binary Distribution:** Uses S3-compatible pre-signed URLs to distribute firmware binaries securely over wide area networks (WANs).
 * **Automated Ngrok Tunneling:** Exposes local Flask management endpoints to the internet automatically via static Ngrok tunnels.
-* **USB Initial Provisioning Tool:** Flash new ESP32 microcontrollers with the WiFeY OTA bootloader with a single click.
-* **Live Serial Monitor:** Integrated real-time WebSockets/Server-Sent Events (SSE) serial monitor for hardware debugging.
+* **USB Initial Provisioning Tool:** Flash new ESP32 microcontrollers with the WiFeY OTA bootloader with a single click and auto-register them in your fleet.
+* **Bidirectional Serial Monitor:** Integrated real-time SSE serial monitor with command sending, configurable baud rates, timestamps, and autoscroll for hardware debugging.
+* **Developer-Friendly Code Editor:** Features synchronized line numbering, Tab key indentation, keyboard shortcuts (`Ctrl+S`, `Ctrl+U`), wrapped OTA preview, and built-in example sketches.
+* **In-IDE Cloud & Settings Config:** Manage `.env` credentials, Ngrok domain, R2 bucket keys, and toolchain configurations directly from the desktop interface.
 * **Native Desktop Interface:** Runs as a native desktop application using `pywebview`.
 
 ---
@@ -140,11 +143,12 @@ After compilation, the executable `WiFeY_Studio.exe` will be located in the `dis
 
 ```text
 WiFeY-Studio/
-├── app.py                  # Main Flask application & GUI logic
-├── WiFeY-Installer.py      # Automated pipeline & PyInstaller builder
+├── app.py                  # Main Flask application, API endpoints & native GUI
+├── WiFeY-Installer.py      # Automated pipeline & PyInstaller standalone builder
+├── wifey_db.json           # Persistent fleet & device registry database
 ├── .env                    # Secret API keys & domain config (Create manually)
 ├── .env.example            # Template for environment variables
-├── build_cache/            # Smart compilation cache (Automated)
+├── build_cache/            # Multi-core smart compilation cache (Automated)
 ├── core_cache/             # Arduino core binary cache (Automated)
 └── dist/                   # Output directory for compiled EXE
 ```

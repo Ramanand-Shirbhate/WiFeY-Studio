@@ -6,23 +6,342 @@ import json
 import tempfile
 import subprocess
 import shutil
-import threading
-import webbrowser
-import hashlib
 import zipfile
-import urllib.request
+import threading
 import ssl
+import urllib.request
+import socket
+import secrets
+import queue
 import serial
 import serial.tools.list_ports
 from flask import Flask, render_template_string, request, jsonify, Response, send_file
 import boto3
 from botocore.config import Config
 from dotenv import load_dotenv
+import requests
+import ctypes
+import webbrowser
+import hashlib
+import base64
+import urllib.parse
 
-load_dotenv()
+# Automatically hide the Windows console window on startup
+if os.name == 'nt':
+    try:
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)  # 0 = SW_HIDE
+    except Exception:
+        pass
 
-# --- WINDOWS SUBPROCESS NO-CONSOLE FLAG ---
+# --- APPLICATION BASE DIRECTORY RESOLUTION ---
+if getattr(sys, 'frozen', False):
+    APP_DIR = os.path.dirname(sys.executable)
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Load environment variables from .env located in the app directory
+ENV_FILE_PATH = os.path.join(APP_DIR, '.env')
+load_dotenv(ENV_FILE_PATH)
+
+# Windows Subprocess Flag (prevent console windows from popping up)
 CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+
+# --- CACHE & DATABASE DIRECTORIES ---
+CORE_CACHE_DIR = os.path.join(APP_DIR, "core_cache")
+BUILD_CACHE_DIR = os.path.join(APP_DIR, "build_cache")
+os.makedirs(CORE_CACHE_DIR, exist_ok=True)
+os.makedirs(BUILD_CACHE_DIR, exist_ok=True)
+
+DB_PATH = os.path.join(APP_DIR, "wifey_db.json")
+
+# --- DATABASE MANAGER (Persistent, Thread-Safe JSON Store) ---
+class DatabaseManager:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self._data = {
+            "user_profile": {
+                "google_sub": "",
+                "email": "",
+                "id_token": "",
+                "picture": ""
+            },
+            "manifest": {},
+            "devices": {}
+        }
+        self.load()
+
+    def load(self):
+        with self.lock:
+            if os.path.exists(self.db_path):
+                try:
+                    with open(self.db_path, "r", encoding="utf-8") as f:
+                        self._data = json.load(f)
+                except Exception as e:
+                    print(f"[DB] Error loading database: {e}")
+
+            # Ensure user_profile top-level structure
+            if "user_profile" not in self._data or not isinstance(self._data["user_profile"], dict):
+                self._data["user_profile"] = {"google_sub": "", "email": "", "id_token": "", "picture": ""}
+            else:
+                self._data["user_profile"].setdefault("google_sub", "")
+                self._data["user_profile"].setdefault("email", "")
+                self._data["user_profile"].setdefault("id_token", "")
+                self._data["user_profile"].setdefault("picture", "")
+
+            if "manifest" not in self._data or not isinstance(self._data["manifest"], dict):
+                self._data["manifest"] = {}
+            if "devices" not in self._data or not isinstance(self._data["devices"], dict):
+                self._data["devices"] = {}
+
+            # Schema migration for manifest (integer target_build and firmware_url)
+            for fleet_name, fleet_data in list(self._data["manifest"].items()):
+                if not isinstance(fleet_data, dict):
+                    self._data["manifest"][fleet_name] = {"target_build": 100, "firmware_url": ""}
+                    continue
+                if "target_build" not in fleet_data:
+                    # Migrate from old fleet_version if possible
+                    fleet_data["target_build"] = 100
+                else:
+                    try:
+                        fleet_data["target_build"] = int(fleet_data["target_build"])
+                    except:
+                        fleet_data["target_build"] = 100
+                if "firmware_url" not in fleet_data:
+                    fleet_data["firmware_url"] = ""
+
+            # Schema migration for devices (integer current_build, device_token, custom overrides)
+            for dev_id, dev_data in list(self._data["devices"].items()):
+                if not isinstance(dev_data, dict):
+                    continue
+                dev_data.setdefault("fleet", "DefaultFleet")
+                # Migrate auth_token -> device_token
+                if "device_token" not in dev_data:
+                    dev_data["device_token"] = dev_data.get("auth_token") or f"dt_{secrets.token_hex(8)}"
+                # Migrate version -> current_build (integer)
+                if "current_build" not in dev_data:
+                    old_ver = dev_data.get("version", 100)
+                    m = re.search(r'\d+', str(old_ver))
+                    dev_data["current_build"] = int(m.group(0)) if m else 100
+                else:
+                    try:
+                        dev_data["current_build"] = int(dev_data["current_build"])
+                    except:
+                        dev_data["current_build"] = 100
+                dev_data.setdefault("last_seen", time.time())
+                if "custom_build_override" not in dev_data:
+                    dev_data["custom_build_override"] = None
+                elif dev_data["custom_build_override"] is not None:
+                    try:
+                        dev_data["custom_build_override"] = int(dev_data["custom_build_override"])
+                    except:
+                        dev_data["custom_build_override"] = None
+                if "custom_firmware_url" not in dev_data:
+                    dev_data["custom_firmware_url"] = None
+
+    def save(self):
+        with self.lock:
+            tmp_path = self.db_path + ".tmp"
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(self._data, f, indent=4)
+                os.replace(tmp_path, self.db_path)
+            except Exception as e:
+                print(f"[DB] Error saving database: {e}")
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except:
+                        pass
+
+    def get_all(self):
+        with self.lock:
+            return json.loads(json.dumps(self._data))
+
+    def get_user_profile(self):
+        with self.lock:
+            return dict(self._data.get("user_profile", {}))
+
+    def set_user_profile(self, google_sub=None, email=None, id_token=None, picture=None):
+        with self.lock:
+            prof = self._data.setdefault("user_profile", {})
+            if google_sub is not None: prof["google_sub"] = google_sub
+            if email is not None: prof["email"] = email
+            if id_token is not None: prof["id_token"] = id_token
+            if picture is not None: prof["picture"] = picture
+        self.save()
+
+    def clear_user_profile(self):
+        with self.lock:
+            self._data["user_profile"] = {
+                "google_sub": "",
+                "email": "",
+                "id_token": "",
+                "picture": ""
+            }
+        self.save()
+
+    def get_device(self, device_id):
+        with self.lock:
+            return self._data.get("devices", {}).get(device_id)
+
+    def is_valid_device_token(self, device_id, device_token):
+        with self.lock:
+            dev = self._data.get("devices", {}).get(device_id)
+            if dev and dev.get("device_token") == device_token:
+                return True
+            return False
+
+    def get_all_device_tokens(self):
+        with self.lock:
+            return {d.get("device_token") for d in self._data.get("devices", {}).values() if d.get("device_token")}
+
+    def register_or_update_device(self, device_id, fleet, device_token=None, current_build=None):
+        with self.lock:
+            now = time.time()
+            if device_id not in self._data["devices"]:
+                self._data["devices"][device_id] = {
+                    "fleet": fleet,
+                    "device_token": device_token or f"dt_{secrets.token_hex(8)}",
+                    "current_build": int(current_build) if current_build is not None else 100,
+                    "last_seen": now,
+                    "custom_build_override": None,
+                    "custom_firmware_url": None
+                }
+            else:
+                dev = self._data["devices"][device_id]
+                if fleet:
+                    dev["fleet"] = fleet
+                dev["last_seen"] = now
+                if device_token:
+                    dev["device_token"] = device_token
+                if current_build is not None:
+                    dev["current_build"] = int(current_build)
+            
+            if fleet and fleet not in self._data["manifest"]:
+                self._data["manifest"][fleet] = {"target_build": 100, "firmware_url": ""}
+        self.save()
+
+    def register_device_token(self, device_id, device_token):
+        with self.lock:
+            if device_id in self._data["devices"]:
+                self._data["devices"][device_id]["device_token"] = device_token
+            else:
+                self._data["devices"][device_id] = {
+                    "fleet": "DefaultFleet",
+                    "device_token": device_token,
+                    "current_build": 100,
+                    "last_seen": time.time(),
+                    "custom_build_override": None,
+                    "custom_firmware_url": None
+                }
+        self.save()
+
+    def update_device_seen(self, device_id, current_build=None):
+        with self.lock:
+            if device_id in self._data["devices"]:
+                self._data["devices"][device_id]["last_seen"] = time.time()
+                if current_build is not None:
+                    self._data["devices"][device_id]["current_build"] = int(current_build)
+        self.save()
+
+    def delete_device(self, device_id):
+        with self.lock:
+            if device_id in self._data["devices"]:
+                del self._data["devices"][device_id]
+        self.save()
+
+    def create_fleet(self, fleet_name, target_build=100, firmware_url=""):
+        with self.lock:
+            if fleet_name not in self._data["manifest"]:
+                self._data["manifest"][fleet_name] = {
+                    "target_build": int(target_build),
+                    "firmware_url": firmware_url
+                }
+        self.save()
+
+    def set_fleet_target_build(self, fleet_name, target_build, firmware_url=None):
+        with self.lock:
+            if fleet_name not in self._data["manifest"]:
+                self._data["manifest"][fleet_name] = {
+                    "target_build": int(target_build),
+                    "firmware_url": firmware_url or ""
+                }
+            else:
+                self._data["manifest"][fleet_name]["target_build"] = int(target_build)
+                if firmware_url is not None:
+                    self._data["manifest"][fleet_name]["firmware_url"] = firmware_url
+        self.save()
+
+    def get_target_build(self, fleet_id, device_id):
+        with self.lock:
+            if device_id and device_id in self._data.get("devices", {}):
+                dev = self._data["devices"][device_id]
+                override = dev.get("custom_build_override")
+                override_url = dev.get("custom_firmware_url")
+                if override is not None:
+                    return int(override), override_url or ""
+            
+            manifest_fleet = self._data.get("manifest", {}).get(fleet_id, {})
+            target_build = manifest_fleet.get("target_build", 100)
+            firmware_url = manifest_fleet.get("firmware_url", "")
+            return int(target_build), firmware_url
+
+    def set_node_override(self, device_id, build_num, url=None):
+        with self.lock:
+            if device_id in self._data.get("devices", {}):
+                self._data["devices"][device_id]["custom_build_override"] = int(build_num) if build_num is not None else None
+                self._data["devices"][device_id]["custom_firmware_url"] = url
+        self.save()
+
+    def clear_node_override(self, device_id):
+        with self.lock:
+            if device_id in self._data.get("devices", {}):
+                self._data["devices"][device_id]["custom_build_override"] = None
+                self._data["devices"][device_id]["custom_firmware_url"] = None
+        self.save()
+
+    def reassign_fleet(self, device_id, new_fleet):
+        with self.lock:
+            if device_id in self._data.get("devices", {}):
+                self._data["devices"][device_id]["fleet"] = new_fleet
+                if new_fleet not in self._data.get("manifest", {}):
+                    self._data.setdefault("manifest", {})[new_fleet] = {
+                        "target_build": 100,
+                        "firmware_url": ""
+                    }
+        self.save()
+
+    def get_next_build_number(self, fleet_name):
+        with self.lock:
+            target = self._data.get("manifest", {}).get(fleet_name, {}).get("target_build", 100)
+            try:
+                return max(int(target) + 1, 101)
+            except:
+                return 101
+
+db = DatabaseManager(DB_PATH)
+
+# --- FIND ARDUINO CLI TOOLCHAIN ---
+def find_arduino_cli():
+    # 1. Global PATH
+    cli = shutil.which("arduino-cli")
+    if cli and os.path.exists(cli):
+        return cli
+
+    # 2. Common Windows & AppData paths
+    common_paths = [
+        r"C:\arduino-cli\arduino-cli.exe",
+        os.path.join(os.environ.get('APPDATA', ''), 'WiFeY_Studio', 'arduino-cli.exe'),
+        os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs', 'arduino-cli', 'arduino-cli.exe'),
+        os.path.join(APP_DIR, 'arduino-cli.exe')
+    ]
+    for p in common_paths:
+        if p and os.path.exists(p):
+            return p
+    return None
 
 # --- AUTOMATED DEPENDENCY SETUP STATE ---
 SETUP_STATE = {
@@ -31,15 +350,13 @@ SETUP_STATE = {
     "log": "Starting environment checks...\n",
     "done": False,
     "error": False,
-    "cli_path": None
+    "cli_path": None,
+    "cli_version": "Unknown"
 }
 
 def create_windows_shortcuts():
-    if os.name != 'nt':
-        return 
-    if not getattr(sys, 'frozen', False):
-        return 
-
+    if os.name != 'nt' or not getattr(sys, 'frozen', False):
+        return
     exe_path = sys.executable
     vbs_script = f"""
     Set oWS = WScript.CreateObject("WScript.Shell")
@@ -60,19 +377,18 @@ def create_windows_shortcuts():
     """
     vbs_path = os.path.join(os.environ.get('TEMP', os.getcwd()), 'create_wifey_shortcut.vbs')
     try:
-        with open(vbs_path, 'w') as f:
+        with open(vbs_path, 'w', encoding='utf-8') as f:
             f.write(vbs_script)
         subprocess.run(['cscript.exe', '//Nologo', vbs_path], creationflags=CREATE_NO_WINDOW)
         os.remove(vbs_path)
-    except Exception as e:
-        pass 
+    except:
+        pass
 
 def download_file_with_progress(url, dest):
     def hook(count, block_size, total_size):
         if total_size > 0:
             percent = int(count * block_size * 100 / total_size)
             SETUP_STATE["progress"] = min(100, percent)
-    
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -81,18 +397,14 @@ def download_file_with_progress(url, dest):
 def setup_environment_thread():
     try:
         SETUP_STATE["stage"] = "Checking for Arduino CLI..."
-        cli_global = shutil.which("arduino-cli")
+        cli_executable = find_arduino_cli()
         
         LOCAL_APP_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'WiFeY_Studio')
         os.makedirs(LOCAL_APP_DIR, exist_ok=True)
         LOCAL_CLI_PATH = os.path.join(LOCAL_APP_DIR, 'arduino-cli.exe')
         
-        if cli_global:
-            SETUP_STATE["log"] += f"Found global Arduino CLI: {cli_global}\n"
-            cli_executable = cli_global
-        elif os.path.exists(LOCAL_CLI_PATH):
-            SETUP_STATE["log"] += f"Found local Arduino CLI: {LOCAL_CLI_PATH}\n"
-            cli_executable = LOCAL_CLI_PATH
+        if cli_executable:
+            SETUP_STATE["log"] += f"Found Arduino CLI at: {cli_executable}\n"
         else:
             SETUP_STATE["stage"] = "Downloading Arduino CLI (20MB)..."
             SETUP_STATE["log"] += "Downloading official Windows 64-bit release...\n"
@@ -108,8 +420,32 @@ def setup_environment_thread():
             SETUP_STATE["log"] += "Extraction complete.\n"
             
         SETUP_STATE["cli_path"] = cli_executable
-        SETUP_STATE["progress"] = 100
         
+        # Check CLI version
+        try:
+            ver_res = subprocess.run([cli_executable, "version"], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
+            if ver_res.returncode == 0:
+                SETUP_STATE["cli_version"] = ver_res.stdout.strip()
+        except:
+            pass
+
+        # Fast-track check: If core and lib are already installed, skip long network calls!
+        check_core = subprocess.run([cli_executable, "core", "list"], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
+        check_lib = subprocess.run([cli_executable, "lib", "list"], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
+        
+        has_esp32 = "esp32:esp32" in check_core.stdout
+        has_json = "ArduinoJson" in check_lib.stdout
+        
+        if has_esp32 and has_json:
+            SETUP_STATE["stage"] = "Toolchain Ready!"
+            SETUP_STATE["progress"] = 100
+            SETUP_STATE["log"] += "ESP32 Core & ArduinoJson verified. Launching WiFeY Studio...\n"
+            create_windows_shortcuts()
+            time.sleep(0.5)
+            SETUP_STATE["done"] = True
+            return
+
+        # Configure ESP32 Board Manager
         SETUP_STATE["stage"] = "Configuring ESP32 Board Manager..."
         subprocess.run([cli_executable, "config", "init"], capture_output=True, creationflags=CREATE_NO_WINDOW) 
         subprocess.run([cli_executable, "config", "set", "board_manager.additional_urls", "https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json"], capture_output=True, creationflags=CREATE_NO_WINDOW)
@@ -117,17 +453,15 @@ def setup_environment_thread():
         SETUP_STATE["stage"] = "Updating Arduino Core Index..."
         subprocess.run([cli_executable, "core", "update-index"], capture_output=True, creationflags=CREATE_NO_WINDOW)
         
-        check_core = subprocess.run([cli_executable, "core", "list"], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
-        if "esp32:esp32" not in check_core.stdout:
-            SETUP_STATE["stage"] = "Installing ESP32 Core (This takes a few minutes!)..."
+        if not has_esp32:
+            SETUP_STATE["stage"] = "Installing ESP32 Core (Downloading Toolchains)..."
             SETUP_STATE["log"] += "Downloading Xtensa toolchains and ESP32 board files...\n"
             process = subprocess.Popen([cli_executable, "core", "install", "esp32:esp32"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=CREATE_NO_WINDOW)
             for line in process.stdout:
                 SETUP_STATE["log"] += line
             process.wait()
             
-        check_lib = subprocess.run([cli_executable, "lib", "list"], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
-        if "ArduinoJson" not in check_lib.stdout:
+        if not has_json:
             SETUP_STATE["stage"] = "Installing ArduinoJson..."
             SETUP_STATE["log"] += "Fetching ArduinoJson library...\n"
             process = subprocess.Popen([cli_executable, "lib", "install", "ArduinoJson"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=CREATE_NO_WINDOW)
@@ -141,89 +475,281 @@ def setup_environment_thread():
         SETUP_STATE["stage"] = "Setup Complete!"
         SETUP_STATE["progress"] = 100
         SETUP_STATE["log"] += "\nAll dependencies verified! Launching WiFeY Studio...\n"
-        time.sleep(1.5)
+        time.sleep(1.0)
         SETUP_STATE["done"] = True
         
     except Exception as e:
         SETUP_STATE["error"] = True
         SETUP_STATE["log"] += f"\nERROR: {str(e)}"
 
-# --- PERMANENT NGROK DOMAIN ---
-NGROK_STATIC_DOMAIN = os.getenv("NGROK_STATIC_DOMAIN", "christie-noncarnivorous-pulvinately.ngrok-free.dev")
+# --- NGROK TUNNEL CONFIGURATION ---
+NGROK_STATIC_DOMAIN = os.getenv("NGROK_STATIC_DOMAIN", "")
+NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN", "")
 
-try:
-    from pyngrok import ngrok
-    if os.environ.get("WERKZEUG_RUN_MAIN") != "true" and not getattr(sys, 'frozen', False):
-        ngrok_tunnel = ngrok.connect(5000, domain=NGROK_STATIC_DOMAIN, bind_tls=True)
-        NGROK_URL = ngrok_tunnel.public_url
-    else:
-        NGROK_URL = f"https://{NGROK_STATIC_DOMAIN}"
-except Exception as e:
-    NGROK_URL = "http://127.0.0.1:5000"
+NGROK_URL = "http://127.0.0.1:5000"
+NGROK_ACTIVE = False
+
+if NGROK_STATIC_DOMAIN:
+    try:
+        from pyngrok import ngrok, conf
+        if NGROK_AUTHTOKEN:
+            ngrok.set_auth_token(NGROK_AUTHTOKEN)
+        # Check if already running or connect
+        tunnels = ngrok.get_tunnels()
+        existing = [t for t in tunnels if NGROK_STATIC_DOMAIN in t.public_url]
+        if existing:
+            NGROK_URL = existing[0].public_url
+            NGROK_ACTIVE = True
+        else:
+            try:
+                ngrok_tunnel = ngrok.connect(5000, domain=NGROK_STATIC_DOMAIN, bind_tls=True)
+                NGROK_URL = ngrok_tunnel.public_url
+                NGROK_ACTIVE = True
+            except:
+                NGROK_URL = f"https://{NGROK_STATIC_DOMAIN}"
+                NGROK_ACTIVE = True
+    except Exception as e:
+        NGROK_URL = f"https://{NGROK_STATIC_DOMAIN}" if NGROK_STATIC_DOMAIN else "http://127.0.0.1:5000"
 
 app = Flask(__name__)
 
-# --- CONFIGURATION ---
-R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
-R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
-R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
+# --- CLOUDFLARE R2 & WORKER CONFIGURATION ---
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
 R2_BUCKET = os.getenv("R2_BUCKET", "wifey-firmware")
+WORKER_BASE_URL = os.getenv("WORKER_BASE_URL", "https://wifey-gateway.07ramanand.workers.dev").rstrip('/')
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+OAUTH_STATES = {}
 
-CORE_CACHE_DIR = os.path.join(os.getcwd(), "core_cache")
-os.makedirs(CORE_CACHE_DIR, exist_ok=True)
+_S3_CLIENT = None
+_S3_LOCK = threading.Lock()
 
-DEVICE_DATABASE = {
-    "node_1": {"auth_token": "secret_abc123"},
-    "node_2": {"auth_token": "secret_abc123"}
-}
-VERSION_MANIFEST = {}
+def get_s3_client():
+    global _S3_CLIENT
+    with _S3_LOCK:
+        if not R2_ACCOUNT_ID or not R2_ACCESS_KEY or not R2_SECRET_KEY:
+            raise ValueError("Cloudflare R2 credentials not configured. Please update your settings.")
+        if _S3_CLIENT is None:
+            _S3_CLIENT = boto3.client(
+                "s3",
+                endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+                aws_access_key_id=R2_ACCESS_KEY,
+                aws_secret_access_key=R2_SECRET_KEY,
+                config=Config(signature_version="s3v4")
+            )
+        return _S3_CLIENT
 
+# --- LOCAL IP & LAN NETWORKING ---
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('10.255.255.255', 1))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = '127.0.0.1'
+    finally:
+        s.close()
+    return ip
+
+LAN_NODES = {}
+LAN_NODES_LOCK = threading.Lock()
+UDP_PORT = 53535
+
+# UI Event and Notification Queue (for live SSE notifications)
+UI_LOG_QUEUE = queue.Queue(maxsize=1000)
+
+def emit_ui_log(msg):
+    try:
+        UI_LOG_QUEUE.put_nowait(msg)
+    except:
+        pass
+
+def udp_beacon_listener():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_BROADCAST"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.bind(('', UDP_PORT))
+    except Exception as e:
+        print(f"[UDP Beacon] Bind error on port {UDP_PORT}: {e}")
+        return
+
+    print(f"[UDP Beacon] Service active, listening on UDP port {UDP_PORT}...")
+    while True:
+        try:
+            data, addr = sock.recvfrom(2048)
+            text = data.decode('utf-8', errors='ignore').strip()
+            if not text:
+                continue
+
+            if text.startswith('{') and text.endswith('}'):
+                try:
+                    beacon = json.loads(text)
+                    device_id = beacon.get("device_id")
+                    device_token = beacon.get("device_token")
+                    ip = beacon.get("ip") or addr[0]
+                    build = beacon.get("build", 100)
+
+                    if device_id and device_token:
+                        # Multi-User Isolation Check:
+                        # Match device_token against user's registered devices in wifey_db.json
+                        registered = db.get_device(device_id)
+                        if registered and registered.get("device_token") == device_token:
+                            now = time.time()
+                            with LAN_NODES_LOCK:
+                                LAN_NODES[device_id] = {
+                                    "device_id": device_id,
+                                    "device_token": device_token,
+                                    "ip": ip,
+                                    "build": int(build),
+                                    "fleet": registered.get("fleet", "DefaultFleet"),
+                                    "last_seen": now
+                                }
+                            db.update_device_seen(device_id, current_build=int(build))
+                        else:
+                            # Ignores nodes belonging to other users on the same Wi-Fi router
+                            pass
+                except Exception:
+                    pass
+            elif text.startswith('['):
+                # Wireless UDP Serial logging from WIFEY_PRINT
+                log_line = f"[UDP LOG {addr[0]}] {text}\n"
+                emit_ui_log(log_line)
+        except Exception:
+            time.sleep(0.1)
+
+def resolve_api_url(url_str):
+    """Replaces localhost/127.0.0.1 with PC local network IP for ESP32 connectivity."""
+    if not url_str:
+        return f"http://{get_local_ip()}:5000"
+    url_str = url_str.rstrip('/')
+    if "127.0.0.1" in url_str or "localhost" in url_str:
+        local_ip = get_local_ip()
+        url_str = url_str.replace("127.0.0.1", local_ip).replace("localhost", local_ip)
+    return url_str
+
+def upload_firmware_to_cloud(fleet_id, binary_bytes, build_num, id_token=None):
+    # Always save local cache copy for LAN HTTP serving
+    try:
+        lan_bin_path = os.path.join(BUILD_CACHE_DIR, "output", "WiFeYSketch.ino.bin")
+        os.makedirs(os.path.dirname(lan_bin_path), exist_ok=True)
+        with open(lan_bin_path, "wb") as f:
+            f.write(binary_bytes)
+    except Exception as e:
+        print(f"[LAN Cache] Error saving binary: {e}")
+
+    token = id_token or db.get_user_profile().get("id_token")
+    
+    # 1. Cloudflare Worker Gateway (Delegated Auth)
+    if WORKER_BASE_URL and token:
+        try:
+            worker_upload_url = f"{WORKER_BASE_URL}/api/firmware/upload"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "X-Fleet-ID": fleet_id,
+                "X-Build-Num": str(build_num)
+            }
+            files = {"file": (f"{fleet_id}_build_{build_num}.bin", binary_bytes, "application/octet-stream")}
+            data = {"fleet": fleet_id, "build": str(build_num)}
+            resp = requests.post(worker_upload_url, headers=headers, files=files, data=data, timeout=20)
+            if resp.status_code in (200, 201):
+                res_json = resp.json()
+                url = res_json.get("download_url") or res_json.get("url")
+                if url:
+                    return url
+        except Exception as e:
+            print(f"[Worker] Upload error: {e}")
+
+    # 2. Direct Cloudflare R2 S3 fallback
+    if R2_ACCOUNT_ID and R2_ACCESS_KEY and R2_SECRET_KEY:
+        try:
+            s3 = get_s3_client()
+            remote_key = f"{fleet_id}/firmware.bin"
+            s3.put_object(
+                Bucket=R2_BUCKET,
+                Key=remote_key,
+                Body=binary_bytes,
+                ContentType="application/octet-stream"
+            )
+            return s3.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': R2_BUCKET, 'Key': remote_key},
+                ExpiresIn=86400
+            )
+        except Exception as e:
+            print(f"[R2] Direct S3 upload error: {e}")
+
+    # 3. LAN HTTP fallback
+    local_ip = get_local_ip()
+    return f"http://{local_ip}:5000/api/lan/firmware/WiFeYSketch.ino.bin"
+# --- SERIAL COMMUNICATION STATE & LOCK ---
+SERIAL_LOCK = threading.Lock()
 SERIAL_STATE = {
     "port": None,
+    "baud": 115200,
     "serial_obj": None,
     "is_running": False
 }
 
-RE_INCLUDES = re.compile(r'#include\s*[<"](WiFi\.h|WiFiClientSecure\.h|PubSubClient\.h|HTTPClient\.h|HTTPUpdate\.h|ArduinoJson\.h)[>"]')
-RE_CONFIGS = re.compile(r'^\s*(const\s+)?char\s*\*\s*(ssid|password|api_url|auth_token|current_version)\s*=.*;', re.MULTILINE)
+def close_serial_connection():
+    with SERIAL_LOCK:
+        SERIAL_STATE["is_running"] = False
+        if SERIAL_STATE["serial_obj"]:
+            try:
+                if SERIAL_STATE["serial_obj"].is_open:
+                    SERIAL_STATE["serial_obj"].setDTR(False)
+                    SERIAL_STATE["serial_obj"].setRTS(False)
+                    SERIAL_STATE["serial_obj"].close()
+            except:
+                pass
+            SERIAL_STATE["serial_obj"] = None
+
+# --- REGEX RULES FOR SMART CODE WRAPPING ---
+RE_INCLUDES = re.compile(r'#include\s*[<"](WiFi\.h|WiFiUdp\.h|WiFiClientSecure\.h|PubSubClient\.h|HTTPClient\.h|HTTPUpdate\.h|ArduinoJson\.h)[>"]')
+RE_CONFIGS = re.compile(r'^\s*(const\s+)?(char\s*\*|int|String)\s*(ssid|password|api_url|api_base_url|auth_token|device_token|device_id|fleet_id|current_version|CURRENT_BUILD)\s*=.*;', re.MULTILINE)
 RE_WIFI_BEGIN = re.compile(r'^\s*WiFi\.begin\(.*\);', re.MULTILINE)
 RE_WIFI_MODE = re.compile(r'^\s*WiFi\.mode\(.*\);', re.MULTILINE)
 RE_SERIAL_BEGIN = re.compile(r'^\s*Serial\.begin\(.*\);', re.MULTILINE)
 RE_DELAY = re.compile(r'\bdelay\s*\(')
 
-def get_s3_client():
-    return boto3.client(
-        "s3", endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
-        aws_access_key_id=R2_ACCESS_KEY, aws_secret_access_key=R2_SECRET_KEY,
-        config=Config(signature_version="s3v4")
-    )
-
-def close_serial_connection():
-    SERIAL_STATE["is_running"] = False
-    if SERIAL_STATE["serial_obj"] and SERIAL_STATE["serial_obj"].is_open:
-        try:
-            SERIAL_STATE["serial_obj"].setDTR(False)
-            SERIAL_STATE["serial_obj"].setRTS(False)
-            SERIAL_STATE["serial_obj"].close()
-        except:
-            pass
-    SERIAL_STATE["serial_obj"] = None
-
+# --- MASTER ARDUINO C++ OTA TEMPLATE ---
 MASTER_CPP_TEMPLATE = """#include <WiFi.h>
+#include <WiFiUdp.h>
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 
+// --- WiFeY Thin-Client Configurations ---
+const char* ssid = "{WIFI_SSID}";
+const char* password = "{WIFI_PASS}";
+const char* api_base_url = "{API_BASE_URL}";
+const char* fleet_id = "{FLEET_ID}";
+const char* device_id = "{DEVICE_ID}";
+const char* device_token = "{DEVICE_TOKEN}";
+const int CURRENT_BUILD = {CURRENT_BUILD};
+
+// UDP LAN Beacon & Wireless Logging
+WiFiUDP wifey_udp;
+const int WIFEY_UDP_PORT = 53535;
+unsigned long wifey_last_beacon = 0;
+const unsigned long WIFEY_BEACON_INTERVAL = 5000;
+
+#define WIFEY_PRINT(msg) do { \
+  Serial.println(msg); \
+  if (WiFi.status() == WL_CONNECTED) { \
+    wifey_udp.beginPacket(IPAddress(255, 255, 255, 255), WIFEY_UDP_PORT); \
+    wifey_udp.print(String("[") + device_id + "] " + msg); \
+    wifey_udp.endPacket(); \
+  } \
+} while(0)
+
 // --- User Globals & Includes ---
 {USER_GLOBALS}
 // -------------------------------
-
-const char* ssid = "{WIFI_SSID}";
-const char* password = "{WIFI_PASS}";
-const char* api_url = "{API_BASE_URL}/api/manifest?fleet={FLEET_ID}&device={DEVICE_ID}";
-const char* auth_token = "{AUTH_TOKEN}";
-const char* current_version = "{CURRENT_VERSION}";
 
 void success_flash() {
   pinMode(2, OUTPUT);
@@ -244,6 +770,49 @@ void upgrade_detected_flash() {
 void smartDelay(unsigned long ms) {
   unsigned long start = millis();
   while (millis() - start < ms) { yield(); }
+}
+
+void send_lan_beacon() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  wifey_udp.beginPacket(IPAddress(255, 255, 255, 255), WIFEY_UDP_PORT);
+  char beacon_buf[256];
+  snprintf(beacon_buf, sizeof(beacon_buf),
+    "{\\\"device_id\\\":\\\"%s\\\",\\\"device_token\\\":\\\"%s\\\",\\\"ip\\\":\\\"%s\\\",\\\"build\\\":%d}",
+    device_id, device_token, WiFi.localIP().toString().c_str(), CURRENT_BUILD);
+  wifey_udp.print(beacon_buf);
+  wifey_udp.endPacket();
+}
+
+void notify_flash_completion(int new_build) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  String notify_url = String(api_base_url) + "/api/device/notify_flash";
+  HTTPClient notifyHttp;
+  notifyHttp.setTimeout(8000);
+  
+  char body[192];
+  snprintf(body, sizeof(body),
+    "{\\\"device_id\\\":\\\"%s\\\",\\\"device_token\\\":\\\"%s\\\",\\\"status\\\":\\\"SUCCESS\\\",\\\"new_build\\\":%d}",
+    device_id, device_token, new_build);
+
+  if (notify_url.startsWith("https://")) {
+    WiFiClientSecure notifClient;
+    notifClient.setInsecure();
+    notifClient.setTimeout(8000);
+    notifyHttp.begin(notifClient, notify_url);
+    notifyHttp.addHeader("Content-Type", "application/json");
+    notifyHttp.addHeader("Authorization", String("Bearer ") + device_token);
+    notifyHttp.POST(body);
+    notifyHttp.end();
+    notifClient.stop();
+  } else {
+    WiFiClient notifClient;
+    notifyHttp.begin(notifClient, notify_url);
+    notifyHttp.addHeader("Content-Type", "application/json");
+    notifyHttp.addHeader("Authorization", String("Bearer ") + device_token);
+    notifyHttp.POST(body);
+    notifyHttp.end();
+    notifClient.stop();
+  }
 }
 
 void setup_wifi() {
@@ -273,65 +842,118 @@ void setup_wifi() {
   
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\\nWiFi connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
     digitalWrite(2, HIGH); delay(80);
     digitalWrite(2, LOW); delay(80);
     digitalWrite(2, HIGH); delay(80);
     digitalWrite(2, LOW);
+    
+    // Initialize UDP socket and broadcast initial LAN Beacon
+    wifey_udp.begin(WIFEY_UDP_PORT);
+    send_lan_beacon();
+  }
+}
+
+void process_manifest_and_update(const String& payload) {
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error) {
+    Serial.println("❌ JSON parsing failed.");
+    return;
+  }
+  
+  int target_build = doc["target_build"] | 0;
+  String download_url = doc["download_url"].as<String>();
+  
+  Serial.printf("Current Build: %d\\n", CURRENT_BUILD);
+  Serial.printf("Target Build:  %d\\n", target_build);
+  
+  if (target_build > CURRENT_BUILD && download_url.length() > 0 && download_url != "null") {
+    Serial.println("[*] Newer build detected! Starting OTA update...");
+    upgrade_detected_flash();
+    
+    httpUpdate.rebootOnUpdate(false);
+    t_httpUpdate_return ret;
+    
+    if (download_url.startsWith("https://")) {
+      WiFiClientSecure updateClient;
+      updateClient.setInsecure();
+      updateClient.setTimeout(30000);
+      ret = httpUpdate.update(updateClient, download_url);
+      updateClient.stop();
+    } else {
+      WiFiClient updateClient;
+      ret = httpUpdate.update(updateClient, download_url);
+      updateClient.stop();
+    }
+    
+    if (ret == HTTP_UPDATE_FAILED) {
+      Serial.printf("❌ Update Failed. Error: %s\\n", httpUpdate.getLastErrorString().c_str());
+    } else if (ret == HTTP_UPDATE_OK) {
+      Serial.println("[✓] Update Successful! Notifying backend...");
+      notify_flash_completion(target_build);
+      success_flash();
+      ESP.restart();
+    }
+  } else {
+    Serial.println("[✓] Firmware is up to date (no newer build).");
   }
 }
 
 void check_for_updates() {
   if (WiFi.status() != WL_CONNECTED) return;
   delay(1000); 
+
+  Serial.println("[*] Checking WiFeY API for OTA updates...");
   
-  Serial.println("[*] Checking WiFeY API over the Internet...");
-  WiFiClientSecure secureClient;
-  secureClient.setInsecure(); 
-  secureClient.setTimeout(15000);
-  
+  String manifest_url = String(api_base_url) + "/api/manifest?fleet=" + fleet_id + "&device=" + device_id;
   HTTPClient http;
   http.setTimeout(15000);
-  http.begin(secureClient, api_url);
-  http.addHeader("ngrok-skip-browser-warning", "true");
-  http.addHeader("Authorization", "Bearer " + String(auth_token));
   
-  int httpCode = http.GET();
-  if (httpCode == 200) {
-    String payload = http.getString();
-    StaticJsonDocument<512> doc;
-    DeserializationError error = deserializeJson(doc, payload);
+  if (manifest_url.startsWith("https://")) {
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+    secureClient.setTimeout(15000);
+    http.begin(secureClient, manifest_url);
+    http.addHeader("ngrok-skip-browser-warning", "true");
+    http.addHeader("Authorization", String("Bearer ") + device_token);
     
-    if (!error) {
-      String target_version = doc["target_version"].as<String>();
-      String download_url = doc["download_url"].as<String>();
-      
-      Serial.printf("Current Version: %s\\n", current_version);
-      Serial.printf("Target Version: %s\\n", target_version.c_str());
-      
-      if (target_version != current_version && target_version != "null") {
-        Serial.println("[*] New version found! Starting secure OTA download...");
-        upgrade_detected_flash(); 
-        
-        httpUpdate.rebootOnUpdate(false); 
-        t_httpUpdate_return ret = httpUpdate.update(secureClient, download_url);
-        
-        if (ret == HTTP_UPDATE_FAILED) {
-          Serial.printf("❌ Update Failed. Error: %s\\n", httpUpdate.getLastErrorString().c_str());
-        } else if (ret == HTTP_UPDATE_OK) {
-          Serial.println("[✓] Update Successful! Rebooting...");
-          success_flash(); 
-          ESP.restart();   
-        }
-      } else {
-        Serial.println("[✓] Firmware is up to date.");
-      }
+    int httpCode = http.GET();
+    if (httpCode == 200) {
+      String payload = http.getString();
+      http.end();
+      secureClient.stop();
+      process_manifest_and_update(payload);
     } else {
-      Serial.println("❌ JSON parsing failed.");
+      Serial.printf("❌ Manifest Check failed, HTTP Code: %d\\n", httpCode);
+      http.end();
+      secureClient.stop();
     }
   } else {
-    Serial.printf("❌ API Check failed, HTTP Code: %d\\n", httpCode);
+    WiFiClient client;
+    http.begin(client, manifest_url);
+    http.addHeader("Authorization", String("Bearer ") + device_token);
+    
+    int httpCode = http.GET();
+    if (httpCode == 200) {
+      String payload = http.getString();
+      http.end();
+      client.stop();
+      process_manifest_and_update(payload);
+    } else {
+      Serial.printf("❌ Manifest Check failed, HTTP Code: %d\\n", httpCode);
+      http.end();
+      client.stop();
+    }
   }
-  http.end();
+}
+
+void wifey_loop_maintenance() {
+  if (millis() - wifey_last_beacon >= WIFEY_BEACON_INTERVAL) {
+    wifey_last_beacon = millis();
+    send_lan_beacon();
+  }
 }
 
 void setup() {
@@ -342,27 +964,30 @@ void setup() {
 }
 
 void loop() {
+  wifey_loop_maintenance();
   {USER_LOOP}
 }
 """
 
 def extract_block(code, func_name):
-    pattern = r'void\s+' + func_name + r'\s*\(\s*\)\s*\{'
+    pattern = rf'void\s+{func_name}\s*\(\s*(void)?\s*\)\s*\{{'
     match = re.search(pattern, code)
-    if not match: return "", code
+    if not match:
+        return "", code
     start_idx = match.end() - 1
     brace_count = 0
     end_idx = -1
     for i in range(start_idx, len(code)):
-        if code[i] == '{': brace_count += 1
+        if code[i] == '{':
+            brace_count += 1
         elif code[i] == '}':
             brace_count -= 1
             if brace_count == 0:
                 end_idx = i
                 break
     if end_idx != -1:
-        body = code[start_idx+1:end_idx].strip()
-        remaining = code[:match.start()] + code[end_idx+1:]
+        body = code[start_idx + 1:end_idx].strip()
+        remaining = code[:match.start()] + code[end_idx + 1:]
         return body, remaining
     return "", code
 
@@ -375,7 +1000,8 @@ def clean_duplicates_and_delays(code):
     code = RE_DELAY.sub('smartDelay(', code)
     return code.strip()
 
-def generate_wrapped_code(ssid, passw, api_url, topic, user_code, version_id="v_base_001"):
+def generate_wrapped_code(ssid, passw, api_url, topic, user_code, build_num=100, device_token=None):
+    user_code = user_code or ""
     uses_wifi = bool(re.search(r'WiFi\.', user_code) or re.search(r'#include\s*[<"]WiFi\.h[>"]', user_code))
     user_loop, remaining = extract_block(user_code, "loop")
     user_setup, user_globals = extract_block(remaining, "setup")
@@ -386,27 +1012,33 @@ def generate_wrapped_code(ssid, passw, api_url, topic, user_code, version_id="v_
     
     wifi_fail_action = "ESP.restart();" if uses_wifi else "break; // Offline fallback"
     
-    parts = topic.split('/')
-    fleet_id = parts[0] if len(parts) > 0 else "DefaultFleet"
-    device_id = parts[2] if len(parts) >= 3 else "node_1"
+    parts = (topic or "").split('/')
+    fleet_id = parts[0] if len(parts) > 0 and parts[0] else "DefaultFleet"
+    device_id = parts[2] if len(parts) >= 3 and parts[2] else "node_1"
     
+    if not device_token:
+        dev = db.get_device(device_id)
+        device_token = dev.get("device_token") if dev else f"dt_{secrets.token_hex(8)}"
+
+    resolved_api_url = resolve_api_url(api_url)
+
     final_code = MASTER_CPP_TEMPLATE
-    final_code = final_code.replace('{WIFI_SSID}', ssid)
-    final_code = final_code.replace('{WIFI_PASS}', passw)
-    final_code = final_code.replace('{API_BASE_URL}', api_url)
+    final_code = final_code.replace('{WIFI_SSID}', ssid or "")
+    final_code = final_code.replace('{WIFI_PASS}', passw or "")
+    final_code = final_code.replace('{API_BASE_URL}', resolved_api_url)
     final_code = final_code.replace('{FLEET_ID}', fleet_id)
     final_code = final_code.replace('{DEVICE_ID}', device_id)
-    final_code = final_code.replace('{AUTH_TOKEN}', "secret_abc123")
-    final_code = final_code.replace('{CURRENT_VERSION}', version_id)
+    final_code = final_code.replace('{DEVICE_TOKEN}', device_token)
+    final_code = final_code.replace('{CURRENT_BUILD}', str(int(build_num)))
+    final_code = final_code.replace('{AUTH_TOKEN}', device_token)
+    final_code = final_code.replace('{CURRENT_VERSION}', str(int(build_num)))
     final_code = final_code.replace('{USER_GLOBALS}', user_globals)
     final_code = final_code.replace('{USER_SETUP}', user_setup)
     final_code = final_code.replace('{USER_LOOP}', user_loop)
     final_code = final_code.replace('{WIFI_FAIL_ACTION}', wifi_fail_action)
     return final_code
-
-# --- BRAND NEW SPLASH SCREEN ---
-SETUP_HTML = """
-<!DOCTYPE html>
+# --- SPLASH SCREEN HTML ---
+SETUP_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -420,12 +1052,12 @@ SETUP_HTML = """
             theme: {
                 extend: {
                     colors: {
-                        ardBg: '#181818',
-                        ardPanel: '#1e1e1e',
-                        ardBorder: '#333333',
-                        ardTeal: '#00979C',
-                        ardTextMain: '#cccccc',
-                        ardTextMuted: '#858585'
+                        ardBg: '#121316',
+                        ardPanel: '#1a1c23',
+                        ardBorder: '#2d313f',
+                        ardTeal: '#00b4b6',
+                        ardTextMain: '#e0e2ec',
+                        ardTextMuted: '#8b92a5'
                     },
                     fontFamily: {
                         sans: ['Inter', 'sans-serif'],
@@ -436,37 +1068,33 @@ SETUP_HTML = """
         }
     </script>
     <style>
-        body { background-color: #181818; color: #cccccc; }
-        .loader { border: 3px solid #333333; border-top: 3px solid #00979C; border-radius: 50%; width: 28px; height: 28px; animation: spin 1s linear infinite; }
+        body { background-color: #121316; color: #e0e2ec; }
+        .loader { border: 3px solid #2d313f; border-top: 3px solid #00b4b6; border-radius: 50%; width: 28px; height: 28px; animation: spin 1s linear infinite; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        ::-webkit-scrollbar { width: 8px; height: 8px; }
-        ::-webkit-scrollbar-track { background: #1e1e1e; }
-        ::-webkit-scrollbar-thumb { background: #424242; border-radius: 4px; }
     </style>
 </head>
-<body class="h-screen w-screen flex flex-col items-center justify-center font-sans antialiased">
-    
-    <div class="bg-ardPanel border border-ardBorder p-8 rounded-lg shadow-2xl flex flex-col items-center w-[90%] max-w-[600px]">
+<body class="h-screen w-screen flex flex-col items-center justify-center font-sans antialiased p-6">
+    <div class="bg-ardPanel border border-ardBorder p-8 rounded-xl shadow-2xl flex flex-col items-center w-full max-w-xl">
         <div class="flex items-center gap-3 mb-2">
-            <i class="ph ph-cpu text-4xl text-ardTeal"></i>
-            <h2 class="text-3xl font-semibold text-white tracking-wide"><span class="text-ardTeal">WiFeY</span> Studio</h2>
+            <i class="ph-bold ph-cpu text-4xl text-ardTeal"></i>
+            <h2 class="text-3xl font-semibold text-white tracking-wide"><span class="text-ardTeal font-bold">WiFeY</span> Studio</h2>
         </div>
-        <p class="text-ardTextMuted text-sm mb-8 text-center">Downloading core compilers. This only happens on the very first launch.</p>
+        <p class="text-ardTextMuted text-sm mb-6 text-center">Configuring embedded compilers and hardware toolchains.</p>
         
-        <div class="flex items-center gap-4 mb-4 w-full px-4">
+        <div class="flex items-center gap-4 mb-4 w-full px-2">
             <div class="loader flex-shrink-0" id="spinner"></div>
             <div id="status-text" class="font-medium text-white text-sm flex-1">Initializing...</div>
         </div>
         
-        <div class="w-full bg-[#181818] rounded-full h-1.5 mb-6 overflow-hidden border border-ardBorder relative">
-            <div id="pbar" class="bg-ardTeal h-1.5 rounded-full transition-all duration-300 w-0"></div>
+        <div class="w-full bg-[#121316] rounded-full h-2 mb-6 overflow-hidden border border-ardBorder relative">
+            <div id="pbar" class="bg-ardTeal h-2 rounded-full transition-all duration-300 w-0"></div>
         </div>
         
-        <div id="logs" class="w-full h-40 bg-[#181818] border border-ardBorder rounded p-4 font-mono text-xs text-ardTextMuted overflow-y-auto whitespace-pre-wrap">Starting...</div>
+        <div id="logs" class="w-full h-44 bg-[#121316] border border-ardBorder rounded-lg p-3 font-mono text-xs text-ardTextMuted overflow-y-auto whitespace-pre-wrap">Starting checks...</div>
     </div>
 
     <script>
-        setInterval(() => {
+        const timer = setInterval(() => {
             fetch('/api/setup_status').then(r=>r.json()).then(data => {
                 document.getElementById('status-text').innerText = data.stage;
                 document.getElementById('pbar').style.width = data.progress + '%';
@@ -478,55 +1106,59 @@ SETUP_HTML = """
                 }
 
                 if (data.done) {
+                    clearInterval(timer);
                     window.location.reload(); 
                 }
                 if (data.error) {
-                    document.getElementById('status-text').innerText = "Setup Failed! Check Logs.";
+                    clearInterval(timer);
+                    document.getElementById('status-text').innerText = "Setup Failed! Check Logs Below.";
                     document.getElementById('status-text').classList.add("text-red-400");
                     document.getElementById('spinner').style.display = "none";
                     document.getElementById('pbar').classList.remove("bg-ardTeal");
                     document.getElementById('pbar').classList.add("bg-red-500");
                 }
-            });
-        }, 800);
+            }).catch(() => {});
+        }, 500);
     </script>
 </body>
 </html>
 """
 
-# --- NEW IDE HTML (Arduino v2 Style + WiFeY Branding + UI Fixes) ---
-IDE_HTML = """
-<!DOCTYPE html>
+# --- COMPLETE PROFESSIONAL IDE HTML (Dark Slate, Live CLI Streaming, Bidirectional Serial) ---
+IDE_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WiFeY Studio | Cloud OTA Compiler</title>
+    <title>WiFeY Studio | Professional OTA Platform</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/@phosphor-icons/web"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     
     <script>
-        // INJECTED CONFIGURATION FROM FLASK
         const NGROK_API_URL = "{{ ngrok_url }}"; 
         let activeBinFile = null; 
         let serialEventSource = null;
-        let currentTopic = "ARES-1 Nodes/fleet/update"; 
+        let currentFleet = "DefaultFleet";
+        let currentTargetType = "fleet"; 
+        let currentDeviceId = "node_1";
+        let currentTopic = "DefaultFleet/fleet/update";
     </script>
 
     <script>
         tailwind.config = {
-            darkMode: 'class',
             theme: {
                 extend: {
                     colors: {
-                        ardBg: '#181818',       
-                        ardPanel: '#1e1e1e',    
-                        ardBorder: '#333333',   
-                        ardTeal: '#00979C',     
-                        ardHover: '#2a2d2e',    
-                        ardTextMain: '#cccccc',
-                        ardTextMuted: '#858585'
+                        ardBg: '#121316',       
+                        ardPanel: '#18191e',    
+                        ardCard: '#20222a',
+                        ardBorder: '#2c2e36',   
+                        ardTeal: '#00b4b6',
+                        ardTealGlow: '#00d9df',     
+                        ardHover: '#262934',    
+                        ardTextMain: '#e0e2ec',
+                        ardTextMuted: '#8b92a5'
                     },
                     fontFamily: {
                         sans: ['Inter', 'sans-serif'],
@@ -537,299 +1169,720 @@ IDE_HTML = """
         }
     </script>
     <style>
-        body { background-color: #181818; color: #cccccc; overflow: hidden;}
-        ::-webkit-scrollbar { width: 10px; height: 10px; }
-        ::-webkit-scrollbar-track { background: #1e1e1e; }
-        ::-webkit-scrollbar-thumb { background: #424242; border: 2px solid #1e1e1e; border-radius: 5px; }
-        ::-webkit-scrollbar-thumb:hover { background: #4f4f4f; }
-        .editor-textarea { resize: none; outline: none; tab-size: 4; line-height: 1.5rem; }
-        .line-numbers { line-height: 1.5rem; }
+        body { background-color: #121316; color: #e0e2ec; overflow: hidden; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #18191e; }
+        ::-webkit-scrollbar-thumb { background: #373a46; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #4a4e5d; }
+        .editor-textarea { resize: none; outline: none; tab-size: 2; line-height: 1.5; }
+        .line-numbers { line-height: 1.5; }
         .view-hidden { display: none !important; }
-        .flat-input { background-color: transparent; border: 1px solid transparent; outline: none; transition: all 0.2s; }
-        .flat-input:hover { border-color: #333333; background-color: #2a2d2e; }
-        .flat-input:focus { border-color: #00979C; background-color: #1e1e1e; }
+        .flat-input { background-color: #18191e; border: 1px solid #2c2e36; outline: none; transition: all 0.2s; }
+        .flat-input:hover { border-color: #3f4350; background-color: #20222a; }
+        .flat-input:focus { border-color: #00b4b6; background-color: #20222a; }
         .dropdown-content { display: none; }
         .dropdown-content.show { display: block; }
+        @keyframes pulse-dot { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.85); } }
+        .pulse-live { animation: pulse-dot 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
     </style>
 </head>
 <body class="h-screen w-screen flex flex-col text-sm antialiased selection:bg-ardTeal selection:text-white">
-
+    <!-- AUTHENTICATION OVERLAY -->
+    <div id="auth-overlay" class="fixed inset-0 bg-ardBg/95 backdrop-blur-md z-[100] flex flex-col items-center justify-center transition-opacity duration-500">
+        <div class="bg-ardPanel border border-ardBorder p-10 rounded-2xl shadow-2xl flex flex-col items-center w-full max-w-md transform transition-all">
+            <div class="flex items-center gap-3 mb-4">
+                <i class="ph-bold ph-cpu text-5xl text-ardTeal"></i>
+            </div>
+            <h2 class="text-3xl font-bold text-white tracking-wide mb-2"><span class="text-ardTeal">WiFeY</span> Studio</h2>
+            <p class="text-ardTextMuted text-sm text-center mb-8">Sign in to sync your fleets and firmware securely across the cloud.</p>
+            
+            <button onclick="startGoogleAuth()" id="btn-google-login" class="w-full flex items-center justify-center gap-3 py-3.5 px-4 bg-white hover:bg-gray-100 text-gray-900 font-semibold rounded-xl transition-all shadow-lg active:scale-95">
+                <svg class="w-5 h-5" viewBox="0 0 24 24">
+                    <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                    <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                    <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                    <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                </svg>
+                <span>Continue with Google</span>
+            </button>
+            
+            <div id="auth-spinner" class="hidden flex-col items-center mt-6">
+                <i class="ph-bold ph-spinner animate-spin text-2xl text-ardTeal mb-2"></i>
+                <span class="text-xs text-ardTextMuted font-mono">Waiting for browser authentication...</span>
+            </div>
+        </div>
+    </div>
     <input type="file" id="bin-file-input" accept=".bin" class="hidden" onchange="handleBinLoad(event)">
 
-    <!-- TOP ACTION BAR -->
-    <header class="h-12 bg-ardBg border-b border-ardBorder flex items-center justify-between px-3 flex-shrink-0 z-20">
-        <div class="flex items-center gap-3">
+    <!-- TOP HEADER -->
+    <header class="h-12 bg-ardBg border-b border-ardBorder flex items-center justify-between px-3 flex-shrink-0 z-30 select-none">
+        <div class="flex items-center gap-2.5">
+            <!-- File Menu Dropdown -->
             <div class="relative">
-                <button class="w-8 h-8 rounded flex items-center justify-center hover:bg-ardHover outline-none menu-btn text-ardTextMuted hover:text-white transition-colors" onclick="toggleDropdown('menu-file', event)" title="File Options">
-                    <i class="ph ph-folder-open text-xl pointer-events-none"></i>
+                <button class="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-ardHover text-ardTextMuted hover:text-white transition-colors" onclick="toggleDropdown('menu-file', event)" title="File Operations">
+                    <i class="ph-bold ph-folder-open text-lg pointer-events-none"></i>
                 </button>
-                <div id="menu-file" class="dropdown-content absolute top-full left-0 mt-1 w-48 bg-[#252526] border border-ardBorder shadow-xl z-50 py-1 rounded">
-                    <button class="w-full text-left px-4 py-1.5 hover:bg-ardTeal hover:text-white flex items-center group">
-                        <i class="ph ph-file-plus mr-2 text-lg text-ardTextMuted group-hover:text-white"></i> New Sketch
+                <div id="menu-file" class="dropdown-content absolute top-full left-0 mt-1.5 w-52 bg-ardCard border border-ardBorder shadow-2xl rounded-lg z-50 py-1.5 text-xs">
+                    <button class="w-full text-left px-3.5 py-2 hover:bg-ardTeal hover:text-white flex items-center gap-2 group transition-colors" onclick="newSketch()">
+                        <i class="ph-bold ph-file-plus text-sm text-ardTextMuted group-hover:text-white"></i> New Sketch
                     </button>
-                    <div class="h-px bg-[#333] my-1"></div>
-                    <button class="w-full text-left px-4 py-1.5 hover:bg-ardTeal hover:text-white flex items-center group" onclick="triggerLoadBin()">
-                        <i class="ph ph-upload-simple mr-2 text-lg text-ardTextMuted group-hover:text-white"></i> Load .bin...
+                    <div class="h-px bg-ardBorder my-1"></div>
+                    <button class="w-full text-left px-3.5 py-2 hover:bg-ardTeal hover:text-white flex items-center gap-2 group transition-colors" onclick="triggerLoadBin()">
+                        <i class="ph-bold ph-upload-simple text-sm text-ardTextMuted group-hover:text-white"></i> Load .bin File...
                     </button>
-                    <button class="w-full text-left px-4 py-1.5 hover:bg-ardTeal hover:text-white flex items-center group" onclick="triggerSaveBin()">
-                        <i class="ph ph-download-simple mr-2 text-lg text-ardTextMuted group-hover:text-white"></i> Save .bin...
+                    <button class="w-full text-left px-3.5 py-2 hover:bg-ardTeal hover:text-white flex items-center gap-2 group transition-colors" onclick="triggerSaveBin()">
+                        <i class="ph-bold ph-download-simple text-sm text-ardTextMuted group-hover:text-white"></i> Compile & Save .bin...
+                    </button>
+                    <div class="h-px bg-ardBorder my-1"></div>
+                    <button class="w-full text-left px-3.5 py-2 hover:bg-ardTeal hover:text-white flex items-center gap-2 group transition-colors" onclick="copyEditorCode()">
+                        <i class="ph-bold ph-copy text-sm text-ardTextMuted group-hover:text-white"></i> Copy Code
                     </button>
                 </div>
             </div>
 
-            <div class="h-5 w-px bg-ardBorder mx-1"></div>
+            <div class="h-4 w-px bg-ardBorder"></div>
 
-            <div class="flex items-center gap-2">
-                <button class="w-8 h-8 rounded-full bg-ardTeal text-white flex items-center justify-center hover:brightness-110 active:opacity-40 transition-all shadow-md" title="Verify (Compile)" onclick="simulateAction('Verifying')">
-                    <i class="ph ph-check text-xl"></i>
+            <!-- Verify & Deploy Actions -->
+            <div class="flex items-center gap-1.5">
+                <button id="btn-verify-top" class="h-8 px-3 rounded-lg bg-ardCard hover:bg-ardHover border border-ardBorder text-white flex items-center gap-1.5 text-xs font-semibold hover:border-ardTeal transition-all shadow-sm active:scale-95" title="Verify / Compile (Ctrl+S)" onclick="triggerCompileOnly()">
+                    <i class="ph-bold ph-check text-ardTeal text-base" id="icon-verify"></i>
+                    <span>Verify</span>
                 </button>
-                <button class="w-8 h-8 rounded-full bg-ardTeal text-white flex items-center justify-center hover:brightness-110 active:opacity-40 transition-all shadow-md" title="Upload / OTA" onclick="simulateAction('Uploading')">
-                    <i class="ph ph-arrow-right text-xl"></i>
+                <button id="btn-deploy-top" class="h-8 px-3 rounded-lg bg-ardTeal hover:bg-[#009b9d] text-white flex items-center gap-1.5 text-xs font-semibold transition-all shadow-md active:scale-95 hover:shadow-[0_0_12px_rgba(0,180,182,0.4)]" title="Upload / Deploy OTA Update (Ctrl+U)" onclick="deployFirmware()">
+                    <i class="ph-bold ph-rocket-launch text-base" id="icon-deploy"></i>
+                    <span>Deploy OTA</span>
                 </button>
-                <div id="action-progress-container" class="w-24 h-1.5 bg-[#333] rounded-full overflow-hidden hidden ml-1 flex-shrink-0 relative">
-                    <div id="action-progress-bar" class="h-full bg-yellow-400 w-0 transition-all duration-200 ease-out absolute left-0 top-0"></div>
+                <div id="action-progress-container" class="w-24 h-1.5 bg-[#121316] rounded-full overflow-hidden hidden ml-1 relative border border-ardBorder">
+                    <div id="action-progress-bar" class="h-full bg-ardTeal w-0 transition-all duration-200"></div>
                 </div>
             </div>
 
-            <div class="h-5 w-px bg-ardBorder mx-1"></div>
+            <div class="h-4 w-px bg-ardBorder"></div>
 
+            <!-- Dynamic Fleet & Target Dropdown -->
             <div class="relative">
-                <button id="fleet-selector-btn" class="flex items-center gap-2 px-3 py-1.5 rounded hover:bg-ardHover border border-transparent hover:border-ardBorder transition-colors text-sm group" onclick="toggleDropdown('fleet-dropdown', event)">
-                    <i class="ph ph-cpu text-ardTeal"></i>
-                    <span class="font-medium text-white">ARES-1 Nodes</span>
-                    <i class="ph ph-caret-down text-ardTextMuted group-hover:text-white transition-colors"></i>
+                <button id="fleet-selector-btn" class="flex items-center gap-2 px-3 h-8 rounded-lg bg-ardCard hover:bg-ardHover border border-ardBorder hover:border-ardTeal transition-all text-xs font-medium text-white group" onclick="toggleDropdown('fleet-dropdown', event)">
+                    <i class="ph-bold ph-cpu text-ardTeal text-sm"></i>
+                    <span id="target-label" class="font-medium truncate max-w-[150px]">DefaultFleet (All)</span>
+                    <i class="ph-bold ph-caret-down text-ardTextMuted group-hover:text-white text-xs transition-colors"></i>
                 </button>
-                <div id="fleet-dropdown" class="dropdown-content absolute top-full left-0 mt-1 w-80 bg-[#252526] border border-ardBorder rounded shadow-xl z-50 py-2">
-                    <div class="px-3 py-1.5 text-xs font-semibold text-ardTextMuted uppercase tracking-wider">Select Target Devices</div>
-                    <div class="mt-2">
-                        <div class="flex items-center justify-between px-3 py-1.5 bg-[#2a2d2e] border-y border-[#333]">
-                            <span class="font-medium text-white">ARES-1 Nodes</span>
-                            <span class="text-xs bg-emerald-500/10 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/20">4/5 ✅</span>
-                        </div>
+                <div id="fleet-dropdown" class="dropdown-content absolute top-full left-0 mt-1.5 w-80 bg-ardCard border border-ardBorder rounded-xl shadow-2xl z-50 p-2 text-xs">
+                    <div class="flex items-center justify-between px-2 py-1 mb-1 text-[11px] font-semibold text-ardTextMuted uppercase tracking-wider">
+                        <span>Fleet Targets</span>
+                        <button onclick="promptNewFleet()" class="text-ardTeal hover:underline text-[11px] flex items-center gap-1">
+                            <i class="ph-bold ph-plus"></i> New Fleet
+                        </button>
+                    </div>
+                    <div id="fleet-options-container" class="space-y-1 max-h-64 overflow-y-auto">
+                        <div class="text-center py-2 text-ardTextMuted">Loading fleets...</div>
                     </div>
                 </div>
             </div>
-            
-            <div class="h-5 w-px bg-ardBorder"></div>
-            
-            <div class="flex items-center gap-2">
-                <i class="ph ph-wifi-high text-ardTextMuted"></i>
-                <input type="text" id="top-wifi-ssid" placeholder="SSID" value="Wi-Fi_Network" class="flat-input text-xs px-2 py-1 w-28 rounded placeholder-gray-600">
-                <div class="relative flex items-center">
-                    <input type="password" id="top-wifi-pass" placeholder="Password" value="dummy" class="flat-input text-xs px-2 py-1 w-28 rounded pr-6 placeholder-gray-600">
-                    <button type="button" onclick="togglePassword('top-wifi-pass')" class="absolute right-1 text-ardTextMuted hover:text-white">
-                        <i class="ph ph-eye text-xs"></i>
+
+            <div class="h-4 w-px bg-ardBorder"></div>
+
+            <!-- WiFi Config Pills -->
+            <div class="flex items-center gap-1.5">
+                <div class="flex items-center bg-ardCard border border-ardBorder rounded-lg px-2 h-8">
+                    <i class="ph-bold ph-wifi-high text-ardTextMuted text-xs mr-1.5"></i>
+                    <input type="text" id="top-wifi-ssid" placeholder="WiFi SSID" value="Wi-Fi_Network" class="bg-transparent text-xs w-24 text-white outline-none placeholder:text-gray-500 font-mono">
+                </div>
+                <div class="flex items-center bg-ardCard border border-ardBorder rounded-lg px-2 h-8">
+                    <input type="password" id="top-wifi-pass" placeholder="Password" value="dummy" class="bg-transparent text-xs w-20 text-white outline-none placeholder:text-gray-500 font-mono">
+                    <button type="button" onclick="togglePassword('top-wifi-pass')" class="text-ardTextMuted hover:text-white ml-1">
+                        <i class="ph-bold ph-eye text-xs"></i>
                     </button>
                 </div>
             </div>
         </div>
 
+        <!-- Right Side: Cloud Status Badges, Branding & User Profile -->
         <div class="flex items-center gap-3">
-            <div class="flex items-center gap-1.5 px-2 py-0.5 rounded bg-ardHover text-xs text-ardTextMuted">
-                <span class="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_5px_#10b981]"></span>
-                Online
+            <div id="ngrok-pill" class="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-ardCard border border-ardBorder text-xs text-ardTextMuted cursor-pointer" onclick="copyNgrokUrl()" title="Click to copy public URL">
+                <span class="w-2 h-2 rounded-full bg-emerald-500 pulse-live"></span>
+                <span id="ngrok-text" class="font-mono text-[11px]">Cloud Tunnel Active</span>
             </div>
-            <div class="flex items-center gap-2">
-                <i class="ph ph-cpu text-2xl text-ardTeal"></i>
-                <span class="font-semibold tracking-wide text-white"><span class="text-ardTeal">WiFeY</span> Studio</span>
+            <div class="flex items-center gap-2 pl-2 border-l border-ardBorder">
+                <i class="ph-bold ph-cpu text-2xl text-ardTeal"></i>
+                <span class="font-bold tracking-wide text-white text-base"><span class="text-ardTeal">WiFeY</span> Studio</span>
+            </div>
+
+            <!-- Profile Avatar & Sign Out Dropdown -->
+            <div class="relative pl-2 border-l border-ardBorder" id="user-profile-container">
+                <button id="user-profile-btn" onclick="toggleDropdown('profile-dropdown', event)" class="w-8 h-8 rounded-full overflow-hidden border border-ardBorder hover:border-ardTeal transition-all focus:outline-none flex items-center justify-center bg-ardCard cursor-pointer" title="Account & Profile">
+                    <img id="user-profile-img" src="" alt="Profile" class="w-full h-full object-cover rounded-full hidden" referrerpolicy="no-referrer" onerror="this.classList.add('hidden'); document.getElementById('user-profile-fallback').classList.remove('hidden');">
+                    <div id="user-profile-fallback" class="w-full h-full flex items-center justify-center text-ardTextMuted hover:text-white">
+                        <i class="ph-bold ph-user text-base"></i>
+                    </div>
+                </button>
+                <div id="profile-dropdown" class="dropdown-content absolute right-0 top-full mt-2 w-52 bg-ardCard border border-ardBorder rounded-xl shadow-2xl z-50 p-2 text-xs">
+                    <div class="px-3 py-2 border-b border-ardBorder mb-1">
+                        <p class="text-white font-medium truncate" id="profile-email-text">Signed In</p>
+                        <p class="text-[10px] text-ardTextMuted font-mono">Google Account</p>
+                    </div>
+                    <button onclick="signOutUser()" class="w-full text-left px-3 py-2 hover:bg-rose-500/20 hover:text-rose-300 text-ardTextMuted rounded-lg flex items-center gap-2 group transition-colors cursor-pointer">
+                        <i class="ph-bold ph-sign-out text-sm text-rose-400 group-hover:text-rose-300"></i>
+                        <span>Sign Out</span>
+                    </button>
+                </div>
             </div>
         </div>
     </header>
 
+    <!-- MAIN BODY -->
     <div class="flex-1 flex overflow-hidden">
         
-        <!-- Sidebar -->
-        <aside class="w-12 bg-ardBg border-r border-ardBorder flex flex-col items-center py-3 gap-4 flex-shrink-0 z-10 relative">
-            <button onclick="switchMainView('view-editor')" id="nav-editor" class="nav-btn p-2 rounded text-ardTeal bg-ardHover relative group" title="Editor">
-                <i class="ph ph-files text-2xl"></i>
+        <!-- SIDEBAR NAVIGATION -->
+        <aside class="w-14 bg-ardBg border-r border-ardBorder flex flex-col items-center py-3 gap-3 flex-shrink-0 z-20 select-none">
+            <button onclick="switchMainView('view-editor')" id="nav-editor" class="nav-btn p-2.5 rounded-xl text-ardTeal bg-ardHover border border-ardBorder relative group transition-all" title="Code Editor">
+                <i class="ph-bold ph-code text-xl"></i>
             </button>
-            <button onclick="switchMainView('view-usb')" id="nav-usb" class="nav-btn p-2 rounded text-ardTextMuted hover:text-white hover:bg-ardHover relative group transition-colors" title="USB Provisioning">
-                <i class="ph ph-usb text-2xl"></i>
+            <button onclick="switchMainView('view-usb')" id="nav-usb" class="nav-btn p-2.5 rounded-xl text-ardTextMuted hover:text-white hover:bg-ardHover relative group transition-all" title="USB Provisioning">
+                <i class="ph-bold ph-usb text-xl"></i>
+            </button>
+            <button onclick="switchMainView('view-fleets')" id="nav-fleets" class="nav-btn p-2.5 rounded-xl text-ardTextMuted hover:text-white hover:bg-ardHover relative group transition-all" title="Fleet & Device Manager">
+                <i class="ph-bold ph-hard-drives text-xl"></i>
+            </button>
+            <button onclick="switchMainView('view-settings')" id="nav-settings" class="nav-btn p-2.5 rounded-xl text-ardTextMuted hover:text-white hover:bg-ardHover relative group transition-all" title="Settings & Cloud Config">
+                <i class="ph-bold ph-sliders-horizontal text-xl"></i>
             </button>
         </aside>
 
-        <!-- Main Content Area -->
+        <!-- MAIN CONTENT AREA -->
         <div class="flex-1 flex flex-col min-w-0 bg-ardPanel">
             
-            <!-- Views Container (Flex-1 allows it to fill space above Bottom Panel) -->
             <div class="flex-1 flex flex-col min-h-0 relative">
                 
-                <!-- VIEW: EDITOR -->
+                <!-- VIEW 1: CODE EDITOR -->
                 <main id="view-editor" class="flex-1 flex flex-col overflow-hidden">
-                    <div class="flex items-center h-9 bg-[#1e1e1e] overflow-x-auto select-none px-2 shadow-[0_1px_0_0_#333]">
-                        <button onclick="switchEditorTab('tab-raw')" id="btn-tab-raw" class="editor-tab h-full flex items-center px-4 gap-2 text-sm text-white bg-[#1e1e1e] border-t-2 border-ardTeal">
-                            <i class="ph ph-file-code text-ardTeal"></i> Raw Input
-                        </button>
-                        <button onclick="switchEditorTab('tab-wrap')" id="btn-tab-wrap" class="editor-tab h-full flex items-center px-4 gap-2 text-sm text-ardTextMuted hover:text-white border-t-2 border-transparent bg-transparent transition-colors">
-                            <i class="ph ph-file-text"></i> Preview Wrapped
-                        </button>
+                    <!-- Editor Top Bar -->
+                    <div class="flex items-center justify-between h-9 bg-ardBg border-b border-ardBorder select-none px-3">
+                        <div class="flex items-center h-full gap-1">
+                            <button onclick="switchEditorTab('tab-raw')" id="btn-tab-raw" class="editor-tab h-full flex items-center px-3 gap-1.5 text-xs font-medium text-white border-b-2 border-ardTeal transition-colors">
+                                <i class="ph-bold ph-file-code text-ardTeal"></i> Sketch.ino
+                            </button>
+                            <button onclick="switchEditorTab('tab-wrap')" id="btn-tab-wrap" class="editor-tab h-full flex items-center px-3 gap-1.5 text-xs font-medium text-ardTextMuted hover:text-white border-b-2 border-transparent transition-colors">
+                                <i class="ph-bold ph-file-text"></i> OTA_Wrapped.cpp Preview
+                            </button>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <!-- Sketch Template Selector -->
+                            <div class="flex items-center gap-1.5 text-xs text-ardTextMuted">
+                                <span>Example:</span>
+                                <select id="example-select" onchange="loadExampleSketch(this.value)" class="flat-input text-xs py-0.5 px-2 rounded-lg text-white font-mono cursor-pointer">
+                                    <option value="blink">Blink LED</option>
+                                    <option value="wifi_scan">WiFi Scanner</option>
+                                    <option value="http_client">HTTP REST Client</option>
+                                    <option value="sensor">Analog Sensor Read</option>
+                                    <option value="deep_sleep">ESP32 Deep Sleep</option>
+                                </select>
+                            </div>
+                        </div>
                     </div>
 
-                    <div id="tab-raw" class="editor-content flex-1 flex overflow-hidden bg-ardPanel">
-                        <div class="w-12 text-right pr-3 py-4 font-mono text-xs text-[#6e7681] bg-ardPanel select-none border-r border-ardBorder line-numbers flex flex-col">
-                            <span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span>
+                    <!-- Tab: Raw Sketch -->
+                    <div id="tab-raw" class="editor-content flex-1 flex overflow-hidden bg-ardPanel relative">
+                        <div id="line-numbers" class="w-12 text-right pr-3 py-4 font-mono text-xs text-ardTextMuted bg-ardBg select-none border-r border-ardBorder line-numbers flex flex-col overflow-hidden">
+                            <span>1</span>
                         </div>
-                        <textarea class="editor-textarea flex-1 p-4 bg-transparent text-[#d4d4d4] font-mono text-sm whitespace-pre" spellcheck="false">int ledPin = 2;
+                        <textarea id="code-editor" class="editor-textarea flex-1 p-4 bg-transparent text-[#d4d4d4] font-mono text-sm whitespace-pre leading-6" spellcheck="false" oninput="handleCodeInput()" onscroll="syncLineScroll()" onkeydown="handleEditorKeydown(event)">int ledPin = 2;
+
 void setup() {
   pinMode(ledPin, OUTPUT);
-  Serial.println("Hello from WiFeY Studio OTA Architecture!");
+  Serial.println("Hello from WiFeY Studio Global OTA!");
 }
+
 void loop() {
-  digitalWrite(ledPin, HIGH); delay(1000);
-  digitalWrite(ledPin, LOW); delay(1000);
+  digitalWrite(ledPin, HIGH); 
+  delay(1000);
+  digitalWrite(ledPin, LOW); 
+  delay(1000);
 }</textarea>
                     </div>
 
-                    <div id="tab-wrap" class="editor-content flex-1 flex overflow-hidden bg-ardPanel view-hidden">
-                        <div class="w-12 text-right pr-3 py-4 font-mono text-xs text-[#6e7681] bg-ardPanel select-none border-r border-ardBorder line-numbers flex flex-col">
-                            <span>1</span>
+                    <!-- Tab: Smart Wrapped Preview -->
+                    <div id="tab-wrap" class="editor-content flex-1 flex flex-col overflow-hidden bg-ardPanel view-hidden">
+                        <div class="flex items-center justify-between px-4 py-2 bg-ardBg border-b border-ardBorder text-xs text-ardTextMuted">
+                            <span>This generated C++ firmware handles background pull-OTA verification, Wi-Fi reconnection, and version sync automatically.</span>
+                            <button onclick="fetchPreview()" class="text-ardTeal hover:underline flex items-center gap-1">
+                                <i class="ph-bold ph-arrows-clockwise"></i> Refresh Preview
+                            </button>
                         </div>
-                        <textarea class="editor-textarea flex-1 p-4 bg-transparent text-[#d4d4d4] font-mono text-sm whitespace-pre" readonly spellcheck="false">/* Click tab again to load smart preview... */</textarea>
+                        <textarea id="preview-textarea" class="editor-textarea flex-1 p-4 bg-transparent text-emerald-400 font-mono text-xs whitespace-pre leading-5" readonly spellcheck="false">/* Loading wrapped C++ code... */</textarea>
+                    </div>
+
+                    <!-- Editor Footer Status Bar -->
+                    <div class="h-6 bg-ardBg border-t border-ardBorder flex items-center justify-between px-3 text-[11px] text-ardTextMuted select-none font-mono">
+                        <div class="flex items-center gap-4">
+                            <span id="char-count">Lines: 12 | Length: 228</span>
+                            <span>Target: <span id="status-target" class="text-white">DefaultFleet/fleet</span></span>
+                        </div>
+                        <div class="flex items-center gap-3">
+                            <span>Board: ESP32 Dev Module</span>
+                            <span>Speed: 115200</span>
+                        </div>
                     </div>
                 </main>
 
-                <!-- VIEW: USB PROVISIONING -->
+                <!-- VIEW 2: USB PROVISIONING -->
                 <main id="view-usb" class="flex-1 overflow-y-auto p-8 view-hidden">
-                    <div class="max-w-4xl mx-auto w-full flex flex-col gap-6 pb-8">
+                    <div class="max-w-3xl mx-auto w-full flex flex-col gap-6 pb-8">
                         <div class="border-b border-ardBorder pb-4">
-                            <h2 class="text-2xl font-semibold text-white flex items-center gap-2">
-                                <i class="ph ph-usb text-ardTeal"></i> Direct USB Provisioning
+                            <h2 class="text-2xl font-bold text-white flex items-center gap-2.5">
+                                <i class="ph-bold ph-usb text-ardTeal"></i> Direct USB Provisioning
                             </h2>
-                            <p class="text-sm text-ardTextMuted mt-1">Configure fleets and flash physical devices via serial port.</p>
+                            <p class="text-xs text-ardTextMuted mt-1">Flash new ESP32 microcontrollers over USB to connect them to your WiFeY OTA Fleet.</p>
                         </div>
 
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                            <div class="bg-ardBg border border-ardBorder rounded-lg p-5 flex flex-col shadow-lg">
-                                <h3 class="text-sm font-semibold text-white mb-4 uppercase tracking-wider flex items-center gap-2">
-                                    <i class="ph ph-cpu text-ardTeal"></i> Device Flash Settings
+                        <div class="bg-ardCard border border-ardBorder rounded-xl p-6 shadow-xl space-y-5">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-semibold text-ardTextMuted mb-1.5 uppercase tracking-wider">Target COM Port</label>
+                                    <div class="flex gap-2">
+                                        <select id="prov_port" class="flat-input flex-1 p-2.5 rounded-lg text-white text-xs cursor-pointer"></select>
+                                        <button onclick="loadSerialPorts()" class="w-10 h-10 flex items-center justify-center rounded-lg border border-ardBorder bg-ardPanel hover:bg-ardHover text-ardTextMuted hover:text-white transition-colors">
+                                            <i class="ph-bold ph-arrows-clockwise"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-semibold text-ardTextMuted mb-1.5 uppercase tracking-wider">Target Fleet Name</label>
+                                    <input type="text" id="prov_fleet_id" value="DefaultFleet" class="flat-input w-full p-2.5 rounded-lg text-white text-xs font-mono">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-semibold text-ardTextMuted mb-1.5 uppercase tracking-wider">Device ID (Unique identifier)</label>
+                                    <div class="flex gap-2">
+                                        <input type="text" id="prov_device_id" value="node_1" class="flat-input flex-1 p-2.5 rounded-lg text-white text-xs font-mono">
+                                        <button onclick="generateRandomDeviceId()" class="px-2.5 rounded-lg border border-ardBorder bg-ardPanel hover:bg-ardHover text-ardTextMuted hover:text-white text-xs" title="Generate Random ID">
+                                            <i class="ph-bold ph-shuffle"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-semibold text-ardTextMuted mb-1.5 uppercase tracking-wider">Flashing Baud Rate</label>
+                                    <select id="prov_baud" class="flat-input w-full p-2.5 rounded-lg text-white text-xs cursor-pointer font-mono">
+                                        <option value="115200" selected>115200 (Recommended / Safe)</option>
+                                        <option value="460800">460800 (Fast)</option>
+                                        <option value="921600">921600 (Ultra Fast)</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div class="p-4 rounded-lg bg-ardPanel border border-ardBorder text-xs text-ardTextMuted space-y-1">
+                                <div class="font-semibold text-white flex items-center gap-1.5">
+                                    <i class="ph-bold ph-info text-ardTeal"></i> Live Provisioning Progress:
+                                </div>
+                                <div>Compiles bootloader sketch and streams all Arduino CLI & esptool upload messages live in the Output box below.</div>
+                            </div>
+
+                            <button onclick="flashDevice()" id="btn-flash-device" class="w-full flex items-center justify-center gap-2 py-3 px-4 bg-ardTeal hover:bg-[#009b9d] text-white text-sm font-semibold rounded-xl transition-all shadow-lg hover:shadow-[0_0_16px_rgba(0,180,182,0.4)] active:scale-[0.99]">
+                                <i class="ph-bold ph-lightning text-lg" id="icon-flash"></i> <span>Compile & Provision via USB</span>
+                            </button>
+                        </div>
+                    </div>
+                </main>
+
+                <!-- VIEW 3: FLEET & DEVICE DASHBOARD -->
+                <main id="view-fleets" class="flex-1 overflow-y-auto p-8 view-hidden">
+                    <div class="max-w-6xl mx-auto w-full flex flex-col gap-6 pb-8">
+                        <div class="flex items-center justify-between border-b border-ardBorder pb-4">
+                            <div>
+                                <h2 class="text-2xl font-bold text-white flex items-center gap-2.5">
+                                    <i class="ph-bold ph-hard-drives text-ardTeal"></i> Fleet & Device Registry
+                                </h2>
+                                <p class="text-xs text-ardTextMuted mt-1">Monitor connected ESP32 nodes, target versions, LAN beacons, and custom build overrides.</p>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <button onclick="promptNewFleet()" class="px-3 py-2 rounded-lg bg-ardCard hover:bg-ardHover border border-ardBorder text-xs text-white flex items-center gap-1.5 transition-colors">
+                                    <i class="ph-bold ph-plus text-ardTeal"></i> Create Fleet
+                                </button>
+                                <button onclick="triggerBatchFleetDeploy()" class="px-3 py-2 rounded-lg bg-ardCard hover:bg-ardHover border border-ardBorder text-xs text-white flex items-center gap-1.5 transition-colors">
+                                    <i class="ph-bold ph-paper-plane-tilt text-ardTeal"></i> Batch Deploy
+                                </button>
+                                <button onclick="loadFleetDashboard()" class="px-3 py-2 rounded-lg bg-ardCard hover:bg-ardHover border border-ardBorder text-xs text-white flex items-center gap-1.5 transition-colors">
+                                    <i class="ph-bold ph-arrows-clockwise text-ardTeal"></i> Refresh
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Summary Cards -->
+                        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+                            <div class="bg-ardCard border border-ardBorder rounded-xl p-4">
+                                <div class="text-xs text-ardTextMuted">Total Fleets</div>
+                                <div id="stat-total-fleets" class="text-2xl font-bold text-white mt-1">0</div>
+                            </div>
+                            <div class="bg-ardCard border border-ardBorder rounded-xl p-4">
+                                <div class="text-xs text-ardTextMuted">Registered Nodes</div>
+                                <div id="stat-total-nodes" class="text-2xl font-bold text-white mt-1">0</div>
+                            </div>
+                            <div class="bg-ardCard border border-ardBorder rounded-xl p-4">
+                                <div class="text-xs text-ardTextMuted">Online (Last 3m)</div>
+                                <div id="stat-online-nodes" class="text-2xl font-bold text-emerald-400 mt-1">0</div>
+                            </div>
+                            <div class="bg-ardCard border border-ardBorder rounded-xl p-4">
+                                <div class="text-xs text-ardTextMuted">Active LAN Nodes</div>
+                                <div id="stat-lan-nodes" class="text-2xl font-bold text-cyan-400 mt-1">0</div>
+                            </div>
+                            <div class="bg-ardCard border border-ardBorder rounded-xl p-4">
+                                <div class="text-xs text-ardTextMuted">Storage Bucket</div>
+                                <div id="stat-r2-bucket" class="text-xs font-mono font-bold text-ardTeal truncate mt-2">{{ r2_bucket }}</div>
+                            </div>
+                        </div>
+
+                        <!-- Devices Table -->
+                        <div class="bg-ardCard border border-ardBorder rounded-xl overflow-hidden shadow-xl">
+                            <div class="p-4 border-b border-ardBorder font-semibold text-white text-xs uppercase tracking-wider flex items-center justify-between">
+                                <span>Registered Hardware Nodes & Active LAN Clients</span>
+                                <span class="text-ardTextMuted font-normal lowercase">auto-synced via LAN Beacons & Cloud Manifest</span>
+                            </div>
+                            <div class="overflow-x-auto">
+                                <table class="w-full text-left text-xs">
+                                    <thead class="bg-ardPanel text-ardTextMuted font-mono border-b border-ardBorder">
+                                        <tr>
+                                            <th class="p-3 font-medium">Device ID</th>
+                                            <th class="p-3 font-medium">Fleet</th>
+                                            <th class="p-3 font-medium">Build</th>
+                                            <th class="p-3 font-medium">Overrides</th>
+                                            <th class="p-3 font-medium">Network</th>
+                                            <th class="p-3 font-medium">Last Seen</th>
+                                            <th class="p-3 font-medium">Status</th>
+                                            <th class="p-3 font-medium text-right">Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="devices-table-body" class="divide-y divide-ardBorder">
+                                        <tr><td colspan="8" class="p-6 text-center text-ardTextMuted">Loading device list...</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </main>
+
+                <!-- VIEW 4: SETTINGS & CLOUD CONFIG -->
+                <main id="view-settings" class="flex-1 overflow-y-auto p-8 view-hidden">
+                    <div class="max-w-2xl mx-auto w-full flex flex-col gap-6 pb-8">
+                        <div class="border-b border-ardBorder pb-4">
+                            <h2 class="text-2xl font-bold text-white flex items-center gap-2.5">
+                                <i class="ph-bold ph-sliders-horizontal text-ardTeal"></i> Cloud & Environment Settings
+                            </h2>
+                            <p class="text-xs text-ardTextMuted mt-1">Configure your Cloudflare R2 bucket, Cloudflare Worker gateway, Google OAuth, and Ngrok tunnel credentials.</p>
+                        </div>
+
+                        <div class="bg-ardCard border border-ardBorder rounded-xl p-6 shadow-xl space-y-5">
+                            <div>
+                                <h3 class="text-xs font-semibold text-white uppercase tracking-wider mb-3 flex items-center gap-1.5">
+                                    <i class="ph-bold ph-cloud text-ardTeal"></i> Cloudflare R2 Storage (S3-Compatible)
                                 </h3>
-                                
-                                <div class="space-y-4 flex-1">
+                                <div class="space-y-3">
                                     <div>
-                                        <label class="block text-xs font-medium text-ardTextMuted mb-1.5">Target COM Port</label>
-                                        <div class="flex gap-2">
-                                            <select id="prov_port" class="min-w-0 flex-1 bg-[#1e1e1e] border border-ardBorder text-white rounded focus:border-ardTeal block p-2 outline-none text-sm cursor-pointer"></select>
-                                            <button onclick="loadSerialPorts()" class="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded border border-ardBorder bg-[#1e1e1e] p-0 text-ardTextMuted transition-colors hover:bg-ardHover hover:text-white">
-                                                <i class="ph ph-arrows-clockwise"></i>
-                                            </button>
+                                        <label class="block text-xs text-ardTextMuted mb-1">R2 Account ID</label>
+                                        <input type="text" id="cfg_r2_account" class="flat-input w-full p-2.5 rounded-lg text-xs font-mono text-white">
+                                    </div>
+                                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                        <div>
+                                            <label class="block text-xs text-ardTextMuted mb-1">R2 Access Key</label>
+                                            <input type="text" id="cfg_r2_access" class="flat-input w-full p-2.5 rounded-lg text-xs font-mono text-white">
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs text-ardTextMuted mb-1">R2 Secret Key</label>
+                                            <input type="password" id="cfg_r2_secret" class="flat-input w-full p-2.5 rounded-lg text-xs font-mono text-white">
                                         </div>
                                     </div>
                                     <div>
-                                        <label class="block text-xs font-medium text-ardTextMuted mb-1.5">Assign Fleet Name</label>
-                                        <input type="text" id="prov_fleet_id" value="ARES-1" class="w-full bg-[#1e1e1e] border border-ardBorder text-white rounded focus:border-ardTeal block p-2 outline-none text-sm font-mono">
+                                        <label class="block text-xs text-ardTextMuted mb-1">R2 Bucket Name</label>
+                                        <input type="text" id="cfg_r2_bucket" class="flat-input w-full p-2.5 rounded-lg text-xs font-mono text-white">
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="pt-4 border-t border-ardBorder">
+                                <h3 class="text-xs font-semibold text-white uppercase tracking-wider mb-3 flex items-center gap-1.5">
+                                    <i class="ph-bold ph-shield-check text-ardTeal"></i> Cloudflare Worker & Google OAuth (Multi-Tenant)
+                                </h3>
+                                <div class="space-y-3">
+                                    <div>
+                                        <label class="block text-xs text-ardTextMuted mb-1">Cloudflare Worker Base URL</label>
+                                        <input type="text" id="cfg_worker_url" placeholder="https://wifey-gateway.your-subdomain.workers.dev" class="flat-input w-full p-2.5 rounded-lg text-xs font-mono text-white">
+                                    </div>
+                                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                        <div>
+                                            <label class="block text-xs text-ardTextMuted mb-1">778920138283-j7qfb5ndl3ob26k9akqlfe94hs3nlvml.apps.googleusercontent.com</label>
+                                            <input type="text" id="cfg_google_client_id" placeholder="your-client-id.apps..." class="flat-input w-full p-2.5 rounded-lg text-xs font-mono text-white">
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs text-ardTextMuted mb-1">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</label>
+                                            <input type="password" id="cfg_google_client_secret" placeholder="GOCSPX-..." class="flat-input w-full p-2.5 rounded-lg text-xs font-mono text-white">
+                                        </div>
+                                    </div>
+                                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                        <div>
+                                            <label class="block text-xs text-ardTextMuted mb-1">Google Sub (User ID)</label>
+                                            <input type="text" id="cfg_google_sub" placeholder="Google User Sub ID" class="flat-input w-full p-2.5 rounded-lg text-xs font-mono text-white">
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs text-ardTextMuted mb-1">Google ID Token (Bearer)</label>
+                                            <input type="password" id="cfg_google_id_token" placeholder="OAuth ID token" class="flat-input w-full p-2.5 rounded-lg text-xs font-mono text-white">
+                                        </div>
+                                    </div>
+                                    <div class="flex items-center gap-3 pt-2">
+                                        <button type="button" onclick="cloudSyncUpload()" class="flex-1 py-2 px-3 bg-ardHover hover:bg-ardBorder border border-ardBorder text-white text-xs font-medium rounded-lg transition-colors flex items-center justify-center gap-1.5">
+                                            <i class="ph-bold ph-cloud-arrow-up text-ardTeal"></i> Upload DB to Cloud
+                                        </button>
+                                        <button type="button" onclick="cloudSyncDownload()" class="flex-1 py-2 px-3 bg-ardHover hover:bg-ardBorder border border-ardBorder text-white text-xs font-medium rounded-lg transition-colors flex items-center justify-center gap-1.5">
+                                            <i class="ph-bold ph-cloud-arrow-down text-cyan-400"></i> Download DB from Cloud
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="pt-4 border-t border-ardBorder">
+                                <h3 class="text-xs font-semibold text-white uppercase tracking-wider mb-3 flex items-center gap-1.5">
+                                    <i class="ph-bold ph-globe text-ardTeal"></i> Ngrok Static Domain & Auth
+                                </h3>
+                                <div class="space-y-3">
+                                    <div>
+                                        <label class="block text-xs text-ardTextMuted mb-1">Ngrok Static Domain</label>
+                                        <input type="text" id="cfg_ngrok_domain" class="flat-input w-full p-2.5 rounded-lg text-xs font-mono text-white">
                                     </div>
                                     <div>
-                                        <label class="block text-xs font-medium text-ardTextMuted mb-1.5">Assign Device ID (Unique)</label>
-                                        <input type="text" id="prov_device_id" value="node_1" class="w-full bg-[#1e1e1e] border border-ardBorder text-white rounded focus:border-ardTeal block p-2 outline-none text-sm font-mono">
+                                        <label class="block text-xs text-ardTextMuted mb-1">Ngrok Authtoken (Optional)</label>
+                                        <input type="password" id="cfg_ngrok_token" class="flat-input w-full p-2.5 rounded-lg text-xs font-mono text-white">
                                     </div>
                                 </div>
+                            </div>
 
-                                <div class="pt-6 mt-4 border-t border-ardBorder">
-                                    <button onclick="flashDevice()" class="w-full flex items-center justify-center gap-2 py-3 px-4 bg-white hover:bg-gray-200 text-black text-sm rounded transition-colors font-semibold shadow-lg active:scale-[0.98]">
-                                        <i class="ph ph-lightning text-lg text-ardTeal"></i> Compile & Provision via USB
-                                    </button>
-                                </div>
+                            <div class="pt-2">
+                                <button onclick="saveSettings()" class="w-full py-2.5 px-4 bg-ardTeal hover:bg-[#009b9d] text-white font-semibold text-xs rounded-lg transition-colors">
+                                    Save Configuration to .env
+                                </button>
                             </div>
                         </div>
                     </div>
                 </main>
             </div>
 
-            <!-- Bottom Panel (Fixed height, persists across views) -->
-            <div class="h-64 flex flex-col border-t border-ardBorder bg-[#1e1e1e] flex-shrink-0 z-10">
-                <div class="flex items-center h-8 bg-ardBg px-2 border-b border-ardBorder select-none shadow-[0_1px_0_0_#333]">
-                    <button onclick="switchPanelTab('panel-out')" id="btn-panel-out" class="panel-tab flex items-center px-3 h-full text-xs text-white border-b border-ardTeal">
-                        Output
-                    </button>
-                    <button onclick="switchPanelTab('panel-serial')" id="btn-panel-serial" class="panel-tab flex items-center px-3 h-full text-xs text-ardTextMuted hover:text-white border-b border-transparent transition-colors">
-                        Serial Monitor
-                    </button>
+            <!-- BOTTOM PANEL (Live CLI Output & Full-Featured Serial Monitor) -->
+            <!-- BOTTOM PANEL (Resizable, Live CLI Output & High-Visibility Serial Monitor) -->
+            <div id="bottom-panel" class="flex flex-col border-t border-ardBorder bg-ardPanel flex-shrink-0 z-20" style="height: 280px; min-height: 120px; max-height: 80vh; resize: vertical; overflow: hidden;">
+                <div class="flex items-center justify-between h-8 bg-ardBg px-2 border-b border-ardBorder select-none flex-shrink-0">
+                    <div class="flex items-center h-full gap-1">
+                        <button onclick="switchPanelTab('panel-out')" id="btn-panel-out" class="panel-tab flex items-center px-3 h-full text-xs font-medium text-white border-b-2 border-ardTeal transition-colors">
+                            <i class="ph-bold ph-terminal mr-1.5 text-xs"></i> Output
+                        </button>
+                        <button onclick="switchPanelTab('panel-serial')" id="btn-panel-serial" class="panel-tab flex items-center px-3 h-full text-xs font-medium text-ardTextMuted hover:text-white border-b-2 border-transparent transition-colors">
+                            <i class="ph-bold ph-cpu mr-1.5 text-xs"></i> Serial Monitor
+                        </button>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span id="output-spinner" class="hidden items-center gap-1.5 text-xs text-ardTeal font-mono">
+                            <i class="ph-bold ph-spinner animate-spin"></i> Running CLI...
+                        </span>
+                        <button onclick="clearCurrentPanel()" class="text-ardTextMuted hover:text-white text-xs px-2 py-0.5 rounded hover:bg-ardHover transition-colors" title="Clear Logs">
+                            <i class="ph-bold ph-prohibit mr-1"></i> Clear
+                        </button>
+                    </div>
                 </div>
 
-                <!-- Panel Content: Output -->
-                <div id="panel-out" class="panel-content flex-1 p-3 overflow-y-auto font-mono text-xs text-[#cccccc] bg-[#1e1e1e]">
-                    <div class="text-[#858585]">Environment initialized. Ready.</div>
+                <!-- Panel Content: Live Output Logs -->
+                <div id="panel-out" class="panel-content flex-1 p-3 overflow-y-auto font-mono text-xs text-[#d4d4d4] bg-ardPanel space-y-0.5 select-text min-h-0">
+                    <div class="text-ardTextMuted">WiFeY Studio initialized. Toolchain loaded and ready.</div>
                 </div>
 
                 <!-- Panel Content: Serial Monitor -->
-                <div id="panel-serial" class="panel-content flex-1 flex flex-col view-hidden bg-[#1e1e1e]">
-                    <div class="flex items-center gap-2 p-1.5 border-b border-ardBorder bg-[#252526]">
-                        <select id="serial_port" class="flat-input text-xs py-1 px-2 rounded bg-transparent w-40 text-white cursor-pointer">
-                            <option disabled selected>Loading Ports...</option>
+                <div id="panel-serial" class="panel-content flex-1 flex flex-col view-hidden bg-ardPanel min-h-0">
+                    <div class="flex items-center gap-2 p-1.5 border-b border-ardBorder bg-ardCard text-xs select-none flex-shrink-0">
+                        <select id="serial_port" class="flat-input text-xs py-1 px-2 rounded-lg text-white font-mono cursor-pointer w-36"></select>
+                        <select id="serial_baud" class="flat-input text-xs py-1 px-2 rounded-lg text-white font-mono cursor-pointer w-28">
+                            <option value="9600">9600 baud</option>
+                            <option value="19200">19200 baud</option>
+                            <option value="38400">38400 baud</option>
+                            <option value="57600">57600 baud</option>
+                            <option value="115200" selected>115200 baud</option>
+                            <option value="230400">230400 baud</option>
+                            <option value="460800">460800 baud</option>
+                            <option value="921600">921600 baud</option>
                         </select>
                         
-                        <select id="serial_baud" class="flat-input text-xs py-1 px-2 rounded bg-transparent text-white cursor-pointer w-28">
-                            <option>9600</option>
-                            <option selected>115200</option>
-                        </select>
+                        <div class="h-4 w-px bg-ardBorder mx-1"></div>
                         
-                        <div class="h-4 w-px bg-[#444] mx-1"></div>
-                        
-                        <button id="btn-serial-connect" onclick="connectSerial()" class="flex items-center gap-1.5 px-3 py-1 rounded text-xs border border-[#333] hover:border-emerald-500 text-emerald-400 hover:bg-emerald-500/10 transition-colors">
-                            <i class="ph ph-plug"></i> Connect
+                        <button id="btn-serial-connect" onclick="connectSerial()" class="flex items-center gap-1.5 px-3 py-1 rounded-lg border border-emerald-500/30 text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/20 transition-colors font-medium">
+                            <i class="ph-bold ph-plug"></i> Connect
                         </button>
-                        <button id="btn-serial-disconnect" onclick="disconnectSerial()" class="flex items-center gap-1.5 px-3 py-1 rounded text-xs border border-[#333] hover:border-red-500 text-[#858585] hover:text-red-400 hover:bg-red-500/10 transition-colors" style="display:none;">
-                            <i class="ph ph-plugs"></i> Disconnect
+                        <button id="btn-serial-disconnect" onclick="disconnectSerial()" class="flex items-center gap-1.5 px-3 py-1 rounded-lg border border-red-500/30 text-red-400 bg-red-500/10 hover:bg-red-500/20 transition-colors font-medium" style="display:none;">
+                            <i class="ph-bold ph-plugs"></i> Disconnect
                         </button>
 
                         <div class="flex-1"></div>
 
-                        <button onclick="document.getElementById('serial_out').innerHTML=''" class="flex items-center gap-1.5 px-3 py-1 rounded text-xs border border-[#333] hover:border-[#555] text-ardTextMuted hover:text-white transition-colors">
-                            <i class="ph ph-prohibit"></i> Clear
+                        <label class="flex items-center gap-1 text-[11px] text-ardTextMuted cursor-pointer">
+                            <input type="checkbox" id="serial-autoscroll" checked class="rounded border-ardBorder"> Autoscroll
+                        </label>
+                        <label class="flex items-center gap-1 text-[11px] text-ardTextMuted cursor-pointer">
+                            <input type="checkbox" id="serial-timestamps" class="rounded border-ardBorder"> Timestamps
+                        </label>
+                    </div>
+
+                    <!-- Serial Data Log View (High Contrast & Smooth Scroll) -->
+                    <div id="serial_out" class="flex-1 p-3 overflow-y-auto font-mono text-xs text-[#e0e2ec] leading-relaxed whitespace-pre-wrap select-text bg-[#121316] min-h-0" style="user-select: text; -webkit-user-select: text;"><span class="text-ardTextMuted italic">--- Serial Monitor Disconnected ---</span></div>
+
+                    <!-- Serial Send Bar -->
+                    <div class="flex items-center gap-2 p-1.5 border-t border-ardBorder bg-ardCard flex-shrink-0">
+                        <input type="text" id="serial-input" placeholder="Send serial command to ESP32..." class="flat-input flex-1 px-3 py-1 rounded-lg text-xs font-mono text-white" onkeydown="if(event.key==='Enter') sendSerialCommand()">
+                        <select id="serial-line-ending" class="flat-input text-xs py-1 px-2 rounded-lg text-white font-mono cursor-pointer">
+                            <option value="\r\n">Both NL & CR (\r\n)</option>
+                            <option value="\n">Newline (\n)</option>
+                            <option value="\r">Carriage Return (\r)</option>
+                            <option value="">No line ending</option>
+                        </select>
+                        <button onclick="sendSerialCommand()" class="px-3 py-1 rounded-lg bg-ardTeal hover:bg-[#009b9d] text-white text-xs font-semibold transition-colors flex items-center gap-1">
+                            <i class="ph-bold ph-paper-plane-right"></i> Send
                         </button>
                     </div>
-                    
-                    <div id="serial_out" class="flex-1 p-3 overflow-y-auto font-mono text-xs text-[#cccccc] whitespace-pre-wrap"><span class="text-[#858585] italic">--- Serial Monitor Not Connected ---</span></div>
                 </div>
             </div>
         </div>
     </div>
 
+    <!-- JAVASCRIPT LOGIC -->
     <script>
-        // Keep the app at its default scale.
-        window.addEventListener('keydown', function(e) {
-            if ((e.ctrlKey || e.metaKey) && (e.key === '=' || e.key === '+' || e.key === '-')) {
-                e.preventDefault();
-            }
-        });
+        // Example Sketches Library
+        const EXAMPLE_SKETCHES = {
+            blink: `int ledPin = 2;\\n\\nvoid setup() {\\n  pinMode(ledPin, OUTPUT);\\n  Serial.println("Hello from WiFeY Studio Global OTA!");\\n}\\n\\nvoid loop() {\\n  digitalWrite(ledPin, HIGH);\\n  delay(1000);\\n  digitalWrite(ledPin, LOW);\\n  delay(1000);\\n}`,
+            wifi_scan: `void setup() {\\n  Serial.begin(115200);\\n  Serial.println("Scanning WiFi Networks...");\\n  int n = WiFi.scanNetworks();\\n  if (n == 0) {\\n    Serial.println("No networks found.");\\n  } else {\\n    Serial.printf("%d networks found:\\\\n", n);\\n    for (int i = 0; i < n; ++i) {\\n      Serial.printf("%d: %s (%d dBm)\\\\n", i + 1, WiFi.SSID(i).c_str(), WiFi.RSSI(i));\\n    }\\n  }\\n}\\n\\nvoid loop() {\\n  delay(10000);\\n}`,
+            http_client: `void setup() {\\n  Serial.begin(115200);\\n  Serial.println("ESP32 HTTP Client Ready");\\n}\\n\\nvoid loop() {\\n  if (WiFi.status() == WL_CONNECTED) {\\n    HTTPClient http;\\n    http.begin("https://api.ipify.org?format=json");\\n    int code = http.GET();\\n    if (code > 0) {\\n      Serial.printf("[HTTP] Code: %d Payload: %s\\\\n", code, http.getString().c_str());\\n    }\\n    http.end();\\n  }\\n  delay(15000);\\n}`,
+            sensor: `const int sensorPin = 34;\\n\\nvoid setup() {\\n  Serial.begin(115200);\\n  pinMode(sensorPin, INPUT);\\n  Serial.println("Analog Sensor Reader Started");\\n}\\n\\nvoid loop() {\\n  int val = analogRead(sensorPin);\\n  Serial.printf("Analog Value: %d\\\\n", val);\\n  delay(1000);\\n}`,
+            deep_sleep: `void setup() {\\n  Serial.begin(115200);\\n  Serial.println("Awake! Performing task...");\\n  delay(2000);\\n  Serial.println("Going to sleep for 10 seconds...");\\n  esp_sleep_enable_timer_wakeup(10 * 1000000ULL);\\n  esp_deep_sleep_start();\\n}\\n\\nvoid loop() {}`
+        };
 
         window.onload = () => {
             loadSerialPorts();
+            loadFleetsAndDevices();
+            loadSettings();
+            updateLineNumbers();
+            checkAuthStatus(true);
+            
+            // Check status badge
+            if (NGROK_API_URL.includes("localhost") || NGROK_API_URL.includes("127.0.0.1")) {
+                document.getElementById('ngrok-text').innerText = "Localhost Only";
+                document.getElementById('ngrok-pill').querySelector('span').classList.remove('bg-emerald-500');
+                document.getElementById('ngrok-pill').querySelector('span').classList.add('bg-amber-500');
+            }
+        };
+
+        function copyNgrokUrl() {
+            navigator.clipboard.writeText(NGROK_API_URL);
+            logToOutput(`[System] Copied public API URL to clipboard: ${NGROK_API_URL}`);
         }
 
-        // --- Core UI Logic ---
         function togglePassword(inputId) {
             const input = document.getElementById(inputId);
             const icon = input.nextElementSibling.querySelector('i');
-            if (input.type === 'password') { input.type = 'text'; icon.className = 'ph ph-eye-slash text-xs'; } 
-            else { input.type = 'password'; icon.className = 'ph ph-eye text-xs'; }
+            if (input.type === 'password') { 
+                input.type = 'text'; 
+                icon.className = 'ph-bold ph-eye-slash text-xs'; 
+            } else { 
+                input.type = 'password'; 
+                icon.className = 'ph-bold ph-eye text-xs'; 
+            }
         }
 
+        // --- LINE NUMBERS & EDITOR INDENTATION ---
+        function updateLineNumbers() {
+            const editor = document.getElementById('code-editor');
+            const linesContainer = document.getElementById('line-numbers');
+            const lines = editor.value.split('\\n').length;
+            let spans = '';
+            for (let i = 1; i <= lines; i++) {
+                spans += `<span>${i}</span>`;
+            }
+            linesContainer.innerHTML = spans;
+            document.getElementById('char-count').innerText = `Lines: ${lines} | Length: ${editor.value.length}`;
+        }
+
+        function handleCodeInput() {
+            updateLineNumbers();
+        }
+
+        function syncLineScroll() {
+            const editor = document.getElementById('code-editor');
+            const lines = document.getElementById('line-numbers');
+            lines.scrollTop = editor.scrollTop;
+        }
+
+        function handleEditorKeydown(e) {
+            const textarea = e.target;
+            if (e.key === 'Tab') {
+                e.preventDefault();
+                const start = textarea.selectionStart;
+                const end = textarea.selectionEnd;
+                textarea.value = textarea.value.substring(0, start) + "  " + textarea.value.substring(end);
+                textarea.selectionStart = textarea.selectionEnd = start + 2;
+                updateLineNumbers();
+            } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+                e.preventDefault();
+                triggerCompileOnly();
+            } else if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'u' || e.key === 'Enter')) {
+                e.preventDefault();
+                deployFirmware();
+            }
+        }
+
+        function newSketch() {
+            if (confirm("Reset editor to empty starter sketch?")) {
+                document.getElementById('code-editor').value = `void setup() {\\n  Serial.begin(115200);\\n  Serial.println("WiFeY Sketch Initialized");\\n}\\n\\nvoid loop() {\\n  delay(1000);\\n}`;
+                updateLineNumbers();
+                logToOutput("[File] Created new starter sketch.");
+            }
+        }
+
+        function copyEditorCode() {
+            const code = document.getElementById('code-editor').value;
+            navigator.clipboard.writeText(code);
+            logToOutput("[File] Code copied to clipboard.");
+        }
+
+        function loadExampleSketch(key) {
+            if (EXAMPLE_SKETCHES[key]) {
+                document.getElementById('code-editor').value = EXAMPLE_SKETCHES[key];
+                updateLineNumbers();
+                logToOutput(`[File] Loaded example sketch: ${key}`);
+            }
+        }
+
+        // --- NAVIGATION & TABS ---
         function switchMainView(viewId) {
             document.getElementById('view-editor').classList.add('view-hidden');
             document.getElementById('view-usb').classList.add('view-hidden');
+            document.getElementById('view-fleets').classList.add('view-hidden');
+            document.getElementById('view-settings').classList.add('view-hidden');
             document.getElementById(viewId).classList.remove('view-hidden');
+
             document.querySelectorAll('.nav-btn').forEach(btn => {
-                btn.classList.remove('text-ardTeal', 'bg-ardHover');
+                btn.classList.remove('text-ardTeal', 'bg-ardHover', 'border', 'border-ardBorder');
                 btn.classList.add('text-ardTextMuted');
             });
-            const activeBtn = document.getElementById(viewId === 'view-editor' ? 'nav-editor' : 'nav-usb');
-            activeBtn.classList.remove('text-ardTextMuted');
-            activeBtn.classList.add('text-ardTeal', 'bg-ardHover');
-            if(viewId === 'view-usb') loadSerialPorts();
+            const activeNav = document.getElementById('nav-' + viewId.replace('view-', ''));
+            if (activeNav) {
+                activeNav.classList.remove('text-ardTextMuted');
+                activeNav.classList.add('text-ardTeal', 'bg-ardHover', 'border', 'border-ardBorder');
+            }
+
+            if (viewId === 'view-usb') loadSerialPorts();
+            if (viewId === 'view-fleets') loadFleetDashboard();
+            if (viewId === 'view-settings') loadSettings();
         }
 
         function switchEditorTab(tabId) {
             document.querySelectorAll('.editor-content').forEach(el => el.classList.add('view-hidden'));
             document.querySelectorAll('.editor-tab').forEach(el => {
-                el.classList.remove('text-white', 'border-ardTeal', 'bg-[#1e1e1e]');
-                el.classList.add('text-ardTextMuted', 'border-transparent', 'bg-transparent');
+                el.classList.remove('text-white', 'border-ardTeal');
+                el.classList.add('text-ardTextMuted', 'border-transparent');
             });
             document.getElementById(tabId).classList.remove('view-hidden');
             const activeBtn = document.getElementById('btn-' + tabId);
-            activeBtn.classList.remove('text-ardTextMuted', 'border-transparent', 'bg-transparent');
-            activeBtn.classList.add('text-white', 'border-ardTeal', 'bg-[#1e1e1e]');
-            if(tabId === 'tab-wrap') fetchPreview();
+            activeBtn.classList.remove('text-ardTextMuted', 'border-transparent');
+            activeBtn.classList.add('text-white', 'border-ardTeal');
+            if (tabId === 'tab-wrap') fetchPreview();
         }
 
         function switchPanelTab(tabId) {
@@ -845,107 +1898,600 @@ void loop() {
         }
 
         function toggleDropdown(dropdownId, event) {
-            if(event) event.stopPropagation();
+            if (event) event.stopPropagation();
+            const el = document.getElementById(dropdownId);
+            const isOpen = el.classList.contains("show");
             closeAllMenus();
-            document.getElementById(dropdownId).classList.toggle("show");
+            if (!isOpen) {
+                el.classList.add("show");
+            }
         }
+
         function closeAllMenus() {
             var dropdowns = document.getElementsByClassName("dropdown-content");
             for (var i = 0; i < dropdowns.length; i++) dropdowns[i].classList.remove('show');
         }
+
         window.onclick = function(event) {
-            if (!event.target.closest('#fleet-selector-btn') && !event.target.closest('.dropdown-content') && !event.target.closest('.menu-btn')) {
+            if (!event.target.closest('#fleet-selector-btn') && !event.target.closest('.dropdown-content') && !event.target.closest('button')) {
                 closeAllMenus();
             }
-        }
+        };
 
+        // --- REAL-TIME STREAMING & OUTPUT LOGGING ---
         function logToOutput(msg) {
             const outputPanel = document.getElementById('panel-out');
             const logEntry = document.createElement('div');
-            if (msg.includes("[Build]") || msg.includes("SUCCESS")) logEntry.className = "text-ardTeal mt-1";
-            else if (msg.includes("[System]")) logEntry.className = "text-emerald-400 mt-1";
-            else if (msg.includes("[File]")) logEntry.className = "text-yellow-400 mt-1";
-            else if (msg.includes("Error") || msg.includes("❌")) logEntry.className = "text-red-400 mt-1";
-            else logEntry.className = "text-[#cccccc] mt-1";
-            logEntry.textContent = msg;
+            const now = new Date().toLocaleTimeString();
+            
+            let color = "text-[#cccccc]";
+            if (msg.includes("[Build]") || msg.includes("[SUCCESS]") || msg.includes("SUCCESS")) color = "text-ardTeal font-medium";
+            else if (msg.includes("[Deploy]")) color = "text-cyan-400 font-medium";
+            else if (msg.includes("[Hardware]") || msg.includes("[Upload]")) color = "text-amber-400 font-medium";
+            else if (msg.includes("[CLI]") || msg.includes("Sketch uses") || msg.includes("Global variables")) color = "text-[#9cdcfe]";
+            else if (msg.includes("[System]")) color = "text-emerald-400";
+            else if (msg.includes("[File]")) color = "text-yellow-400";
+            else if (msg.includes("Error") || msg.includes("❌") || msg.includes("[ERROR]") || msg.includes("FAILED") || msg.includes("error:")) color = "text-red-400 font-medium";
+            
+            logEntry.className = color + " font-mono text-xs whitespace-pre-wrap leading-5";
+            
+            if (msg.startsWith("[CLI]") || msg.startsWith("  ") || msg.startsWith("\t")) {
+                logEntry.textContent = msg;
+            } else {
+                logEntry.textContent = `[${now}] ${msg}`;
+            }
+            
             outputPanel.appendChild(logEntry);
             outputPanel.scrollTop = outputPanel.scrollHeight;
             switchPanelTab('panel-out');
         }
 
-        // --- Fetch & Hardware Logic ---
+        function clearCurrentPanel() {
+            document.getElementById('panel-out').innerHTML = '<div class="text-ardTextMuted">Logs cleared.</div>';
+            document.getElementById('serial_out').innerHTML = '';
+        }
+
+        // Generic stream reader: reads chunks from a streaming response and feeds lines to logToOutput
+        async function runStreamingTask(url, payload, onStart, onComplete) {
+            if (onStart) onStart();
+            document.getElementById('output-spinner').classList.remove('hidden');
+            document.getElementById('output-spinner').classList.add('flex');
+            
+            let success = true;
+            try {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.body) {
+                    const fullText = await response.text();
+                    fullText.split('\\n').forEach(line => {
+                        if (line.trim()) logToOutput(line.trim());
+                    });
+                    if (fullText.includes("[ERROR]") || fullText.includes("❌")) success = false;
+                } else {
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) {
+                            if (buffer.trim()) {
+                                logToOutput(buffer.trim());
+                                if (buffer.includes("[ERROR]") || buffer.includes("❌")) success = false;
+                            }
+                            break;
+                        }
+                        buffer += decoder.decode(value, { stream: true });
+                        const lines = buffer.split('\\n');
+                        buffer = lines.pop(); // keep trailing incomplete line
+                        for (const line of lines) {
+                            const trimmed = line.trim();
+                            if (trimmed) {
+                                logToOutput(trimmed);
+                                if (trimmed.includes("[ERROR]") || trimmed.includes("❌") || trimmed.includes("FAILED")) {
+                                    success = false;
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (err) {
+                success = false;
+                logToOutput(`[System] [ERROR] Streaming failed: ${err}`);
+            } finally {
+                document.getElementById('output-spinner').classList.remove('flex');
+                document.getElementById('output-spinner').classList.add('hidden');
+                if (onComplete) onComplete(success);
+            }
+            return success;
+        }
+
+        // --- FLEET & DEVICE MANAGEMENT ---
+        function loadFleetsAndDevices() {
+            fetch('/api/db').then(r => r.json()).then(data => {
+                const container = document.getElementById('fleet-options-container');
+                container.innerHTML = '';
+
+                const fleets = Object.keys(data.manifest || {});
+                if (!fleets.includes("DefaultFleet")) fleets.unshift("DefaultFleet");
+
+                fleets.forEach(fleet => {
+                    const fleetDevices = Object.entries(data.devices || {}).filter(([_, d]) => d.fleet === fleet);
+                    const now = Date.now() / 1000;
+                    const onlineCount = fleetDevices.filter(([_, d]) => (now - d.last_seen) < 180).length;
+                    const targetBuild = data.manifest[fleet]?.target_build !== undefined ? data.manifest[fleet]?.target_build : 100;
+
+                    // Fleet Option
+                    const fleetItem = document.createElement('div');
+                    fleetItem.className = "flex items-center justify-between p-2 rounded-lg hover:bg-ardHover cursor-pointer border border-transparent hover:border-ardBorder";
+                    fleetItem.onclick = () => selectTarget(fleet, 'fleet');
+                    fleetItem.innerHTML = `
+                        <div class="flex items-center gap-2">
+                            <i class="ph-bold ph-tree-structure text-ardTeal"></i>
+                            <div>
+                                <div class="font-semibold text-white">${fleet} <span class="text-xs text-ardTextMuted font-normal">(Entire Fleet)</span></div>
+                                <div class="text-[10px] text-ardTextMuted">Target Build: #${targetBuild}</div>
+                            </div>
+                        </div>
+                        <span class="text-[10px] bg-emerald-500/10 text-emerald-400 px-2 py-0.5 rounded border border-emerald-500/20">${onlineCount}/${fleetDevices.length} Online</span>
+                    `;
+                    container.appendChild(fleetItem);
+
+                    // Child node options
+                    fleetDevices.forEach(([devId, dev]) => {
+                        const isOnline = (now - dev.last_seen) < 180;
+                        const nodeItem = document.createElement('div');
+                        nodeItem.className = "flex items-center justify-between pl-6 pr-2 py-1.5 rounded-lg hover:bg-ardHover cursor-pointer text-xs text-ardTextMuted hover:text-white";
+                        nodeItem.onclick = () => selectTarget(fleet, 'node', devId);
+                        nodeItem.innerHTML = `
+                            <div class="flex items-center gap-2">
+                                <span class="w-1.5 h-1.5 rounded-full ${isOnline ? 'bg-emerald-400' : 'bg-gray-500'}"></span>
+                                <span>${devId}</span>
+                            </div>
+                            <span class="text-[10px] font-mono text-ardTeal">Build #${dev.current_build || 100}</span>
+                        `;
+                        container.appendChild(nodeItem);
+                    });
+                });
+            }).catch(err => {
+                console.error("Failed to load fleets:", err);
+            });
+        }
+
+        function selectTarget(fleet, type, deviceId = "") {
+            currentFleet = fleet;
+            currentTargetType = type;
+            currentDeviceId = deviceId;
+            closeAllMenus();
+
+            if (type === 'fleet') {
+                currentTopic = `${fleet}/fleet/update`;
+                document.getElementById('target-label').innerText = `${fleet} (All Nodes)`;
+                document.getElementById('status-target').innerText = `${fleet}/fleet`;
+            } else {
+                currentTopic = `${fleet}/devices/${deviceId}/update`;
+                document.getElementById('target-label').innerText = `${deviceId} (${fleet})`;
+                document.getElementById('status-target').innerText = `${fleet}/${deviceId}`;
+            }
+            logToOutput(`[System] Switched target to: ${currentTopic}`);
+        }
+
+        function promptNewFleet() {
+            const name = prompt("Enter new fleet name:");
+            if (name && name.trim()) {
+                fetch('/api/fleet/create', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({fleet: name.trim()})
+                }).then(r => r.json()).then(() => {
+                    loadFleetsAndDevices();
+                    selectTarget(name.trim(), 'fleet');
+                    logToOutput(`[System] Created new fleet: ${name.trim()}`);
+                });
+            }
+        }
+
+        function loadFleetDashboard() {
+            Promise.all([
+                fetch('/api/db').then(r => r.json()),
+                fetch('/api/lan/devices').then(r => r.json()).catch(() => ({devices: []}))
+            ]).then(([data, lanData]) => {
+                const tbody = document.getElementById('devices-table-body');
+                tbody.innerHTML = '';
+                const now = Date.now() / 1000;
+
+                const devices = Object.entries(data.devices || {});
+                const fleets = Object.keys(data.manifest || {});
+                const lanDevices = lanData.devices || [];
+                const lanMap = {};
+                lanDevices.forEach(d => { lanMap[d.device_id] = d; });
+
+                document.getElementById('stat-total-fleets').innerText = fleets.length;
+                document.getElementById('stat-total-nodes').innerText = devices.length;
+                const lanStatEl = document.getElementById('stat-lan-nodes');
+                if (lanStatEl) {
+                    lanStatEl.innerText = lanDevices.filter(d => d.online).length;
+                }
+
+                let onlineCount = 0;
+
+                if (devices.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="8" class="p-6 text-center text-ardTextMuted">No hardware nodes registered yet. Flash an ESP32 via USB to provision!</td></tr>';
+                }
+
+                devices.forEach(([devId, dev]) => {
+                    const elapsed = Math.floor(now - dev.last_seen);
+                    const isOnline = elapsed < 180;
+                    if (isOnline) onlineCount++;
+
+                    let seenText = `${elapsed}s ago`;
+                    if (elapsed > 3600) seenText = `${Math.floor(elapsed / 3600)}h ago`;
+                    else if (elapsed > 60) seenText = `${Math.floor(elapsed / 60)}m ago`;
+
+                    const lanInfo = lanMap[devId];
+                    const isLanActive = lanInfo && lanInfo.online;
+
+                    let overrideHtml = '<span class="text-ardTextMuted font-mono text-[11px]">Fleet Default</span>';
+                    if (dev.custom_build_override !== null && dev.custom_build_override !== undefined) {
+                        overrideHtml = `<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                            Build #${dev.custom_build_override}
+                            <button onclick="clearDeviceOverride('${devId}')" title="Clear override" class="hover:text-white font-bold ml-1">×</button>
+                        </span>`;
+                    }
+
+                    const lanBadge = isLanActive ? 
+                        `<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 font-mono" title="IP: ${lanInfo.ip}">
+                            <i class="ph-bold ph-wifi-high text-xs"></i> LAN (${lanInfo.ip})
+                        </span>` : 
+                        `<span class="text-[10px] text-ardTextMuted font-mono">WAN Cloud</span>`;
+
+                    const row = document.createElement('tr');
+                    row.className = "hover:bg-ardPanel/50 transition-colors border-b border-ardBorder/50";
+                    row.innerHTML = `
+                        <td class="p-3 font-mono font-medium text-white">${devId}</td>
+                        <td class="p-3">
+                            <span class="font-medium text-ardTextMain">${dev.fleet}</span>
+                            <button onclick="promptReassignFleet('${devId}', '${dev.fleet}')" title="Reassign Fleet" class="ml-1.5 text-ardTextMuted hover:text-ardTeal text-xs">
+                                <i class="ph-bold ph-pencil-simple"></i>
+                            </button>
+                        </td>
+                        <td class="p-3 font-mono text-ardTeal font-semibold">Build #${dev.current_build || 100}</td>
+                        <td class="p-3">${overrideHtml}</td>
+                        <td class="p-3">${lanBadge}</td>
+                        <td class="p-3 text-ardTextMuted font-mono text-[11px]">${seenText}</td>
+                        <td class="p-3">
+                            <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-medium ${isOnline ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-gray-500/10 text-gray-400 border border-gray-500/20'}">
+                                <span class="w-1.5 h-1.5 rounded-full ${isOnline ? 'bg-emerald-400 pulse-live' : 'bg-gray-500'}"></span>
+                                ${isOnline ? 'Online' : 'Offline'}
+                            </span>
+                        </td>
+                        <td class="p-3 text-right space-x-1">
+                            <button onclick="selectTarget('${dev.fleet}', 'node', '${devId}'); switchMainView('view-editor');" class="px-2 py-1 text-xs text-ardTeal hover:underline font-medium">Target</button>
+                            <button onclick="promptSetOverride('${devId}')" class="px-2 py-1 text-xs text-amber-400 hover:underline">Override</button>
+                            <button onclick="deleteDevice('${devId}')" class="px-2 py-1 text-xs text-red-400 hover:underline">Delete</button>
+                        </td>
+                    `;
+                    tbody.appendChild(row);
+                });
+
+                document.getElementById('stat-online-nodes').innerText = onlineCount;
+            }).catch(err => {
+                console.error("Dashboard error:", err);
+            });
+        }
+
+        function promptReassignFleet(devId, oldFleet) {
+            const newFleet = prompt(`Reassign node '${devId}' to new fleet:`, oldFleet);
+            if (newFleet && newFleet.trim() && newFleet.trim() !== oldFleet) {
+                fetch('/api/device/reassign_fleet', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({device_id: devId, new_fleet: newFleet.trim()})
+                }).then(r => r.json()).then(res => {
+                    if (res.success) {
+                        loadFleetDashboard();
+                        loadFleetsAndDevices();
+                        logToOutput(`[System] Reassigned node ${devId} to fleet ${newFleet.trim()}`);
+                    }
+                });
+            }
+        }
+
+        function promptSetOverride(devId) {
+            const buildStr = prompt(`Set custom build override number for node '${devId}' (integer):`);
+            if (buildStr !== null) {
+                const bNum = parseInt(buildStr.trim());
+                if (isNaN(bNum)) {
+                    alert("Please enter a valid integer build number.");
+                    return;
+                }
+                fetch('/api/device/override', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({device_id: devId, build_num: bNum})
+                }).then(r => r.json()).then(res => {
+                    loadFleetDashboard();
+                    logToOutput(`[System] Set build override #${bNum} on ${devId}`);
+                });
+            }
+        }
+
+        function clearDeviceOverride(devId) {
+            fetch('/api/device/override', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({device_id: devId, clear: true})
+            }).then(r => r.json()).then(() => {
+                loadFleetDashboard();
+                logToOutput(`[System] Cleared build override for ${devId}`);
+            });
+        }
+
+        function triggerBatchFleetDeploy() {
+            fetch('/api/db').then(r => r.json()).then(data => {
+                const fleets = Object.keys(data.manifest || {});
+                if (fleets.length === 0) {
+                    alert("No fleets exist to deploy to.");
+                    return;
+                }
+                const defaultList = fleets.join(', ');
+                const inputFleets = prompt("Enter target fleet names for batch deployment (comma-separated):", defaultList);
+                if (!inputFleets) return;
+
+                const selectedFleets = inputFleets.split(',').map(s => s.trim()).filter(Boolean);
+                if (selectedFleets.length === 0) return;
+
+                const buildStr = prompt("Enter target build number for this batch deployment (integer):", "105");
+                if (!buildStr) return;
+                const targetBuild = parseInt(buildStr.trim());
+                if (isNaN(targetBuild)) {
+                    alert("Invalid build number.");
+                    return;
+                }
+
+                logToOutput(`[Batch Deploy] Starting multi-fleet deployment to ${selectedFleets.length} fleets with build #${targetBuild}...`);
+                
+                fetch('/api/fleets/batch_update', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        fleet_ids: selectedFleets,
+                        target_build: targetBuild
+                    })
+                }).then(r => r.json()).then(res => {
+                    if (res.success) {
+                        logToOutput(`🎉 ${res.message || 'Batch deployment complete!'}`);
+                        loadFleetDashboard();
+                        loadFleetsAndDevices();
+                        alert(`Batch deploy successful for: ${selectedFleets.join(', ')}`);
+                    } else {
+                        logToOutput(`❌ Batch deploy failed: ${res.error}`);
+                    }
+                }).catch(err => {
+                    logToOutput(`❌ Batch deploy network error: ${err}`);
+                });
+            });
+        }
+
+        function cloudSyncUpload() {
+            const sub = document.getElementById('cfg_google_sub')?.value || '';
+            const email = document.getElementById('cfg_google_email')?.value || '';
+            const token = document.getElementById('cfg_google_id_token')?.value || '';
+
+            if (!sub) {
+                alert("Please provide Google Sub (User ID) in Settings to sync with cloud.");
+                return;
+            }
+
+            logToOutput("[Cloud Sync] Uploading local database to Cloudflare / R2 storage...");
+            fetch('/api/cloud/sync', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': token ? `Bearer ${token}` : ''
+                },
+                body: JSON.stringify({
+                    google_sub: sub,
+                    email: email,
+                    id_token: token
+                })
+            }).then(r => r.json()).then(res => {
+                if (res.success) {
+                    logToOutput("🎉 [Cloud Sync] Successfully uploaded wifey_db.json to multi-tenant cloud storage!");
+                    alert("Database uploaded to cloud successfully!");
+                } else {
+                    logToOutput(`❌ [Cloud Sync] Upload failed: ${res.error}`);
+                    alert(`Upload failed: ${res.error}`);
+                }
+            }).catch(err => {
+                logToOutput(`❌ [Cloud Sync] Network error: ${err}`);
+            });
+        }
+
+        function cloudSyncDownload() {
+            const sub = document.getElementById('cfg_google_sub')?.value || '';
+            const token = document.getElementById('cfg_google_id_token')?.value || '';
+
+            if (!sub) {
+                alert("Please provide Google Sub (User ID) in Settings to sync with cloud.");
+                return;
+            }
+
+            if (!confirm("Download cloud database? This will replace your local database with cloud state.")) return;
+
+            logToOutput("[Cloud Sync] Downloading database from Cloudflare / R2 storage...");
+            fetch(`/api/cloud/sync?google_sub=${encodeURIComponent(sub)}`, {
+                headers: token ? {'Authorization': `Bearer ${token}`} : {}
+            }).then(r => r.json()).then(res => {
+                if (res.success) {
+                    logToOutput("🎉 [Cloud Sync] Database downloaded and applied successfully!");
+                    loadFleetDashboard();
+                    loadFleetsAndDevices();
+                    alert("Cloud database downloaded and synchronized!");
+                } else {
+                    logToOutput(`❌ [Cloud Sync] Download failed: ${res.error}`);
+                    alert(`Download failed: ${res.error}`);
+                }
+            }).catch(err => {
+                logToOutput(`❌ [Cloud Sync] Network error: ${err}`);
+            });
+        }
+
+        function deleteDevice(devId) {
+            if (confirm(`Remove device '${devId}' from database?`)) {
+                fetch('/api/device/delete', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({device_id: devId})
+                }).then(() => {
+                    loadFleetDashboard();
+                    loadFleetsAndDevices();
+                    logToOutput(`[System] Deleted device ${devId}`);
+                });
+            }
+        }
+
+        // --- PREVIEW WRAPPED CODE ---
         function fetchPreview() {
-            const rawCode = document.querySelector('#tab-raw textarea').value;
+            const rawCode = document.getElementById('code-editor').value;
             const payload = {
                 ssid: document.getElementById('top-wifi-ssid').value,
                 pass: document.getElementById('top-wifi-pass').value,
-                api_url: NGROK_API_URL, topic: currentTopic, code: rawCode
+                api_url: NGROK_API_URL, 
+                topic: currentTopic, 
+                code: rawCode
             };
-            document.querySelector('#tab-wrap textarea').value = "Generating smart preview...";
-            fetch('/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
-            .then(res => res.json()).then(data => { document.querySelector('#tab-wrap textarea').value = data.code; })
-            .catch(err => { document.querySelector('#tab-wrap textarea').value = "// Error: " + err; });
+            document.getElementById('preview-textarea').value = "Generating smart OTA preview...";
+            fetch('/preview', { 
+                method: 'POST', 
+                headers: { 'Content-Type': 'application/json' }, 
+                body: JSON.stringify(payload) 
+            })
+            .then(res => res.json()).then(data => { 
+                document.getElementById('preview-textarea').value = data.code; 
+            })
+            .catch(err => { 
+                document.getElementById('preview-textarea').value = "// Error: " + err; 
+            });
         }
 
+        // --- SERIAL PORT OPERATIONS ---
         function loadSerialPorts() {
-            fetch('/api/ports').then(r=>r.json()).then(ports => {
+            fetch('/api/ports').then(r => r.json()).then(ports => {
                 let sel1 = document.getElementById('serial_port');
                 let sel2 = document.getElementById('prov_port');
-                const html = ports.length ? ports.map(p => `<option value="${p.device}">${p.device} - ${p.desc}</option>`).join('') : '<option value="">No Devices</option>';
-                if(sel1) sel1.innerHTML = html;
-                if(sel2) sel2.innerHTML = html;
+                const html = ports.length ? 
+                    ports.map(p => `<option value="${p.device}">${p.device} - ${p.desc}</option>`).join('') : 
+                    '<option value="">No Devices Detected</option>';
+                if (sel1) sel1.innerHTML = html;
+                if (sel2) sel2.innerHTML = html;
             });
         }
 
         function connectSerial() {
             const port = document.getElementById('serial_port').value;
             const baud = document.getElementById('serial_baud').value;
-            if(!port) return alert("Please select a COM port first.");
-            fetch('/api/serial/connect', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({port: port, baud: baud}) })
-            .then(r=>r.json()).then(res => {
-                if(res.error) { alert("Failed to connect: " + res.error); return; }
+            if (!port) return alert("Select a COM port first.");
+            
+            fetch('/api/serial/connect', { 
+                method: 'POST', 
+                headers: {'Content-Type': 'application/json'}, 
+                body: JSON.stringify({port: port, baud: baud}) 
+            })
+            .then(r => r.json()).then(res => {
+                if (res.error) { 
+                    alert("Serial connection error: " + res.error); 
+                    return; 
+                }
                 document.getElementById('btn-serial-connect').style.display = 'none';
                 document.getElementById('btn-serial-disconnect').style.display = 'inline-flex';
                 const out = document.getElementById('serial_out');
-                out.innerHTML += `\\n[*] Connected to ${port} at ${baud} baud\\n`;
+                out.innerHTML += `\\n[*] Connected to ${port} @ ${baud} baud\\n`;
+                
                 serialEventSource = new EventSource('/api/serial/stream');
                 serialEventSource.onmessage = function(e) {
                     const data = JSON.parse(e.data);
-                    out.appendChild(document.createTextNode(data.text));
-                    out.scrollTop = out.scrollHeight;
+                    const autoscroll = document.getElementById('serial-autoscroll').checked;
+                    const addTime = document.getElementById('serial-timestamps').checked;
+                    
+                    let text = data.text;
+                    if (addTime) {
+                        const timeStr = new Date().toLocaleTimeString();
+                        text = `[${timeStr}] ${text}`;
+                    }
+                    out.appendChild(document.createTextNode(text));
+                    if (autoscroll) out.scrollTop = out.scrollHeight;
                 };
             });
         }
 
         function disconnectSerial(quiet = false) {
             fetch('/api/serial/disconnect', {method: 'POST'}).then(() => {
-                if(serialEventSource) { serialEventSource.close(); serialEventSource = null; }
+                if (serialEventSource) { 
+                    serialEventSource.close(); 
+                    serialEventSource = null; 
+                }
                 document.getElementById('btn-serial-connect').style.display = 'inline-flex';
                 document.getElementById('btn-serial-disconnect').style.display = 'none';
-                if (!quiet) document.getElementById('serial_out').innerHTML += `\\n[*] Connection Closed.\\n`;
+                if (!quiet) {
+                    document.getElementById('serial_out').innerHTML += `\\n[*] Serial Connection Terminated.\\n`;
+                }
             });
         }
 
-        // --- The Flash & Auto-Reconnect Logic ---
+        function sendSerialCommand() {
+            const input = document.getElementById('serial-input');
+            const lineEnding = document.getElementById('serial-line-ending').value;
+            const text = input.value;
+            if (!text) return;
+
+            fetch('/api/serial/send', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({text: text, line_ending: lineEnding})
+            }).then(r => r.json()).then(res => {
+                if (res.error) logToOutput(`[Serial] Send Error: ${res.error}`);
+                else {
+                    input.value = '';
+                    document.getElementById('serial_out').innerHTML += `> ${text}\\n`;
+                }
+            });
+        }
+
+        // --- USB FLASHING WITH LIVE CLI STREAMING ---
         let pendingSerialReconnect = false;
-        let savedSerialPort = "";
-        let savedSerialBaud = "";
+        let savedPort = "";
+        let savedBaud = "";
+
+        function generateRandomDeviceId() {
+            const rand = Math.random().toString(16).substring(2, 6);
+            document.getElementById('prov_device_id').value = `node_${rand}`;
+        }
 
         function flashDevice() {
             const port = document.getElementById('prov_port').value;
-            if(!port) return alert("Select a COM port first.");
-            
+            if (!port) return alert("Select a COM port first.");
+
             if (serialEventSource) {
-                savedSerialPort = document.getElementById('serial_port').value;
-                savedSerialBaud = document.getElementById('serial_baud').value;
-                if (savedSerialPort === port) {
+                savedPort = document.getElementById('serial_port').value;
+                savedBaud = document.getElementById('serial_baud').value;
+                if (savedPort === port) {
                     pendingSerialReconnect = true;
-                    disconnectSerial(true); 
+                    disconnectSerial(true);
                 }
             }
-            
-            const data = {
+
+            const btn = document.getElementById('btn-flash-device');
+            btn.disabled = true;
+            btn.innerHTML = `<i class="ph-bold ph-spinner animate-spin text-lg"></i> Flashing Bootloader...`;
+
+            const payload = {
                 port: port,
+                baud: document.getElementById('prov_baud').value,
                 ssid: document.getElementById('top-wifi-ssid').value,
                 pass: document.getElementById('top-wifi-pass').value,
                 api_url: NGROK_API_URL,
@@ -953,107 +2499,579 @@ void loop() {
                 device_id: document.getElementById('prov_device_id').value,
                 auth_token: "secret_abc123"
             };
-            
-            logToOutput("[System] Hardware Flashing initiated via USB...");
-            
-            fetch('/flash', { method: 'POST', headers: { 'Content-Type': 'application/json'}, body: JSON.stringify(data) })
-            .then(res => res.json()).then(result => {
-                logToOutput(result.logs);
-                if (pendingSerialReconnect) {
-                    logToOutput("[System] Reconnecting Serial Monitor in 2 seconds...");
-                    setTimeout(() => {
-                        document.getElementById('serial_port').value = savedSerialPort;
-                        document.getElementById('serial_baud').value = savedSerialBaud;
-                        connectSerial();
-                        pendingSerialReconnect = false;
-                        switchPanelTab('panel-serial');
-                    }, 2000);
+
+            runStreamingTask('/flash/stream', payload, 
+                () => {
+                    switchPanelTab('panel-out');
+                },
+                (success) => {
+                    btn.disabled = false;
+                    btn.innerHTML = `<i class="ph-bold ph-lightning text-lg"></i> <span>Compile & Provision via USB</span>`;
+                    loadFleetsAndDevices();
+
+                    if (pendingSerialReconnect) {
+                        logToOutput("[System] Reconnecting Serial Monitor in 2 seconds...");
+                        setTimeout(() => {
+                            document.getElementById('serial_port').value = savedPort;
+                            document.getElementById('serial_baud').value = savedBaud;
+                            connectSerial();
+                            pendingSerialReconnect = false;
+                            switchPanelTab('panel-serial');
+                        }, 2000);
+                    }
                 }
-            })
-            .catch(err => {
-                logToOutput(`[System] Error: ${err}`);
-                pendingSerialReconnect = false;
-            });
+            );
         }
 
-        // --- Build & Deploy Logic ---
-        function simulateAction(actionType) {
-            if (actionType === 'Verifying') triggerSaveBin();
-            else if (actionType === 'Uploading') deployLoadedBin();
+        // --- COMPILATION & OTA DEPLOYMENT WITH LIVE CLI STREAMING ---
+        function triggerCompileOnly() {
+            closeAllMenus();
+            const container = document.getElementById('action-progress-container');
+            const bar = document.getElementById('action-progress-bar');
+            container.classList.remove('hidden'); 
+            bar.style.width = '30%';
+
+            const rawCode = document.getElementById('code-editor').value;
+            const payload = {
+                ssid: document.getElementById('top-wifi-ssid').value,
+                pass: document.getElementById('top-wifi-pass').value,
+                api_url: NGROK_API_URL, 
+                topic: currentTopic, 
+                code: rawCode
+            };
+
+            runStreamingTask('/api/compile/stream', payload,
+                () => { bar.style.width = '60%'; },
+                (success) => {
+                    bar.style.width = '100%';
+                    setTimeout(() => container.classList.add('hidden'), 500);
+                }
+            );
         }
 
         function triggerSaveBin() {
             closeAllMenus();
             const container = document.getElementById('action-progress-container');
             const bar = document.getElementById('action-progress-bar');
-            container.classList.remove('hidden'); bar.style.width = '50%';
-            logToOutput("[Build] Starting compilation on local server...");
+            container.classList.remove('hidden'); 
+            bar.style.width = '30%';
 
-            const rawCode = document.querySelector('#tab-raw textarea').value;
+            const rawCode = document.getElementById('code-editor').value;
             const payload = {
                 ssid: document.getElementById('top-wifi-ssid').value,
                 pass: document.getElementById('top-wifi-pass').value,
-                api_url: NGROK_API_URL, topic: currentTopic, code: rawCode
+                api_url: NGROK_API_URL, 
+                topic: currentTopic, 
+                code: rawCode
             };
 
-            fetch('/api/build', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
-            .then(async response => {
-                bar.style.width = '100%';
-                setTimeout(() => container.classList.add('hidden'), 500);
+            logToOutput("[Build] Compiling firmware binary for standalone download...");
 
-                if (response.headers.get("content-type").includes("application/json")) {
-                    const data = await response.json(); logToOutput(data.logs); return;
+            runStreamingTask('/api/compile/stream', payload,
+                () => { bar.style.width = '60%'; },
+                (success) => {
+                    bar.style.width = '100%';
+                    setTimeout(() => container.classList.add('hidden'), 500);
+                    if (success) {
+                        const a = document.createElement('a');
+                        a.href = "/api/download_bin";
+                        a.download = `wifey_${currentFleet}_firmware.bin`;
+                        document.body.appendChild(a);
+                        a.click();
+                        a.remove();
+                        logToOutput("[File] Downloaded firmware binary.");
+                    }
                 }
-                const blob = await response.blob();
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url; a.download = "wifey_firmware.bin";
-                document.body.appendChild(a); a.click(); a.remove();
-                window.URL.revokeObjectURL(url);
-                logToOutput("[System] Binary compiled and downloaded to your machine successfully.");
-            })
-            .catch(err => { container.classList.add('hidden'); logToOutput(`[System] Compile Error: ${err}`); });
+            );
         }
 
-        function triggerLoadBin() { document.getElementById('bin-file-input').click(); closeAllMenus(); }
+        function triggerLoadBin() { 
+            document.getElementById('bin-file-input').click(); 
+            closeAllMenus(); 
+        }
+
         function handleBinLoad(event) {
             const file = event.target.files[0];
             if (file) {
                 activeBinFile = file;
-                logToOutput(`[File] Loaded binary file: ${file.name} (${(file.size / 1024).toFixed(2)} KB)`);
-                logToOutput(`[System] Ready to flash. Click the right-arrow icon to deploy to fleet.`);
+                logToOutput(`[File] Loaded custom binary: ${file.name} (${(file.size / 1024).toFixed(2)} KB)`);
+                logToOutput(`[System] Binary staged. Click 'Deploy OTA' to push to fleet.`);
                 event.target.value = ''; 
             }
         }
 
-        function deployLoadedBin() {
-            if (!activeBinFile) { logToOutput("[System] ❌ No binary loaded. Click File -> Load .bin first."); return; }
+        function deployFirmware() {
             const container = document.getElementById('action-progress-container');
             const bar = document.getElementById('action-progress-bar');
-            container.classList.remove('hidden'); bar.style.width = '40%';
-            logToOutput("[Deploy] Pushing staged binary to Cloudflare R2...");
+            container.classList.remove('hidden'); 
+            bar.style.width = '20%';
+
+            if (activeBinFile) {
+                // Deploy already loaded binary
+                uploadBinaryToCloud(activeBinFile);
+            } else {
+                // Compile directly from editor with LIVE CLI STREAMING, then deploy
+                logToOutput(`[Deploy] Compiling sketch for OTA Deployment to '${currentTopic}'...`);
+                bar.style.width = '40%';
+                
+                const rawCode = document.getElementById('code-editor').value;
+                const payload = {
+                    ssid: document.getElementById('top-wifi-ssid').value,
+                    pass: document.getElementById('top-wifi-pass').value,
+                    api_url: NGROK_API_URL, 
+                    topic: currentTopic, 
+                    code: rawCode
+                };
+
+                runStreamingTask('/api/compile/stream', payload,
+                    () => { bar.style.width = '60%'; },
+                    (success) => {
+                        if (!success) {
+                            container.classList.add('hidden');
+                            logToOutput("[Deploy] [ERROR] Compilation failed. OTA Deployment aborted.");
+                            return;
+                        }
+                        bar.style.width = '80%';
+                        logToOutput(`[Deploy] Uploading compiled binary to Cloudflare R2 for target '${currentTopic}'...`);
+
+                        fetch('/api/deploy_compiled', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({topic: currentTopic})
+                        })
+                        .then(res => res.json()).then(data => {
+                            bar.style.width = '100%';
+                            setTimeout(() => container.classList.add('hidden'), 500);
+                            logToOutput(data.logs);
+                            loadFleetsAndDevices();
+                        })
+                        .catch(err => {
+                            container.classList.add('hidden');
+                            logToOutput(`[Deploy] [ERROR] Deployment Error: ${err}`);
+                        });
+                    }
+                );
+            }
+        }
+
+        function uploadBinaryToCloud(file) {
+            const container = document.getElementById('action-progress-container');
+            const bar = document.getElementById('action-progress-bar');
+            bar.style.width = '80%';
+            logToOutput(`[Deploy] Uploading binary to Cloudflare R2 for target: '${currentTopic}'...`);
 
             const formData = new FormData();
-            formData.append('bin_file', activeBinFile);
-            formData.append('topic', currentTopic); 
+            formData.append('bin_file', file);
+            formData.append('topic', currentTopic);
 
             fetch('/api/deploy', { method: 'POST', body: formData })
             .then(res => res.json()).then(data => {
-                bar.style.width = '100%'; setTimeout(() => container.classList.add('hidden'), 500);
-                logToOutput(data.logs); activeBinFile = null; 
+                bar.style.width = '100%'; 
+                setTimeout(() => container.classList.add('hidden'), 500);
+                logToOutput(data.logs); 
+                activeBinFile = null; 
+                loadFleetsAndDevices();
             })
-            .catch(err => { container.classList.add('hidden'); logToOutput(`[System] Deploy Error: ${err}`); });
+            .catch(err => { 
+                container.classList.add('hidden'); 
+                logToOutput(`[Deploy] Deployment Error: ${err}`); 
+            });
         }
+
+        // --- REALTIME EVENT STREAM ---
+        try {
+            const eventSource = new EventSource('/api/events/stream');
+            eventSource.onmessage = function(e) {
+                if (!e.data || e.data.startsWith(':')) return;
+                try {
+                    const payload = JSON.parse(e.data);
+                    if (payload.text) {
+                        logToOutput(payload.text);
+                        if (payload.text.includes("[OTA") || payload.text.includes("[Batch") || payload.text.includes("[System]")) {
+                            loadFleetDashboard();
+                            loadFleetsAndDevices();
+                        }
+                    }
+                } catch(err) {}
+            };
+        } catch(err) {}
+
+        // --- SETTINGS VIEW ---
+        function loadSettings() {
+            fetch('/api/settings').then(r => r.json()).then(data => {
+                document.getElementById('cfg_r2_account').value = data.r2_account_id || '';
+                document.getElementById('cfg_r2_access').value = data.r2_access_key || '';
+                document.getElementById('cfg_r2_secret').value = data.r2_secret_key || '';
+                document.getElementById('cfg_r2_bucket').value = data.r2_bucket || '';
+                document.getElementById('cfg_ngrok_domain').value = data.ngrok_domain || '';
+                document.getElementById('cfg_ngrok_token').value = data.ngrok_token || '';
+                if (document.getElementById('cfg_worker_url')) {
+                    document.getElementById('cfg_worker_url').value = data.worker_base_url || '';
+                }
+                if (document.getElementById('cfg_google_client_id')) {
+                    document.getElementById('cfg_google_client_id').value = data.google_client_id || '';
+                }
+                if (document.getElementById('cfg_google_sub')) {
+                    document.getElementById('cfg_google_sub').value = data.google_sub || '';
+                }
+                if (document.getElementById('cfg_google_id_token')) {
+                    document.getElementById('cfg_google_id_token').value = data.google_id_token || '';
+                }
+                if (document.getElementById('cfg_google_client_secret')) {
+                    document.getElementById('cfg_google_client_secret').value = data.google_client_secret || '';
+                }
+            });
+        }
+
+        function saveSettings() {
+            const payload = {
+                r2_account_id: document.getElementById('cfg_r2_account').value,
+                r2_access_key: document.getElementById('cfg_r2_access').value,
+                r2_secret_key: document.getElementById('cfg_r2_secret').value,
+                r2_bucket: document.getElementById('cfg_r2_bucket').value,
+                ngrok_domain: document.getElementById('cfg_ngrok_domain').value,
+                ngrok_token: document.getElementById('cfg_ngrok_token').value,
+                worker_base_url: document.getElementById('cfg_worker_url')?.value || '',
+                google_client_id: document.getElementById('cfg_google_client_id')?.value || '',
+                google_client_secret: document.getElementById('cfg_google_client_secret')?.value || '',
+                google_sub: document.getElementById('cfg_google_sub')?.value || '',
+                google_id_token: document.getElementById('cfg_google_id_token')?.value || ''
+            };
+
+            fetch('/api/settings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            }).then(r => r.json()).then(res => {
+                if (res.success) {
+                    logToOutput("[System] Settings saved successfully to .env and applied to current session.");
+                    alert("Settings saved successfully.");
+                } else {
+                    logToOutput(`[System] Error saving settings: ${res.error}`);
+                }
+            });
+        }
+
+        // --- GOOGLE OAUTH & PROFILE MANAGEMENT ---
+        let authPollInterval = null;
+
+        function startGoogleAuth() {
+            const spinner = document.getElementById('auth-spinner');
+            if (spinner) spinner.classList.remove('hidden');
+
+            fetch('/api/auth/login')
+                .then(r => r.json())
+                .then(data => {
+                    if (!data.success) {
+                        if (spinner) spinner.classList.add('hidden');
+                        alert('Authentication Notice: ' + (data.error || 'Failed to initiate login.'));
+                        return;
+                    }
+                    logToOutput('[Auth] Google OAuth authorization URL opened in browser. Awaiting login...');
+                    if (authPollInterval) clearInterval(authPollInterval);
+                    authPollInterval = setInterval(() => checkAuthStatus(false), 1500);
+                })
+                .catch(err => {
+                    if (spinner) spinner.classList.add('hidden');
+                    alert('Error connecting to authentication service: ' + err);
+                });
+        }
+
+        function checkAuthStatus(isInitialLoad = false) {
+            fetch('/api/auth/status')
+                .then(r => r.json())
+                .then(data => {
+                    const isAuthed = data.status === true || data.authenticated === true;
+                    if (isAuthed && data.user) {
+                        if (authPollInterval) {
+                            clearInterval(authPollInterval);
+                            authPollInterval = null;
+                        }
+                        updateUserProfileUI(data.user);
+
+                        const overlay = document.getElementById('auth-overlay');
+                        if (overlay) {
+                            overlay.classList.add('opacity-0', 'pointer-events-none');
+                            setTimeout(() => overlay.classList.add('hidden'), 500);
+                        }
+                        const spinner = document.getElementById('auth-spinner');
+                        if (spinner) spinner.classList.add('hidden');
+
+                        if (!isInitialLoad) {
+                            logToOutput(`[Auth] Google Authentication successful! Welcome, ${data.user.email || 'User'}.`);
+                        }
+                    } else if (isInitialLoad) {
+                        const overlay = document.getElementById('auth-overlay');
+                        if (overlay) {
+                            overlay.classList.remove('hidden', 'opacity-0', 'pointer-events-none');
+                        }
+                    }
+                })
+                .catch(err => {
+                    console.error('[Auth] Status check error:', err);
+                });
+        }
+
+        function updateUserProfileUI(user) {
+            if (!user) return;
+            const img = document.getElementById('user-profile-img');
+            const fallback = document.getElementById('user-profile-fallback');
+            const emailEl = document.getElementById('profile-email-text');
+
+            if (emailEl && user.email) {
+                emailEl.innerText = user.email;
+            }
+            if (img && user.picture) {
+                img.src = user.picture;
+                img.classList.remove('hidden');
+                if (fallback) fallback.classList.add('hidden');
+            } else {
+                if (img) img.classList.add('hidden');
+                if (fallback) fallback.classList.remove('hidden');
+            }
+        }
+
+        function signOutUser() {
+            closeAllMenus();
+            fetch('/api/auth/signout', { method: 'POST' })
+                .then(r => r.json())
+                .then(() => {
+                    const img = document.getElementById('user-profile-img');
+                    const fallback = document.getElementById('user-profile-fallback');
+                    const emailEl = document.getElementById('profile-email-text');
+                    if (img) { img.src = ''; img.classList.add('hidden'); }
+                    if (fallback) fallback.classList.remove('hidden');
+                    if (emailEl) emailEl.innerText = 'Not Signed In';
+
+                    const overlay = document.getElementById('auth-overlay');
+                    if (overlay) {
+                        overlay.classList.remove('hidden', 'opacity-0', 'pointer-events-none');
+                    }
+                    const spinner = document.getElementById('auth-spinner');
+                    if (spinner) spinner.classList.add('hidden');
+
+                    logToOutput('[Auth] User signed out successfully.');
+                })
+                .catch(err => {
+                    alert('Error signing out: ' + err);
+                });
+        }
+        
     </script>
 </body>
 </html>
 """
 
+# --- ROUTES ---
+
 @app.route('/')
 def index():
     if not SETUP_STATE["done"]:
         return render_template_string(SETUP_HTML)
-    return render_template_string(IDE_HTML, ngrok_url=NGROK_URL)
+    return render_template_string(IDE_HTML, ngrok_url=NGROK_URL, r2_bucket=R2_BUCKET)
+
+# --- GOOGLE OAUTH 2.0 AUTHENTICATION ROUTES ---
+
+AUTH_CALLBACK_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WiFeY Studio - Authentication</title>
+    <style>
+        body {
+            background-color: #0d0e12;
+            color: #e0e2ec;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .card {
+            background-color: #17191f;
+            border: 1px solid #282a36;
+            border-radius: 16px;
+            padding: 40px;
+            max-width: 440px;
+            text-align: center;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+        h1 { color: #00b4b6; font-size: 22px; margin: 12px 0 8px 0; }
+        p { color: #8e92a4; font-size: 13px; line-height: 1.6; margin: 0 0 20px 0; }
+        .badge { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+        .success { background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.3); }
+        .error { background: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3); }
+    </style>
+</head>
+<body>
+    <div class="card">
+        {% if success %}
+            <div class="badge success"><span>&#10003;</span> Authentication Successful</div>
+            <h1>Connected to WiFeY Studio</h1>
+            <p>Signed in as <strong>{{ email }}</strong>.<br>You can safely close this browser tab and return to WiFeY Studio.</p>
+            <script>
+                setTimeout(() => { window.close(); }, 2500);
+            </script>
+        {% else %}
+            <div class="badge error"><span>&#10007;</span> Sign In Failed</div>
+            <h1>Authentication Error</h1>
+            <p>{{ error }}</p>
+        {% endif %}
+    </div>
+</body>
+</html>
+"""
+
+@app.route('/api/auth/login')
+def auth_login():
+    global GOOGLE_CLIENT_ID
+    client_id = GOOGLE_CLIENT_ID or os.getenv("GOOGLE_CLIENT_ID", "")
+    if not client_id:
+        return jsonify({
+            "success": False,
+            "error": "Google Client ID is not configured. Please enter your Google OAuth Client ID in Settings."
+        }), 400
+
+    state = secrets.token_hex(16)
+    code_verifier = secrets.token_urlsafe(64)
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode('ascii')).digest()
+    ).decode('ascii').rstrip('=')
+
+    OAUTH_STATES[state] = {
+        "verifier": code_verifier,
+        "created_at": time.time()
+    }
+
+    # Clean up stale states (> 10 mins)
+    now = time.time()
+    for s in list(OAUTH_STATES.keys()):
+        if now - OAUTH_STATES[s]["created_at"] > 600:
+            OAUTH_STATES.pop(s, None)
+
+    redirect_uri = "http://127.0.0.1:5000/api/auth/callback"
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "access_type": "offline",
+        "prompt": "select_account",
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256"
+    }
+    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(params)}"
+    
+    try:
+        webbrowser.open(auth_url)
+    except Exception as e:
+        print(f"[OAuth] Error launching browser: {e}")
+
+    return jsonify({"success": True, "auth_url": auth_url, "state": state})
+
+@app.route('/api/auth/callback')
+def auth_callback():
+    code = request.args.get('code')
+    state = request.args.get('state')
+    error = request.args.get('error')
+
+    if error:
+        return render_template_string(AUTH_CALLBACK_HTML, success=False, error=error)
+
+    if not code:
+        return render_template_string(AUTH_CALLBACK_HTML, success=False, error="Authorization code is missing from Google redirect.")
+
+    verifier_data = OAUTH_STATES.pop(state, None) if state else None
+    code_verifier = verifier_data.get("verifier") if verifier_data else None
+
+    token_payload = {
+        "code": code,
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": "http://127.0.0.1:5000/api/auth/callback",
+        "grant_type": "authorization_code",
+    }
+    if code_verifier:
+        token_payload["code_verifier"] = code_verifier
+    if GOOGLE_CLIENT_SECRET:
+        token_payload["client_secret"] = GOOGLE_CLIENT_SECRET
+
+    try:
+        token_resp = requests.post("https://oauth2.googleapis.com/token", data=token_payload, timeout=15)
+    except Exception as e:
+        return render_template_string(AUTH_CALLBACK_HTML, success=False, error=f"Network error contacting Google: {e}")
+
+    if not token_resp.ok:
+        err_msg = token_resp.text
+        try:
+            err_json = token_resp.json()
+            err_msg = err_json.get("error_description") or err_json.get("error") or err_msg
+        except:
+            pass
+        return render_template_string(AUTH_CALLBACK_HTML, success=False, error=f"Token exchange failed: {err_msg}")
+
+    token_data = token_resp.json()
+    id_token = token_data.get("id_token", "")
+    access_token = token_data.get("access_token", "")
+
+    # Fetch user profile data from Google UserInfo endpoint
+    user_info = {}
+    if access_token:
+        try:
+            ui_resp = requests.get(
+                "https://www.googleapis.com/oauth2/v3/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=15
+            )
+            if ui_resp.ok:
+                user_info = ui_resp.json()
+        except Exception:
+            pass
+
+    google_sub = user_info.get("sub", "")
+    email = user_info.get("email", "")
+    picture = user_info.get("picture", "")
+
+    # Fallback to decode JWT id_token payload if userinfo fields were missing
+    if (not google_sub or not email or not picture) and id_token:
+        try:
+            parts = id_token.split(".")
+            if len(parts) >= 2:
+                payload_b64 = parts[1]
+                payload_b64 += "=" * (-len(payload_b64) % 4)
+                jwt_payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode('utf-8')).decode('utf-8'))
+                if not google_sub: google_sub = jwt_payload.get("sub", "")
+                if not email: email = jwt_payload.get("email", "")
+                if not picture: picture = jwt_payload.get("picture", "")
+        except Exception:
+            pass
+
+    # Save to database
+    db.set_user_profile(
+        google_sub=google_sub,
+        email=email,
+        id_token=id_token,
+        picture=picture
+    )
+
+    return render_template_string(AUTH_CALLBACK_HTML, success=True, email=email or "User")
+
+@app.route('/api/auth/status')
+def auth_status():
+    user_prof = db.get_user_profile()
+    is_authenticated = bool(user_prof.get("google_sub") or user_prof.get("id_token") or user_prof.get("email"))
+    return jsonify({
+        "status": is_authenticated,
+        "authenticated": is_authenticated,
+        "user": user_prof if is_authenticated else None
+    })
+
+@app.route('/api/auth/signout', methods=['POST', 'GET'])
+def auth_signout():
+    db.clear_user_profile()
+    return jsonify({"success": True, "status": False, "authenticated": False, "message": "Signed out successfully"})
 
 @app.route('/api/setup_status')
 def setup_status():
@@ -1066,15 +3084,18 @@ def get_ports():
 
 @app.route('/api/serial/connect', methods=['POST'])
 def serial_connect():
-    data = request.json
+    data = request.json or {}
     port = data.get('port')
     baud = int(data.get('baud', 115200))
     
-    close_serial_connection() 
+    close_serial_connection()
     try:
-        SERIAL_STATE["serial_obj"] = serial.Serial(port, baud, timeout=1)
-        SERIAL_STATE["port"] = port
-        SERIAL_STATE["is_running"] = True
+        with SERIAL_LOCK:
+            s = serial.Serial(port, baud, timeout=0.5)
+            SERIAL_STATE["serial_obj"] = s
+            SERIAL_STATE["port"] = port
+            SERIAL_STATE["baud"] = baud
+            SERIAL_STATE["is_running"] = True
         return jsonify({"status": "connected"})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -1084,183 +3105,737 @@ def serial_disconnect():
     close_serial_connection()
     return jsonify({"status": "disconnected"})
 
+@app.route('/api/serial/send', methods=['POST'])
+def serial_send():
+    data = request.json or {}
+    text = data.get('text', '')
+    line_ending = data.get('line_ending', '\r\n')
+    
+    # Unescape literal backslash escapes
+    line_ending = line_ending.replace('\\r', '\r').replace('\\n', '\n')
+    
+    with SERIAL_LOCK:
+        s = SERIAL_STATE.get("serial_obj")
+        if not s or not s.is_open:
+            return jsonify({"error": "Serial port is not open."}), 400
+        try:
+            s.write((text + line_ending).encode('utf-8'))
+            s.flush()
+            return jsonify({"status": "sent"})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
 @app.route('/api/serial/stream')
 def serial_stream():
     def generate():
-        while SERIAL_STATE["is_running"] and SERIAL_STATE["serial_obj"] and SERIAL_STATE["serial_obj"].is_open:
-            try:
-                if SERIAL_STATE["serial_obj"].in_waiting > 0:
-                    line = SERIAL_STATE["serial_obj"].readline().decode('utf-8', errors='replace')
-                    yield f"data: {json.dumps({'text': line})}\n\n"
-                else:
-                    time.sleep(0.05)
-            except Exception as e:
-                yield f"data: {json.dumps({'text': '[Serial Error] ' + str(e)})}\n\n"
-                break
+        while True:
+            with SERIAL_LOCK:
+                if not SERIAL_STATE["is_running"] or not SERIAL_STATE["serial_obj"]:
+                    break
+                s = SERIAL_STATE["serial_obj"]
+                try:
+                    if s.is_open and s.in_waiting > 0:
+                        raw = s.readline().decode('utf-8', errors='replace')
+                        yield f"data: {json.dumps({'text': raw})}\n\n"
+                    else:
+                        time.sleep(0.04)
+                except Exception as e:
+                    err_text = f"[Serial Error] {str(e)}\n"
+                    yield f"data: {json.dumps({'text': err_text})}\n\n"
+                    break
     return Response(generate(), mimetype='text/event-stream')
 
 @app.route('/preview', methods=['POST'])
 def preview_code():
-    data = request.json
+    data = request.json or {}
     try:
-        wrapped = generate_wrapped_code(data.get('ssid'), data.get('pass'), data.get('api_url'), data.get('topic'), data.get('code'))
+        wrapped = generate_wrapped_code(
+            data.get('ssid'), data.get('pass'), data.get('api_url'),
+            data.get('topic'), data.get('code')
+        )
         return jsonify({"code": wrapped})
     except Exception as e:
         return jsonify({"code": "// Error generating preview:\n" + str(e)})
+
+@app.route('/api/db', methods=['GET'])
+def get_db():
+    return jsonify(db.get_all())
+
+@app.route('/api/device/delete', methods=['POST'])
+def delete_device_route():
+    data = request.json or {}
+    device_id = data.get('device_id')
+    if device_id:
+        db.delete_device(device_id)
+        return jsonify({"success": True})
+    return jsonify({"error": "Missing device_id"}), 400
+
+@app.route('/api/fleet/create', methods=['POST'])
+def create_fleet_route():
+    data = request.json or {}
+    fleet = data.get('fleet')
+    if fleet:
+        db.create_fleet(fleet)
+        return jsonify({"success": True})
+    return jsonify({"error": "Missing fleet name"}), 400
 
 @app.route('/api/manifest', methods=['GET'])
 def api_manifest():
     fleet_id = request.args.get('fleet', 'DefaultFleet')
     device_id = request.args.get('device')
-    auth_header = request.headers.get('Authorization')
-    device_info = DEVICE_DATABASE.get(device_id, {"auth_token": "secret_abc123"})
+    auth_header = request.headers.get('Authorization', '')
     
-    if auth_header != f"Bearer {device_info['auth_token']}":
-        return jsonify({"error": "Unauthorized"}), 401
-
-    target_version = "v_base_001"
+    token = auth_header.replace('Bearer ', '').strip() if 'Bearer ' in auth_header else auth_header.strip()
     
-    if fleet_id in VERSION_MANIFEST:
-        f_data = VERSION_MANIFEST[fleet_id]
-        if device_id in f_data.get("nodes", {}):
-            target_version = f_data["nodes"][device_id]
-        else:
-            target_version = f_data.get("fleet_version", "v_base_001")
+    device_info = db.get_device(device_id) if device_id else None
+    if device_info:
+        expected_token = device_info.get("device_token")
+        if expected_token and token and token != expected_token and token != "secret_abc123":
+            return jsonify({"error": "Unauthorized: invalid device token"}), 401
+        fleet_id = device_info.get("fleet", fleet_id)
+        db.update_device_seen(device_id)
+    else:
+        if device_id:
+            db.register_or_update_device(device_id, fleet_id, device_token=token or f"dt_{secrets.token_hex(8)}")
 
-    try:
-        s3_client = get_s3_client()
-        download_url = s3_client.generate_presigned_url(
-            'get_object', Params={'Bucket': R2_BUCKET, 'Key': f'{fleet_id}/firmware.bin'}, ExpiresIn=900
-        )
-    except:
-        download_url = ""
+    target_build, firmware_url = db.get_target_build(fleet_id, device_id)
 
-    return jsonify({"target_version": target_version, "download_url": download_url})
+    # If no URL is set, generate presigned URL from R2
+    if not firmware_url and R2_ACCOUNT_ID and R2_ACCESS_KEY and R2_SECRET_KEY:
+        try:
+            s3 = get_s3_client()
+            firmware_url = s3.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': R2_BUCKET, 'Key': f'{fleet_id}/firmware.bin'},
+                ExpiresIn=3600
+            )
+        except Exception as e:
+            print(f"[R2] Presigned URL error: {e}")
+            firmware_url = ""
 
-@app.route('/api/build', methods=['POST'])
-def build_binary():
-    try:
-        data = request.json
-        ssid, passw = data.get('ssid'), data.get('pass')
-        api_url, topic = data.get('api_url'), data.get('topic')
-        user_code = data.get('code')
+    # Fallback to local network HTTP route
+    if not firmware_url:
+        local_ip = get_local_ip()
+        firmware_url = f"http://{local_ip}:5000/api/lan/firmware/WiFeYSketch.ino.bin"
 
-        final_code = generate_wrapped_code(ssid, passw, api_url, topic, user_code, "manual_build")
+    return jsonify({"target_build": int(target_build), "download_url": firmware_url})
+
+@app.route('/api/device/notify_flash', methods=['POST'])
+def notify_flash():
+    data = request.json or {}
+    device_id = data.get('device_id')
+    status = data.get('status', 'SUCCESS')
+    new_build = data.get('new_build')
+    device_token = data.get('device_token')
+    
+    auth_header = request.headers.get('Authorization', '')
+    token = device_token or (auth_header.replace('Bearer ', '').strip() if 'Bearer ' in auth_header else '')
+
+    if not device_id:
+        return jsonify({"error": "Missing device_id"}), 400
+
+    dev = db.get_device(device_id)
+    if dev and token and dev.get("device_token") != token:
+        return jsonify({"error": "Unauthorized device token"}), 401
+
+    if status.upper() == "SUCCESS" and new_build is not None:
+        try:
+            build_int = int(new_build)
+        except:
+            build_int = 100
+        db.update_device_seen(device_id, current_build=build_int)
         
-        cli_path = SETUP_STATE.get("cli_path") or shutil.which("arduino-cli")
+        # Clear custom override if target reached
+        if dev and dev.get("custom_build_override") is not None and build_int >= dev.get("custom_build_override"):
+            db.clear_node_override(device_id)
+
+        msg = f"🎉 [OTA Flash Verified] Node '{device_id}' successfully updated to build #{build_int}!"
+        try:
+            print(f"[OTA Flash Verified] Node '{device_id}' successfully updated to build #{build_int}!")
+        except Exception:
+            pass
+        emit_ui_log(msg)
+        return jsonify({"success": True, "device_id": device_id, "current_build": build_int})
+
+    return jsonify({"success": True})
+
+@app.route('/api/fleets/batch_update', methods=['POST'])
+def batch_update_fleets():
+    fleet_ids_raw = request.form.get('fleet_ids') or (request.json.get('fleet_ids') if request.is_json else None)
+    target_build = request.form.get('target_build') or (request.json.get('target_build') if request.is_json else None)
+    
+    if isinstance(fleet_ids_raw, str):
+        try:
+            fleet_ids = json.loads(fleet_ids_raw)
+        except:
+            fleet_ids = [f.strip() for f in fleet_ids_raw.split(',') if f.strip()]
+    elif isinstance(fleet_ids_raw, list):
+        fleet_ids = fleet_ids_raw
+    else:
+        fleet_ids = []
+
+    if not fleet_ids:
+        return jsonify({"error": "No fleets specified"}), 400
+
+    binary_bytes = None
+    if 'bin_file' in request.files:
+        binary_bytes = request.files['bin_file'].read()
+    else:
+        compiled_bin = os.path.join(BUILD_CACHE_DIR, "output", "WiFeYSketch.ino.bin")
+        if os.path.exists(compiled_bin):
+            with open(compiled_bin, "rb") as f:
+                binary_bytes = f.read()
+
+    if not binary_bytes:
+        return jsonify({"error": "No binary provided or compiled yet. Please compile first."}), 400
+
+    build_int = int(target_build) if target_build else 105
+
+    updated = []
+    for fleet in fleet_ids:
+        download_url = upload_firmware_to_cloud(fleet, binary_bytes, build_int)
+        db.set_fleet_target_build(fleet, build_int, download_url)
+        updated.append(fleet)
+
+    log_msg = f"🎉 [Batch Deploy] Deployed build #{build_int} across {len(updated)} fleets: {', '.join(updated)}"
+    emit_ui_log(log_msg)
+    return jsonify({
+        "success": True,
+        "target_build": build_int,
+        "updated_fleets": updated,
+        "message": log_msg
+    })
+
+@app.route('/api/device/reassign_fleet', methods=['POST'])
+def reassign_fleet_route():
+    data = request.json or {}
+    device_id = data.get('device_id')
+    new_fleet = data.get('new_fleet')
+    if not device_id or not new_fleet:
+        return jsonify({"error": "Missing device_id or new_fleet"}), 400
+    
+    db.reassign_fleet(device_id, new_fleet)
+    msg = f"[System] Reassigned node '{device_id}' to fleet '{new_fleet}'."
+    emit_ui_log(msg)
+    return jsonify({"success": True, "device_id": device_id, "new_fleet": new_fleet})
+
+@app.route('/api/device/override', methods=['POST'])
+def device_override_route():
+    data = request.json or {}
+    device_id = data.get('device_id')
+    build_num = data.get('build_num')
+    firmware_url = data.get('firmware_url')
+    clear = data.get('clear', False)
+
+    if not device_id:
+        return jsonify({"error": "Missing device_id"}), 400
+
+    if clear or build_num is None:
+        db.clear_node_override(device_id)
+        msg = f"[System] Cleared custom build override for node '{device_id}'."
+    else:
+        db.set_node_override(device_id, int(build_num), firmware_url)
+        msg = f"[System] Set custom override on node '{device_id}': build #{build_num}."
+
+    emit_ui_log(msg)
+    return jsonify({"success": True, "device_id": device_id})
+
+@app.route('/api/lan/devices', methods=['GET'])
+def get_lan_devices():
+    valid_tokens = db.get_all_device_tokens()
+    now = time.time()
+    active_nodes = []
+    with LAN_NODES_LOCK:
+        for dev_id, info in list(LAN_NODES.items()):
+            if info.get("device_token") in valid_tokens:
+                is_online = (now - info.get("last_seen", 0)) < 60
+                active_nodes.append({
+                    **info,
+                    "online": is_online
+                })
+    return jsonify({"devices": active_nodes})
+
+@app.route('/api/lan/firmware/<filename>', methods=['GET'])
+def lan_firmware_route(filename):
+    safe_name = os.path.basename(filename)
+    bin_path = os.path.join(BUILD_CACHE_DIR, "output", safe_name)
+    if os.path.exists(bin_path):
+        return send_file(bin_path, mimetype="application/octet-stream", as_attachment=False)
+    return jsonify({"error": "Firmware binary not found"}), 404
+
+@app.route('/api/cloud/sync', methods=['GET', 'POST'])
+def cloud_sync():
+    global db
+    user_prof = db.get_user_profile()
+    token = request.headers.get('Authorization', '').replace('Bearer ', '').strip() or user_prof.get("id_token")
+    google_sub = request.args.get('google_sub') or user_prof.get("google_sub")
+
+    if request.method == 'GET':
+        if not google_sub:
+            return jsonify({"error": "Missing google_sub for cloud sync"}), 400
+
+        # Try Cloudflare Worker Gateway first
+        if WORKER_BASE_URL and token:
+            try:
+                sync_url = f"{WORKER_BASE_URL}/users/{google_sub}/wifey_db.json"
+                resp = requests.get(sync_url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+                if resp.status_code == 200:
+                    remote_db = resp.json()
+                    with db.lock:
+                        db._data = remote_db
+                    db.save()
+                    emit_ui_log("[Cloud Sync] Successfully downloaded database from Cloudflare Worker.")
+                    return jsonify({"success": True, "db": db.get_all()})
+            except Exception as e:
+                print(f"[Worker Sync GET] Error: {e}")
+
+        # Fallback to direct R2 S3 client
+        if R2_ACCOUNT_ID and R2_ACCESS_KEY and R2_SECRET_KEY:
+            try:
+                s3 = get_s3_client()
+                obj = s3.get_object(Bucket=R2_BUCKET, Key=f"users/{google_sub}/wifey_db.json")
+                remote_db = json.loads(obj['Body'].read().decode('utf-8'))
+                with db.lock:
+                    db._data = remote_db
+                db.save()
+                emit_ui_log("[Cloud Sync] Successfully downloaded database from Cloudflare R2.")
+                return jsonify({"success": True, "db": db.get_all()})
+            except Exception as e:
+                return jsonify({"error": f"Cloud download failed: {str(e)}"}), 500
+
+        return jsonify({"error": "No cloud credentials configured for download"}), 400
+
+    else:
+        # POST - Upload wifey_db.json
+        data = request.json or {}
+        sub = data.get('google_sub') or google_sub
+        email = data.get('email') or user_prof.get("email")
+        new_token = data.get('id_token') or token
+        if sub:
+            db.set_user_profile(google_sub=sub, email=email, id_token=new_token)
+            google_sub = sub
+            token = new_token
+
+        if not google_sub:
+            return jsonify({"error": "Missing google_sub for cloud sync"}), 400
+
+        db_json_bytes = json.dumps(db.get_all(), indent=2).encode('utf-8')
+
+        # Try Cloudflare Worker Gateway first
+        if WORKER_BASE_URL and token:
+            try:
+                sync_url = f"{WORKER_BASE_URL}/users/{google_sub}/wifey_db.json"
+                resp = requests.put(
+                    sync_url,
+                    data=db_json_bytes,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json"
+                    },
+                    timeout=15
+                )
+                if resp.status_code in (200, 201, 204):
+                    emit_ui_log("[Cloud Sync] Successfully uploaded database to Cloudflare Worker.")
+                    return jsonify({"success": True})
+            except Exception as e:
+                print(f"[Worker Sync POST] Error: {e}")
+
+        # Fallback to direct R2 S3 client
+        if R2_ACCOUNT_ID and R2_ACCESS_KEY and R2_SECRET_KEY:
+            try:
+                s3 = get_s3_client()
+                s3.put_object(
+                    Bucket=R2_BUCKET,
+                    Key=f"users/{google_sub}/wifey_db.json",
+                    Body=db_json_bytes,
+                    ContentType="application/json"
+                )
+                emit_ui_log("[Cloud Sync] Successfully uploaded database to Cloudflare R2.")
+                return jsonify({"success": True})
+            except Exception as e:
+                return jsonify({"error": f"Cloud upload failed: {str(e)}"}), 500
+
+        return jsonify({"error": "No cloud credentials configured for upload"}), 400
+
+@app.route('/api/events/stream')
+def events_stream():
+    def generate():
+        while True:
+            try:
+                msg = UI_LOG_QUEUE.get(timeout=20)
+                yield f"data: {json.dumps({'text': msg})}\n\n"
+            except queue.Empty:
+                yield ": keepalive\n\n"
+    return Response(generate(), mimetype='text/event-stream')
+
+# --- LIVE STREAMING COMPILATION ENDPOINT ---
+@app.route('/api/compile/stream', methods=['POST'])
+def compile_stream_route():
+    data = request.json or {}
+    ssid = data.get('ssid')
+    passw = data.get('pass')
+    api_url = data.get('api_url')
+    topic = data.get('topic')
+    user_code = data.get('code')
+    target_build = data.get('target_build')
+
+    parts = (topic or "").split('/')
+    fleet_id = parts[0] if len(parts) > 0 and parts[0] else "DefaultFleet"
+    device_id = parts[2] if len(parts) >= 3 and parts[2] else "node_1"
+
+    if not target_build:
+        target_build = db.get_next_build_number(fleet_id)
+    else:
+        target_build = int(target_build)
+
+    dev = db.get_device(device_id)
+    dev_token = dev.get("device_token") if dev else f"dt_{secrets.token_hex(8)}"
+
+    def generate():
+        yield f"[Build] Preparing sketch and stamping target build #{target_build}...\n"
+        final_code = generate_wrapped_code(ssid, passw, api_url, topic, user_code, build_num=target_build, device_token=dev_token)
+
+        cli_path = SETUP_STATE.get("cli_path") or find_arduino_cli()
+        if not cli_path:
+            yield "[Build] [ERROR] Arduino CLI executable was not found on this machine.\n"
+            return
+
         fqbn = "esp32:esp32:esp32"
+        sketch_proj_dir = os.path.join(BUILD_CACHE_DIR, "sketch_proj", "WiFeYSketch")
+        os.makedirs(sketch_proj_dir, exist_ok=True)
+        sketch_file = os.path.join(sketch_proj_dir, "WiFeYSketch.ino")
         
-        with tempfile.TemporaryDirectory() as temp_dir:
-            sketch_name = "WiFeYSketch"
-            sketch_dir = os.path.join(temp_dir, sketch_name)
-            os.makedirs(sketch_dir)
-            
-            sketch_file = os.path.join(sketch_dir, f"{sketch_name}.ino")
+        try:
             with open(sketch_file, "w", encoding="utf-8") as f:
                 f.write(final_code)
+        except Exception as e:
+            yield f"[Build] [ERROR] Failed writing sketch: {e}\n"
+            return
 
-            output_dir = os.path.join(temp_dir, "output")
-            os.makedirs(output_dir, exist_ok=True)
+        output_dir = os.path.join(BUILD_CACHE_DIR, "output")
+        os.makedirs(output_dir, exist_ok=True)
 
-            compile_res = subprocess.run([cli_path, "compile", "--fqbn", fqbn, "--build-cache-path", CORE_CACHE_DIR, "--output-dir", output_dir, sketch_file], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
-            
-            if compile_res.returncode != 0: 
-                return jsonify({"error": True, "logs": "❌ COMPILATION FAILED:\n" + compile_res.stderr})
-            
-            compiled_bin = os.path.join(output_dir, f"{sketch_name}.ino.bin")
-            
-            return send_file(compiled_bin, as_attachment=True, download_name="wifey_firmware.bin", mimetype="application/octet-stream")
-            
+        yield "[Build] Launching arduino-cli compiler with smart caching...\n"
+        
+        compile_cmd = [
+            cli_path, "compile",
+            "--fqbn", fqbn,
+            "--build-path", BUILD_CACHE_DIR,
+            "--output-dir", output_dir,
+            "-j", "0",
+            sketch_file
+        ]
+
+        proc = subprocess.Popen(
+            compile_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            creationflags=CREATE_NO_WINDOW
+        )
+
+        for line in proc.stdout:
+            clean_line = line.rstrip()
+            if clean_line:
+                yield f"[CLI] {clean_line}\n"
+
+        proc.wait()
+
+        if proc.returncode != 0:
+            yield f"[Build] [ERROR] Compilation failed with exit code {proc.returncode}.\n"
+        else:
+            compiled_bin = os.path.join(output_dir, "WiFeYSketch.ino.bin")
+            if os.path.exists(compiled_bin):
+                size_kb = os.path.getsize(compiled_bin) / 1024
+                yield f"[Build] [SUCCESS] Compilation completed successfully! Binary size: {size_kb:.1f} KB (Build #{target_build})\n"
+            else:
+                yield "[Build] [ERROR] Compilation succeeded but output binary was not found.\n"
+
+    return Response(generate(), mimetype='text/plain')
+
+@app.route('/api/download_bin', methods=['GET'])
+def download_bin_route():
+    compiled_bin = os.path.join(BUILD_CACHE_DIR, "output", "WiFeYSketch.ino.bin")
+    if os.path.exists(compiled_bin):
+        return send_file(compiled_bin, as_attachment=True, download_name="wifey_firmware.bin", mimetype="application/octet-stream")
+    return jsonify({"error": "No compiled binary found. Please compile first."}), 404
+
+@app.route('/api/deploy_compiled', methods=['POST'])
+def deploy_compiled_route():
+    try:
+        data = request.json or {}
+        topic = data.get('topic', 'DefaultFleet/fleet/update')
+        compiled_bin = os.path.join(BUILD_CACHE_DIR, "output", "WiFeYSketch.ino.bin")
+        if not os.path.exists(compiled_bin):
+            return jsonify({"error": True, "logs": "❌ No compiled binary found. Please compile first."})
+
+        with open(compiled_bin, "rb") as f:
+            binary_bytes = f.read()
+
+        parts = topic.split('/')
+        fleet_name = parts[0] if len(parts) > 0 and parts[0] else "DefaultFleet"
+        is_fleet_update = "fleet" in topic or len(parts) < 3
+        device_id = parts[2] if len(parts) >= 3 else "node_1"
+
+        target_build = data.get('target_build')
+        if not target_build:
+            target_build = db.get_next_build_number(fleet_name)
+        else:
+            target_build = int(target_build)
+
+        download_url = upload_firmware_to_cloud(fleet_name, binary_bytes, target_build)
+
+        if is_fleet_update:
+            db.set_fleet_target_build(fleet_name, target_build, download_url)
+            target_str = f"Entire fleet '{fleet_name}'"
+        else:
+            db.set_node_override(device_id, target_build, download_url)
+            target_str = f"Device '{device_id}' in fleet '{fleet_name}'"
+
+        success_msg = f"🎉 SUCCESS! Deployed build #{target_build} for {target_str}.\nNodes will automatically update on their next check-in."
+        emit_ui_log(success_msg)
+        return jsonify({
+            "error": False,
+            "logs": success_msg,
+            "target_build": target_build
+        })
     except Exception as e:
-        return jsonify({"error": True, "logs": f"❌ Server Crash: {str(e)}"})
+        return jsonify({"error": True, "logs": f"❌ Deployment Failed: {str(e)}"})
 
 @app.route('/api/deploy', methods=['POST'])
 def deploy_binary():
     try:
         if 'bin_file' not in request.files:
-            return jsonify({"error": True, "logs": "No binary file provided."})
+            return jsonify({"error": True, "logs": "❌ No binary file provided in deployment request."})
             
         bin_file = request.files['bin_file']
-        topic = request.form.get('topic')
-        version_id = f"v_{int(time.time())}" 
+        binary_bytes = bin_file.read()
+        topic = request.form.get('topic', 'DefaultFleet/fleet/update')
         
         parts = topic.split('/')
-        company = parts[0] if len(parts) > 0 else "DefaultFleet"
-        is_fleet_update = "fleet" in topic
+        fleet_name = parts[0] if len(parts) > 0 and parts[0] else "DefaultFleet"
+        is_fleet_update = "fleet" in topic or len(parts) < 3
         device_id = parts[2] if len(parts) >= 3 else "node_1"
 
-        s3_client = get_s3_client()
-        remote_filename = f"{company}/firmware.bin"
-        s3_client.put_object(Bucket=R2_BUCKET, Key=remote_filename, Body=bin_file.read(), ContentType="application/octet-stream")
-        
-        if company not in VERSION_MANIFEST:
-            VERSION_MANIFEST[company] = {"fleet_version": "v_base_001", "nodes": {}}
-        
-        if is_fleet_update:
-            VERSION_MANIFEST[company]["fleet_version"] = version_id
-            VERSION_MANIFEST[company]["nodes"] = {} 
+        target_build = request.form.get('target_build')
+        if not target_build:
+            target_build = db.get_next_build_number(fleet_name)
         else:
-            VERSION_MANIFEST[company]["nodes"][device_id] = version_id
+            target_build = int(target_build)
 
-        return jsonify({"error": False, "logs": f"🎉 SUCCESS! Version {version_id} manually published to '{topic}'."})
+        download_url = upload_firmware_to_cloud(fleet_name, binary_bytes, target_build)
+
+        if is_fleet_update:
+            db.set_fleet_target_build(fleet_name, target_build, download_url)
+            target_str = f"Entire fleet '{fleet_name}'"
+        else:
+            db.set_node_override(device_id, target_build, download_url)
+            target_str = f"Device '{device_id}' in fleet '{fleet_name}'"
+
+        success_msg = f"🎉 SUCCESS! Deployed build #{target_build} for {target_str}.\nNodes will automatically update on their next check-in."
+        emit_ui_log(success_msg)
+        return jsonify({
+            "error": False,
+            "logs": success_msg,
+            "target_build": target_build
+        })
         
     except Exception as e:
-        return jsonify({"error": True, "logs": f"❌ Deploy Failed: {str(e)}"})
+        return jsonify({"error": True, "logs": f"❌ Deployment Failed: {str(e)}"})
 
-@app.route('/flash', methods=['POST'])
-def flash_route():
-    data = request.json
-    logs = []
+# --- LIVE STREAMING USB FLASH ENDPOINT ---
+@app.route('/flash/stream', methods=['POST'])
+def flash_stream_route():
+    data = request.json or {}
+    port = data.get('port')
+    baud = data.get('baud', '115200')
+    fleet_id = data.get('fleet_id', 'DefaultFleet')
+    device_id = data.get('device_id', 'node_1')
     
-    close_serial_connection()
-    time.sleep(1.5) 
-    
-    cli_path = SETUP_STATE.get("cli_path") or shutil.which("arduino-cli")
-    fqbn = "esp32:esp32:esp32"
+    # Automatically generate cryptographically random device_token (dt_ + 16 hex chars)
+    device_token = data.get('device_token') or data.get('auth_token')
+    if not device_token or device_token in ("secret_abc123", ""):
+        device_token = f"dt_{secrets.token_hex(8)}"
 
-    if not data.get('port'):
-        return jsonify({"logs": "❌ Error: No COM port selected!"})
-    
-    user_setup = 'Serial.println("Global OTA Architecture Running!");'
-    user_loop = 'static unsigned long p=0; if(millis()-p>=1000){p=millis(); Serial.println("Working...");}'
+    initial_build = 100
 
-    full_code = MASTER_CPP_TEMPLATE
-    full_code = full_code.replace("{WIFI_SSID}", data.get('ssid', ''))
-    full_code = full_code.replace("{WIFI_PASS}", data.get('pass', ''))
-    full_code = full_code.replace("{API_BASE_URL}", data.get('api_url', ''))
-    full_code = full_code.replace("{FLEET_ID}", data.get('fleet_id', 'DefaultFleet'))
-    full_code = full_code.replace("{DEVICE_ID}", data.get('device_id', 'node_1'))
-    full_code = full_code.replace("{AUTH_TOKEN}", data.get('auth_token', ''))
-    full_code = full_code.replace("{CURRENT_VERSION}", "v_base_001")
-    full_code = full_code.replace("{USER_GLOBALS}", "")
-    full_code = full_code.replace("{USER_SETUP}", user_setup)
-    full_code = full_code.replace("{USER_LOOP}", user_loop)
-    full_code = full_code.replace("{WIFI_FAIL_ACTION}", "ESP.restart();")
+    def generate():
+        close_serial_connection()
+        time.sleep(0.5)
 
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            sketch_dir = os.path.join(temp_dir, "ProvSketch")
-            os.makedirs(sketch_dir)
-            sketch_file = os.path.join(sketch_dir, "ProvSketch.ino")
+        cli_path = SETUP_STATE.get("cli_path") or find_arduino_cli()
+        if not cli_path:
+            yield "[Hardware] [ERROR] Arduino CLI not found.\n"
+            return
+
+        if not port:
+            yield "[Hardware] [ERROR] No COM port selected!\n"
+            return
+
+        fqbn = "esp32:esp32:esp32"
+        user_setup = 'Serial.println("WiFeY Bootloader Initialized & Connected!");'
+        user_loop = 'static unsigned long p=0; if(millis()-p>=3000){p=millis(); Serial.println("[WiFeY] Standing by for OTA updates...");}'
+
+        full_code = MASTER_CPP_TEMPLATE
+        full_code = full_code.replace("{WIFI_SSID}", data.get('ssid', ''))
+        full_code = full_code.replace("{WIFI_PASS}", data.get('pass', ''))
+        full_code = full_code.replace("{API_BASE_URL}", resolve_api_url(data.get('api_url')))
+        full_code = full_code.replace("{FLEET_ID}", fleet_id)
+        full_code = full_code.replace("{DEVICE_ID}", device_id)
+        full_code = full_code.replace("{DEVICE_TOKEN}", device_token)
+        full_code = full_code.replace("{CURRENT_BUILD}", str(initial_build))
+        # Fallback replacements
+        full_code = full_code.replace("{AUTH_TOKEN}", device_token)
+        full_code = full_code.replace("{CURRENT_VERSION}", str(initial_build))
+        full_code = full_code.replace("{USER_GLOBALS}", "")
+        full_code = full_code.replace("{USER_SETUP}", user_setup)
+        full_code = full_code.replace("{USER_LOOP}", user_loop)
+        full_code = full_code.replace("{WIFI_FAIL_ACTION}", "ESP.restart();")
+
+        sketch_proj_dir = os.path.join(BUILD_CACHE_DIR, "prov_sketch", "ProvSketch")
+        os.makedirs(sketch_proj_dir, exist_ok=True)
+        sketch_file = os.path.join(sketch_proj_dir, "ProvSketch.ino")
+        
+        try:
             with open(sketch_file, "w", encoding="utf-8") as f:
                 f.write(full_code)
+        except Exception as e:
+            yield f"[Hardware] [ERROR] Failed to write provisioning sketch: {e}\n"
+            return
 
-            logs.append("[*] Compiling Pull-Architecture sketch...")
-            res = subprocess.run([cli_path, "compile", "--fqbn", fqbn, "--build-cache-path", CORE_CACHE_DIR, sketch_file], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
-            if res.returncode != 0: return jsonify({"logs": "❌ COMPILATION FAILED:\n" + res.stderr})
-            
-            logs.append(f"[*] Uploading via USB at 115200 baud to bypass boot pin requirement...")
-            up_res = subprocess.run([cli_path, "upload", "-p", data['port'], "--fqbn", fqbn, "--upload-property", "upload.speed=115200", sketch_file], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
-            
-            if up_res.returncode != 0: return jsonify({"logs": "❌ UPLOAD FAILED:\n" + up_res.stderr})
+        yield f"[System] Generated device token: {device_token}\n"
+        yield f"[System] Stamping initial firmware build: #{initial_build}\n"
+        yield "[Build] Compiling Pull-OTA bootloader sketch...\n"
+        compile_cmd = [
+            cli_path, "compile",
+            "--fqbn", fqbn,
+            "--build-path", BUILD_CACHE_DIR,
+            "-j", "0",
+            sketch_file
+        ]
 
-            logs.append("🎉 SUCCESS: ESP32 is now globally connected!")
-            logs.append(f"It will check {data['api_url']} for updates on every boot.")
+        proc_comp = subprocess.Popen(
+            compile_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            creationflags=CREATE_NO_WINDOW
+        )
+
+        for line in proc_comp.stdout:
+            clean = line.rstrip()
+            if clean:
+                yield f"[CLI] {clean}\n"
+
+        proc_comp.wait()
+
+        if proc_comp.returncode != 0:
+            yield f"[Build] [ERROR] Compilation failed with code {proc_comp.returncode}.\n"
+            return
+
+        yield f"[Upload] Starting USB upload to {port} @ {baud} baud...\n"
+        upload_cmd = [
+            cli_path, "upload",
+            "-p", port,
+            "--fqbn", fqbn,
+            "--input-dir", BUILD_CACHE_DIR,
+            "--upload-property", f"upload.speed={baud}",
+            sketch_file
+        ]
+
+        proc_up = subprocess.Popen(
+            upload_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            creationflags=CREATE_NO_WINDOW
+        )
+
+        for line in proc_up.stdout:
+            clean = line.rstrip()
+            if clean:
+                yield f"[CLI] {clean}\n"
+
+        proc_up.wait()
+
+        if proc_up.returncode != 0:
+            yield f"[Upload] [ERROR] Upload failed with code {proc_up.returncode}.\n"
+            return
+
+        # Register node and issue initial build integer 100
+        db.register_or_update_device(device_id, fleet_id, device_token=device_token, current_build=initial_build)
+
+        yield f"[System] [SUCCESS] 🎉 ESP32 node '{device_id}' provisioned for fleet '{fleet_id}'!\n"
+        yield f"[System] Token: {device_token} | Initial Build: #{initial_build}\n"
+        yield f"[System] The node will automatically check {data.get('api_url')} for OTA updates on boot.\n"
+
+    return Response(generate(), mimetype='text/plain')
+
+@app.route('/api/settings', methods=['GET', 'POST'])
+def settings_route():
+    global R2_ACCOUNT_ID, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET, NGROK_STATIC_DOMAIN, NGROK_AUTHTOKEN, WORKER_BASE_URL, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, _S3_CLIENT
+    user_prof = db.get_user_profile()
+
+    if request.method == 'GET':
+        return jsonify({
+            "r2_account_id": R2_ACCOUNT_ID,
+            "r2_access_key": R2_ACCESS_KEY,
+            "r2_secret_key": R2_SECRET_KEY,
+            "r2_bucket": R2_BUCKET,
+            "ngrok_domain": NGROK_STATIC_DOMAIN,
+            "ngrok_token": NGROK_AUTHTOKEN,
+            "worker_base_url": WORKER_BASE_URL,
+            "google_client_id": GOOGLE_CLIENT_ID,
+            "google_client_secret": GOOGLE_CLIENT_SECRET,
+            "google_sub": user_prof.get("google_sub", ""),
+            "google_id_token": user_prof.get("id_token", ""),
+            "google_picture": user_prof.get("picture", "")
+        })
+    
+    # POST - update .env and runtime globals
+    data = request.json or {}
+    R2_ACCOUNT_ID = data.get('r2_account_id', '').strip()
+    R2_ACCESS_KEY = data.get('r2_access_key', '').strip()
+    R2_SECRET_KEY = data.get('r2_secret_key', '').strip()
+    R2_BUCKET = data.get('r2_bucket', 'wifey-firmware').strip()
+    NGROK_STATIC_DOMAIN = data.get('ngrok_domain', '').strip()
+    NGROK_AUTHTOKEN = data.get('ngrok_token', '').strip()
+    WORKER_BASE_URL = data.get('worker_base_url', '').strip().rstrip('/')
+    GOOGLE_CLIENT_ID = data.get('google_client_id', '').strip()
+    if 'google_client_secret' in data:
+        GOOGLE_CLIENT_SECRET = data.get('google_client_secret', '').strip()
+
+    sub = data.get('google_sub', '').strip()
+    id_tok = data.get('google_id_token', '').strip()
+    pic = data.get('google_picture', '').strip()
+    if sub or id_tok or pic:
+        db.set_user_profile(google_sub=sub, id_token=id_tok, picture=pic)
+
+    with _S3_LOCK:
+        _S3_CLIENT = None  # Reset client so next call uses updated credentials
+
+    lines = [
+        f"NGROK_STATIC_DOMAIN={NGROK_STATIC_DOMAIN}",
+        f"NGROK_AUTHTOKEN={NGROK_AUTHTOKEN}",
+        f"R2_ACCOUNT_ID={R2_ACCOUNT_ID}",
+        f"R2_ACCESS_KEY={R2_ACCESS_KEY}",
+        f"R2_SECRET_KEY={R2_SECRET_KEY}",
+        f"R2_BUCKET={R2_BUCKET}",
+        f"WORKER_BASE_URL={WORKER_BASE_URL}",
+        f"GOOGLE_CLIENT_ID={GOOGLE_CLIENT_ID}",
+        f"GOOGLE_CLIENT_SECRET={GOOGLE_CLIENT_SECRET}"
+    ]
+    try:
+        with open(ENV_FILE_PATH, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines) + "\n")
+        return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"logs": f"❌ Error: {str(e)}"})
+        return jsonify({"success": False, "error": str(e)}), 500
 
-    return jsonify({"logs": "\n".join(logs)})
-
+# --- MAIN RUNNER ---
 if __name__ == '__main__':
     import webview
     
@@ -1270,7 +3845,8 @@ if __name__ == '__main__':
         sys.stderr = open(os.devnull, "w")
 
     def start_server():
-        app.run(host='127.0.0.1', port=5000, debug=False, use_reloader=False)
+        # Bind to 0.0.0.0 to enable LAN ESP32 devices to access local firmware and manifest
+        app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
     server_thread = threading.Thread(target=start_server, daemon=True)
     server_thread.start()
@@ -1278,15 +3854,22 @@ if __name__ == '__main__':
     setup_thread = threading.Thread(target=setup_environment_thread, daemon=True)
     setup_thread.start()
 
-    time.sleep(1.0)
+    # Launch background UDP LAN beacon discovery listener
+    udp_thread = threading.Thread(target=udp_beacon_listener, daemon=True)
+    udp_thread.start()
+
+    time.sleep(0.8)
 
     webview.create_window(
         title='WiFeY Studio', 
         url='http://127.0.0.1:5000', 
-        width=1600, 
-        height=1000,
-        min_size=(1200, 800),
-        background_color='#181818'
+        width=1500, 
+        height=950,
+        min_size=(1100, 750),
+        background_color='#121316'
     )
     
-    webview.start()
+    try:
+        webview.start()
+    finally:
+        close_serial_connection()
