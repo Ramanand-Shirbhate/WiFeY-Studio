@@ -518,8 +518,6 @@ if NGROK_STATIC_DOMAIN:
         NGROK_URL = f"https://{NGROK_STATIC_DOMAIN}" if NGROK_STATIC_DOMAIN else "http://127.0.0.1:5000"
 
 app = Flask(__name__)
-# Split the Client ID
-CLIENT_ID = "778920138283-clgb04rusodrhefvmb" + "0lnmlnkjhn06pa.apps.googleusercontent.com"
 
 # --- CLOUDFLARE R2 & WORKER CONFIGURATION ---
 # Cloudflare Worker Gateway & Google OAuth Defaults
@@ -532,7 +530,11 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", fallback_id)
 # Split the Client Secret for GitHub Push Protection
 fallback_secret = "GOCSPX-0ILB99aCoE-" + "215h1p8secswTu_X2"
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", fallback_secret)
-
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
+R2_BUCKET = os.getenv("R2_BUCKET", "wifey-firmware")
+OAUTH_STATES = {}
 def client():
     global _S3_CLIENT
     with _S3_LOCK:
