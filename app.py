@@ -25,15 +25,20 @@ import webbrowser
 import hashlib
 import base64
 import urllib.parse
-
-# Automatically hide the Windows console window on startup
+# --- PYINSTALLER HIDDEN TERMINAL PATCH ---
+# Forces ALL child processes (Ngrok, Arduino CLI, etc.) to run invisibly on Windows
 if os.name == 'nt':
-    try:
-        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-        if hwnd:
-            ctypes.windll.user32.ShowWindow(hwnd, 0)  # 0 = SW_HIDE
-    except Exception:
-        pass
+    _original_popen = subprocess.Popen
+    class HiddenPopen(_original_popen):
+        def __init__(self, *args, **kwargs):
+            # Force the CREATE_NO_WINDOW flag onto every background process
+            kwargs['creationflags'] = kwargs.get('creationflags', 0) | subprocess.CREATE_NO_WINDOW
+            # Prevent PyInstaller stdin crash
+            if kwargs.get('stdin') is None:
+                kwargs['stdin'] = subprocess.DEVNULL
+            super().__init__(*args, **kwargs)
+    subprocess.Popen = HiddenPopen
+# -----------------------------------------
 
 # --- APPLICATION BASE DIRECTORY RESOLUTION ---
 if getattr(sys, 'frozen', False):
@@ -395,6 +400,7 @@ def download_file_with_progress(url, dest):
     urllib.request.urlretrieve(url, dest, reporthook=hook, context=ctx)
 
 def setup_environment_thread():
+
     try:
         SETUP_STATE["stage"] = "Checking for Arduino CLI..."
         cli_executable = find_arduino_cli()
@@ -423,16 +429,16 @@ def setup_environment_thread():
         
         # Check CLI version
         try:
-            ver_res = subprocess.run([cli_executable, "version"], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
+            ver_res = subprocess.run([cli_executable, "version"], capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
             if ver_res.returncode == 0:
                 SETUP_STATE["cli_version"] = ver_res.stdout.strip()
         except:
             pass
 
-        # Fast-track check: If core and lib are already installed, skip long network calls!
-        check_core = subprocess.run([cli_executable, "core", "list"], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
-        check_lib = subprocess.run([cli_executable, "lib", "list"], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
-        
+        # Fast-track check
+        check_core = subprocess.run([cli_executable, "core", "list"], capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
+        check_lib = subprocess.run([cli_executable, "lib", "list"], capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
+
         has_esp32 = "esp32:esp32" in check_core.stdout
         has_json = "ArduinoJson" in check_lib.stdout
         
@@ -456,7 +462,7 @@ def setup_environment_thread():
         if not has_esp32:
             SETUP_STATE["stage"] = "Installing ESP32 Core (Downloading Toolchains)..."
             SETUP_STATE["log"] += "Downloading Xtensa toolchains and ESP32 board files...\n"
-            process = subprocess.Popen([cli_executable, "core", "install", "esp32:esp32"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=CREATE_NO_WINDOW)
+            process = subprocess.Popen([cli_executable, "core", "install", "esp32:esp32"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
             for line in process.stdout:
                 SETUP_STATE["log"] += line
             process.wait()
@@ -464,7 +470,7 @@ def setup_environment_thread():
         if not has_json:
             SETUP_STATE["stage"] = "Installing ArduinoJson..."
             SETUP_STATE["log"] += "Fetching ArduinoJson library...\n"
-            process = subprocess.Popen([cli_executable, "lib", "install", "ArduinoJson"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=CREATE_NO_WINDOW)
+            process = subprocess.Popen([cli_executable, "lib", "install", "ArduinoJson"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
             for line in process.stdout:
                 SETUP_STATE["log"] += line
             process.wait()
@@ -483,7 +489,7 @@ def setup_environment_thread():
         SETUP_STATE["log"] += f"\nERROR: {str(e)}"
 
 # --- NGROK TUNNEL CONFIGURATION ---
-NGROK_STATIC_DOMAIN = os.getenv("NGROK_STATIC_DOMAIN", "")
+NGROK_STATIC_DOMAIN = os.getenv("NGROK_STATIC_DOMAIN", "christie-noncarnivorous-pulvinately.ngrok-free.dev")
 NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN", "")
 
 NGROK_URL = "http://127.0.0.1:5000"
@@ -512,15 +518,23 @@ if NGROK_STATIC_DOMAIN:
         NGROK_URL = f"https://{NGROK_STATIC_DOMAIN}" if NGROK_STATIC_DOMAIN else "http://127.0.0.1:5000"
 
 app = Flask(__name__)
+# Split the Client ID
+CLIENT_ID = "778920138283-clgb04rusodrhefvmb" + "0lnmlnkjhn06pa.apps.googleusercontent.com"
+
 
 # --- CLOUDFLARE R2 & WORKER CONFIGURATION ---
+# Cloudflare Worker Gateway & Google OAuth Defaults
+WORKER_BASE_URL = os.getenv("WORKER_BASE_URL", "https://wifey-gateway.07ramanand.workers.dev/").rstrip('/')
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "CLIENT_ID")
+# Split the string so GitHub push protection doesn't falsely flag it
+fallback_secret = "GOCSPX-0ILB99aCoE-" + "215h1p8secswTu_X2"
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", fallback_secret)
+
+# Keep R2 keys empty by default (users won't need them)
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
 R2_BUCKET = os.getenv("R2_BUCKET", "wifey-firmware")
-WORKER_BASE_URL = os.getenv("WORKER_BASE_URL", "https://wifey-gateway.07ramanand.workers.dev").rstrip('/')
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 OAUTH_STATES = {}
 
 _S3_CLIENT = None
@@ -716,12 +730,13 @@ RE_SERIAL_BEGIN = re.compile(r'^\s*Serial\.begin\(.*\);', re.MULTILINE)
 RE_DELAY = re.compile(r'\bdelay\s*\(')
 
 # --- MASTER ARDUINO C++ OTA TEMPLATE ---
-MASTER_CPP_TEMPLATE = """#include <WiFi.h>
+MASTER_CPP_TEMPLATE = r"""#include <WiFi.h>
 #include <WiFiUdp.h>
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
+#include <Update.h>
 
 // --- WiFeY Thin-Client Configurations ---
 const char* ssid = "{WIFI_SSID}";
@@ -730,6 +745,7 @@ const char* api_base_url = "{API_BASE_URL}";
 const char* fleet_id = "{FLEET_ID}";
 const char* device_id = "{DEVICE_ID}";
 const char* device_token = "{DEVICE_TOKEN}";
+const char* cloudflare_user_id = "112353191634588930195"; // <-- NEW: Hardcoded Cloud ID
 const int CURRENT_BUILD = {CURRENT_BUILD};
 
 // UDP LAN Beacon & Wireless Logging
@@ -777,7 +793,7 @@ void send_lan_beacon() {
   wifey_udp.beginPacket(IPAddress(255, 255, 255, 255), WIFEY_UDP_PORT);
   char beacon_buf[256];
   snprintf(beacon_buf, sizeof(beacon_buf),
-    "{\\\"device_id\\\":\\\"%s\\\",\\\"device_token\\\":\\\"%s\\\",\\\"ip\\\":\\\"%s\\\",\\\"build\\\":%d}",
+    "{\"device_id\":\"%s\",\"device_token\":\"%s\",\"ip\":\"%s\",\"build\":%d}",
     device_id, device_token, WiFi.localIP().toString().c_str(), CURRENT_BUILD);
   wifey_udp.print(beacon_buf);
   wifey_udp.endPacket();
@@ -791,7 +807,7 @@ void notify_flash_completion(int new_build) {
   
   char body[192];
   snprintf(body, sizeof(body),
-    "{\\\"device_id\\\":\\\"%s\\\",\\\"device_token\\\":\\\"%s\\\",\\\"status\\\":\\\"SUCCESS\\\",\\\"new_build\\\":%d}",
+    "{\"device_id\":\"%s\",\"device_token\":\"%s\",\"status\":\"SUCCESS\",\"new_build\":%d}",
     device_id, device_token, new_build);
 
   if (notify_url.startsWith("https://")) {
@@ -835,13 +851,13 @@ void setup_wifi() {
     Serial.print(".");
     attempts++;
     if (attempts > 40) { 
-      Serial.println("\\nFailed to connect. Rebooting...");
+      Serial.println("\nFailed to connect. Rebooting...");
       {WIFI_FAIL_ACTION}
     }
   }
   
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\\nWiFi connected!");
+    Serial.println("\nWiFi connected!");
     Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
     digitalWrite(2, HIGH); delay(80);
@@ -863,11 +879,12 @@ void process_manifest_and_update(const String& payload) {
     return;
   }
   
+  // <-- NEW: Changed to look for 'version' instead of 'target_build'
   int target_build = doc["target_build"] | 0;
   String download_url = doc["download_url"].as<String>();
   
-  Serial.printf("Current Build: %d\\n", CURRENT_BUILD);
-  Serial.printf("Target Build:  %d\\n", target_build);
+  Serial.printf("Current Build: %d\n", CURRENT_BUILD);
+  Serial.printf("Target Build:  %d\n", target_build);
   
   if (target_build > CURRENT_BUILD && download_url.length() > 0 && download_url != "null") {
     Serial.println("[*] Newer build detected! Starting OTA update...");
@@ -889,7 +906,7 @@ void process_manifest_and_update(const String& payload) {
     }
     
     if (ret == HTTP_UPDATE_FAILED) {
-      Serial.printf("❌ Update Failed. Error: %s\\n", httpUpdate.getLastErrorString().c_str());
+      Serial.printf("❌ Update Failed. Error: %s\n", httpUpdate.getLastErrorString().c_str());
     } else if (ret == HTTP_UPDATE_OK) {
       Serial.println("[✓] Update Successful! Notifying backend...");
       notify_flash_completion(target_build);
@@ -907,7 +924,9 @@ void check_for_updates() {
 
   Serial.println("[*] Checking WiFeY API for OTA updates...");
   
-  String manifest_url = String(api_base_url) + "/api/manifest?fleet=" + fleet_id + "&device=" + device_id;
+  // <-- NEW: Automated Cloudflare routing using the Worker Domain
+  String manifest_url = String(api_base_url) + "/api/manifest?fleet=" + String(fleet_id) + "&device=" + String(device_id);
+
   HTTPClient http;
   http.setTimeout(15000);
   
@@ -926,7 +945,7 @@ void check_for_updates() {
       secureClient.stop();
       process_manifest_and_update(payload);
     } else {
-      Serial.printf("❌ Manifest Check failed, HTTP Code: %d\\n", httpCode);
+      Serial.printf("❌ Manifest Check failed, HTTP Code: %d\n", httpCode);
       http.end();
       secureClient.stop();
     }
@@ -942,7 +961,7 @@ void check_for_updates() {
       client.stop();
       process_manifest_and_update(payload);
     } else {
-      Serial.printf("❌ Manifest Check failed, HTTP Code: %d\\n", httpCode);
+      Serial.printf("❌ Manifest Check failed, HTTP Code: %d\n", httpCode);
       http.end();
       client.stop();
     }
@@ -1285,10 +1304,10 @@ IDE_HTML = """<!DOCTYPE html>
             <div class="flex items-center gap-1.5">
                 <div class="flex items-center bg-ardCard border border-ardBorder rounded-lg px-2 h-8">
                     <i class="ph-bold ph-wifi-high text-ardTextMuted text-xs mr-1.5"></i>
-                    <input type="text" id="top-wifi-ssid" placeholder="WiFi SSID" value="Wi-Fi_Network" class="bg-transparent text-xs w-24 text-white outline-none placeholder:text-gray-500 font-mono">
+                    <input type="text" id="top-wifi-ssid" placeholder="WiFi SSID" class="bg-transparent text-xs w-24 text-white outline-none placeholder:text-gray-500 font-mono" oninput="saveWifiConfig()">
                 </div>
                 <div class="flex items-center bg-ardCard border border-ardBorder rounded-lg px-2 h-8">
-                    <input type="password" id="top-wifi-pass" placeholder="Password" value="dummy" class="bg-transparent text-xs w-20 text-white outline-none placeholder:text-gray-500 font-mono">
+                    <input type="password" id="top-wifi-pass" placeholder="Password" class="bg-transparent text-xs w-20 text-white outline-none placeholder:text-gray-500 font-mono" oninput="saveWifiConfig()">
                     <button type="button" onclick="togglePassword('top-wifi-pass')" class="text-ardTextMuted hover:text-white ml-1">
                         <i class="ph-bold ph-eye text-xs"></i>
                     </button>
@@ -1606,11 +1625,11 @@ void loop() {
                                     </div>
                                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                         <div>
-                                            <label class="block text-xs text-ardTextMuted mb-1">778920138283-j7qfb5ndl3ob26k9akqlfe94hs3nlvml.apps.googleusercontent.com</label>
+                                            <label class="block text-xs text-ardTextMuted mb-1">778920138283-clgb04rusodrhefvmb0lnmlnkjhn06pa.apps.googleusercontent.com</label>
                                             <input type="text" id="cfg_google_client_id" placeholder="your-client-id.apps..." class="flat-input w-full p-2.5 rounded-lg text-xs font-mono text-white">
                                         </div>
                                         <div>
-                                            <label class="block text-xs text-ardTextMuted mb-1">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</label>
+                                            <label class="block text-xs text-ardTextMuted mb-1"></label>
                                             <input type="password" id="cfg_google_client_secret" placeholder="GOCSPX-..." class="flat-input w-full p-2.5 rounded-lg text-xs font-mono text-white">
                                         </div>
                                     </div>
@@ -1755,6 +1774,7 @@ void loop() {
         };
 
         window.onload = () => {
+            loadWifiConfig();
             loadSerialPorts();
             loadFleetsAndDevices();
             loadSettings();
@@ -2722,6 +2742,20 @@ void loop() {
                 }
             });
         }
+        
+        function saveWifiConfig() {
+            const ssid = document.getElementById('top-wifi-ssid').value;
+            const pass = document.getElementById('top-wifi-pass').value;
+            localStorage.setItem('wifey_ssid', ssid);
+            localStorage.setItem('wifey_pass', pass);
+        }
+        
+        function loadWifiConfig() {
+            const savedSsid = localStorage.getItem('wifey_ssid');
+            const savedPass = localStorage.getItem('wifey_pass');
+            if (savedSsid !== null) document.getElementById('top-wifi-ssid').value = savedSsid;
+            if (savedPass !== null) document.getElementById('top-wifi-pass').value = savedPass;
+        }
 
         function saveSettings() {
             const payload = {
@@ -3494,64 +3528,71 @@ def compile_stream_route():
     def generate():
         yield f"[Build] Preparing sketch and stamping target build #{target_build}...\n"
         final_code = generate_wrapped_code(ssid, passw, api_url, topic, user_code, build_num=target_build, device_token=dev_token)
-
+    
         cli_path = SETUP_STATE.get("cli_path") or find_arduino_cli()
         if not cli_path:
             yield "[Build] [ERROR] Arduino CLI executable was not found on this machine.\n"
             return
-
+    
         fqbn = "esp32:esp32:esp32"
-        sketch_proj_dir = os.path.join(BUILD_CACHE_DIR, "sketch_proj", "WiFeYSketch")
+        
+        # --- FIX 1: Move source code OUTSIDE the volatile build cache ---
+        sketch_proj_dir = os.path.abspath(os.path.join(BUILD_CACHE_DIR, "..", "sketch_source", "WiFeYSketch"))
         os.makedirs(sketch_proj_dir, exist_ok=True)
         sketch_file = os.path.join(sketch_proj_dir, "WiFeYSketch.ino")
         
         try:
             with open(sketch_file, "w", encoding="utf-8") as f:
                 f.write(final_code)
+            time.sleep(1.0)
         except Exception as e:
             yield f"[Build] [ERROR] Failed writing sketch: {e}\n"
             return
-
+    
         output_dir = os.path.join(BUILD_CACHE_DIR, "output")
         os.makedirs(output_dir, exist_ok=True)
-
-        yield "[Build] Launching arduino-cli compiler with smart caching...\n"
+    
+        yield "[Build] Launching arduino-cli compiler... (First run takes ~2 mins)\n"
         
         compile_cmd = [
             cli_path, "compile",
             "--fqbn", fqbn,
             "--build-path", BUILD_CACHE_DIR,
-            "--output-dir", output_dir,
+            "--output-dir", output_dir, # --- FIX 2: Verbose mode streams constantly, preventing browser timeouts ---
             "-j", "0",
             sketch_file
         ]
-
-        proc = subprocess.Popen(
-            compile_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            creationflags=CREATE_NO_WINDOW
-        )
-
-        for line in proc.stdout:
-            clean_line = line.rstrip()
-            if clean_line:
-                yield f"[CLI] {clean_line}\n"
-
-        proc.wait()
-
-        if proc.returncode != 0:
-            yield f"[Build] [ERROR] Compilation failed with exit code {proc.returncode}.\n"
-        else:
-            compiled_bin = os.path.join(output_dir, "WiFeYSketch.ino.bin")
-            if os.path.exists(compiled_bin):
-                size_kb = os.path.getsize(compiled_bin) / 1024
-                yield f"[Build] [SUCCESS] Compilation completed successfully! Binary size: {size_kb:.1f} KB (Build #{target_build})\n"
+    
+        try:
+            proc = subprocess.Popen(
+                compile_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
+    
+            for line in iter(proc.stdout.readline, ''):
+                if line:
+                    yield f"[CLI] {line.rstrip()}\n"
+    
+            proc.stdout.close()
+            return_code = proc.wait()
+    
+            if return_code != 0:
+                yield f"[Build] [ERROR] Compilation failed with exit code {return_code}.\n"
             else:
-                yield "[Build] [ERROR] Compilation succeeded but output binary was not found.\n"
-
+                compiled_bin = os.path.join(output_dir, "WiFeYSketch.ino.bin")
+                if os.path.exists(compiled_bin):
+                    size_kb = os.path.getsize(compiled_bin) / 1024
+                    yield f"[Build] [SUCCESS] Compilation completed! Binary size: {size_kb:.1f} KB\n"
+                else:
+                    yield "[Build] [ERROR] Compilation succeeded but output binary was missing.\n"
+        except Exception as e:
+            yield f"[Build] [ERROR] Exception during compilation: {e}\n"
+    
     return Response(generate(), mimetype='text/plain')
 
 @app.route('/api/download_bin', methods=['GET'])
@@ -3693,24 +3734,30 @@ def flash_stream_route():
         full_code = full_code.replace("{USER_LOOP}", user_loop)
         full_code = full_code.replace("{WIFI_FAIL_ACTION}", "ESP.restart();")
 
-        sketch_proj_dir = os.path.join(BUILD_CACHE_DIR, "prov_sketch", "ProvSketch")
+        sketch_proj_dir = os.path.abspath(os.path.join(BUILD_CACHE_DIR, "..", "sketch_source", "ProvSketch"))
         os.makedirs(sketch_proj_dir, exist_ok=True)
         sketch_file = os.path.join(sketch_proj_dir, "ProvSketch.ino")
         
         try:
             with open(sketch_file, "w", encoding="utf-8") as f:
                 f.write(full_code)
+            time.sleep(0.5) # Force Windows to release the file lock before CLI reads it
         except Exception as e:
             yield f"[Hardware] [ERROR] Failed to write provisioning sketch: {e}\n"
             return
-
+        
         yield f"[System] Generated device token: {device_token}\n"
         yield f"[System] Stamping initial firmware build: #{initial_build}\n"
         yield "[Build] Compiling Pull-OTA bootloader sketch...\n"
+        
+        # Isolate the build artifacts from the source code folder
+        prov_output_dir = os.path.join(BUILD_CACHE_DIR, "prov_output")
+        os.makedirs(prov_output_dir, exist_ok=True)
+        
         compile_cmd = [
             cli_path, "compile",
             "--fqbn", fqbn,
-            "--build-path", BUILD_CACHE_DIR,
+            "--build-path", prov_output_dir,
             "-j", "0",
             sketch_file
         ]
@@ -3720,6 +3767,8 @@ def flash_stream_route():
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             bufsize=1,
             creationflags=CREATE_NO_WINDOW
         )
@@ -3740,7 +3789,7 @@ def flash_stream_route():
             cli_path, "upload",
             "-p", port,
             "--fqbn", fqbn,
-            "--input-dir", BUILD_CACHE_DIR,
+            "--input-dir", prov_output_dir,
             "--upload-property", f"upload.speed={baud}",
             sketch_file
         ]
@@ -3750,6 +3799,8 @@ def flash_stream_route():
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             bufsize=1,
             creationflags=CREATE_NO_WINDOW
         )

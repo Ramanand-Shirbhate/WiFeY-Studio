@@ -1,0 +1,8 @@
+name = "wifey-gateway"
+main = "index.js"
+compatibility_date = "2024-03-20"
+
+[[r2_buckets]]
+binding = "FIRMWARE_BUCKET"
+# IMPORTANT: Change this if your actual R2 bucket name is different
+bucket_name = "wifey-firmware"
