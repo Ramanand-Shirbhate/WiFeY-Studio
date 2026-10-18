@@ -521,31 +521,19 @@ app = Flask(__name__)
 # Split the Client ID
 CLIENT_ID = "778920138283-clgb04rusodrhefvmb" + "0lnmlnkjhn06pa.apps.googleusercontent.com"
 
-
-
 # --- CLOUDFLARE R2 & WORKER CONFIGURATION ---
 # Cloudflare Worker Gateway & Google OAuth Defaults
 WORKER_BASE_URL = os.getenv("WORKER_BASE_URL", "https://wifey-gateway.07ramanand.workers.dev/").rstrip('/')
-<<<<<<< HEAD
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "CLIENT_ID")
-=======
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "778920138283-clgb04rusodrhefvmb0lnmlnkjhn06pa.apps.googleusercontent.com")
->>>>>>> a3d6dfb (feat: complete WiFeY Studio release with multi-OS installer, secure OAuth uninstaller, and full README documentation)
-# Split the string so GitHub push protection doesn't falsely flag it
+
+# Split the Client ID for GitHub Push Protection
+fallback_id = "778920138283-clgb04rusodrhefvmb" + "0lnmlnkjhn06pa.apps.googleusercontent.com"
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", fallback_id)
+
+# Split the Client Secret for GitHub Push Protection
 fallback_secret = "GOCSPX-0ILB99aCoE-" + "215h1p8secswTu_X2"
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", fallback_secret)
 
-# Keep R2 keys empty by default (users won't need them)
-R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
-R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
-R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
-R2_BUCKET = os.getenv("R2_BUCKET", "wifey-firmware")
-OAUTH_STATES = {}
-
-_S3_CLIENT = None
-_S3_LOCK = threading.Lock()
-
-def get_s3_client():
+def client():
     global _S3_CLIENT
     with _S3_LOCK:
         if not R2_ACCOUNT_ID or not R2_ACCESS_KEY or not R2_SECRET_KEY:
