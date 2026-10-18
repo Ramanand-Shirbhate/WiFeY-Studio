@@ -175,7 +175,7 @@ def verify_uninstall_auth():
     import requests
 
     CLIENT_ID = "778920138283-clgb04rusodrhefvmb0lnmlnkjhn06pa.apps.googleusercontent.com"
-    CLIENT_SECRET = "GOCSPX-0ILB99aCoE-" + "215h1p8secswTu_X2"
+    CLIENT_SECRET = "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"
     REDIRECT_URI = "http://127.0.0.1:5000/api/auth/callback"
 
     params = {
