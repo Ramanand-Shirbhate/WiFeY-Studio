@@ -522,10 +522,15 @@ app = Flask(__name__)
 CLIENT_ID = "778920138283-clgb04rusodrhefvmb" + "0lnmlnkjhn06pa.apps.googleusercontent.com"
 
 
+
 # --- CLOUDFLARE R2 & WORKER CONFIGURATION ---
 # Cloudflare Worker Gateway & Google OAuth Defaults
 WORKER_BASE_URL = os.getenv("WORKER_BASE_URL", "https://wifey-gateway.07ramanand.workers.dev/").rstrip('/')
+<<<<<<< HEAD
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "CLIENT_ID")
+=======
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "778920138283-clgb04rusodrhefvmb0lnmlnkjhn06pa.apps.googleusercontent.com")
+>>>>>>> a3d6dfb (feat: complete WiFeY Studio release with multi-OS installer, secure OAuth uninstaller, and full README documentation)
 # Split the string so GitHub push protection doesn't falsely flag it
 fallback_secret = "GOCSPX-0ILB99aCoE-" + "215h1p8secswTu_X2"
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", fallback_secret)
