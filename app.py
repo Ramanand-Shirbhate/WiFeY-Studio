@@ -529,7 +529,7 @@ def setup_environment_thread():
 NGROK_STATIC_DOMAIN = os.getenv("NGROK_STATIC_DOMAIN", "christie-noncarnivorous-pulvinately.ngrok-free.dev")
 NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN", "")
 
-NGROK_URL = "http://127.0.0.1:5000"
+NGROK_URL = "http://127.0.0.1:5050"
 NGROK_ACTIVE = False
 
 if NGROK_STATIC_DOMAIN:
@@ -545,14 +545,14 @@ if NGROK_STATIC_DOMAIN:
             NGROK_ACTIVE = True
         else:
             try:
-                ngrok_tunnel = ngrok.connect(5000, domain=NGROK_STATIC_DOMAIN, bind_tls=True)
+                ngrok_tunnel = ngrok.connect(5050, domain=NGROK_STATIC_DOMAIN, bind_tls=True)
                 NGROK_URL = ngrok_tunnel.public_url
                 NGROK_ACTIVE = True
             except:
                 NGROK_URL = f"https://{NGROK_STATIC_DOMAIN}"
                 NGROK_ACTIVE = True
     except Exception as e:
-        NGROK_URL = f"https://{NGROK_STATIC_DOMAIN}" if NGROK_STATIC_DOMAIN else "http://127.0.0.1:5000"
+        NGROK_URL = f"https://{NGROK_STATIC_DOMAIN}" if NGROK_STATIC_DOMAIN else "http://127.0.0.1:5050"
 
 app = Flask(__name__)
 
@@ -670,7 +670,7 @@ def udp_beacon_listener():
 def resolve_api_url(url_str):
     """Replaces localhost/127.0.0.1 with PC local network IP for ESP32 connectivity."""
     if not url_str:
-        return f"http://{get_local_ip()}:5000"
+        return f"http://{get_local_ip()}:5050"
     url_str = url_str.rstrip('/')
     if "127.0.0.1" in url_str or "localhost" in url_str:
         local_ip = get_local_ip()
@@ -730,7 +730,7 @@ def upload_firmware_to_cloud(fleet_id, binary_bytes, build_num, id_token=None):
 
     # 3. LAN HTTP fallback
     local_ip = get_local_ip()
-    return f"http://{local_ip}:5000/api/lan/firmware/WiFeYSketch.ino.bin"
+    return f"http://{local_ip}:5050/api/lan/firmware/WiFeYSketch.ino.bin"
 # --- SERIAL COMMUNICATION STATE & LOCK ---
 SERIAL_LOCK = threading.Lock()
 SERIAL_STATE = {
@@ -3017,7 +3017,7 @@ def auth_login():
         if now - OAUTH_STATES[s]["created_at"] > 600:
             OAUTH_STATES.pop(s, None)
 
-    redirect_uri = "http://127.0.0.1:5000/api/auth/callback"
+    redirect_uri = "http://127.0.0.1:5050/api/auth/callback"
     params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
@@ -3056,7 +3056,7 @@ def auth_callback():
     token_payload = {
         "code": code,
         "client_id": GOOGLE_CLIENT_ID,
-        "redirect_uri": "http://127.0.0.1:5000/api/auth/callback",
+        "redirect_uri": "http://127.0.0.1:5050/api/auth/callback",
         "grant_type": "authorization_code",
     }
     if code_verifier:
@@ -3282,7 +3282,7 @@ def api_manifest():
     # Fallback to local network HTTP route
     if not firmware_url:
         local_ip = get_local_ip()
-        firmware_url = f"http://{local_ip}:5000/api/lan/firmware/WiFeYSketch.ino.bin"
+        firmware_url = f"http://{local_ip}:5050/api/lan/firmware/WiFeYSketch.ino.bin"
 
     return jsonify({"target_build": int(target_build), "download_url": firmware_url})
 
@@ -3929,7 +3929,7 @@ if __name__ == '__main__':
 
     def start_server():
         # Bind to 0.0.0.0 to enable LAN ESP32 devices to access local firmware and manifest
-        app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+        app.run(host='0.0.0.0', port=5050, debug=False, use_reloader=False)
 
     server_thread = threading.Thread(target=start_server, daemon=True)
     server_thread.start()
@@ -3945,7 +3945,7 @@ if __name__ == '__main__':
 
     webview.create_window(
         title='WiFeY Studio', 
-        url='http://127.0.0.1:5000', 
+        url='http://127.0.0.1:5050', 
         width=1500, 
         height=950,
         min_size=(1100, 750),
