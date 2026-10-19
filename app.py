@@ -25,6 +25,9 @@ import webbrowser
 import hashlib
 import base64
 import urllib.parse
+import platform
+import stat
+
 # --- PYINSTALLER HIDDEN TERMINAL PATCH ---
 # Forces ALL child processes (Ngrok, Arduino CLI, etc.) to run invisibly on Windows
 if os.name == 'nt':
@@ -390,43 +393,77 @@ def create_windows_shortcuts():
         pass
 
 def download_file_with_progress(url, dest):
-    def hook(count, block_size, total_size):
-        if total_size > 0:
-            percent = int(count * block_size * 100 / total_size)
-            SETUP_STATE["progress"] = min(100, percent)
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    urllib.request.urlretrieve(url, dest, reporthook=hook, context=ctx)
+    
+    with urllib.request.urlopen(url, context=ctx) as response, open(dest, 'wb') as out_file:
+        total_size = int(response.headers.get('Content-Length', 0))
+        block_size = 8192
+        count = 0
+        while True:
+            buffer = response.read(block_size)
+            if not buffer:
+                break
+            out_file.write(buffer)
+            count += 1
+            if total_size > 0:
+                percent = int((count * block_size * 100) / total_size)
+                SETUP_STATE["progress"] = min(100, percent)
 
 def setup_environment_thread():
-
     try:
         SETUP_STATE["stage"] = "Checking for Arduino CLI..."
         cli_executable = find_arduino_cli()
         
         LOCAL_APP_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'WiFeY_Studio')
         os.makedirs(LOCAL_APP_DIR, exist_ok=True)
-        LOCAL_CLI_PATH = os.path.join(LOCAL_APP_DIR, 'arduino-cli.exe')
+        
+        system_os = platform.system()
+        cli_ext = ".exe" if system_os == "Windows" else ""
+        LOCAL_CLI_PATH = os.path.join(LOCAL_APP_DIR, f'arduino-cli{cli_ext}')
         
         if cli_executable:
             SETUP_STATE["log"] += f"Found Arduino CLI at: {cli_executable}\n"
         else:
-            SETUP_STATE["stage"] = "Downloading Arduino CLI (20MB)..."
-            SETUP_STATE["log"] += "Downloading official Windows 64-bit release...\n"
-            zip_path = os.path.join(LOCAL_APP_DIR, "cli.zip")
-            download_file_with_progress("https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Windows_64bit.zip", zip_path)
+            SETUP_STATE["stage"] = "Downloading Arduino CLI..."
+            if system_os == "Windows":
+                SETUP_STATE["log"] += "Downloading official Windows 64-bit release...\n"
+                archive_url = "https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Windows_64bit.zip"
+                archive_path = os.path.join(LOCAL_APP_DIR, "cli.zip")
+            elif system_os == "Linux":
+                SETUP_STATE["log"] += "Downloading official Linux 64-bit release...\n"
+                archive_url = "https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Linux_64bit.tar.gz"
+                archive_path = os.path.join(LOCAL_APP_DIR, "cli.tar.gz")
+            elif system_os == "Darwin":
+                SETUP_STATE["log"] += "Downloading official macOS 64-bit release...\n"
+                archive_url = "https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_macOS_64bit.tar.gz"
+                archive_path = os.path.join(LOCAL_APP_DIR, "cli.tar.gz")
+            
+            download_file_with_progress(archive_url, archive_path)
             
             SETUP_STATE["stage"] = "Extracting files..."
             SETUP_STATE["progress"] = 0
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(LOCAL_APP_DIR)
-            os.remove(zip_path)
+            
+            if archive_path.endswith('.zip'):
+                with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                    zip_ref.extractall(LOCAL_APP_DIR)
+            else:
+                import tarfile
+                with tarfile.open(archive_path, 'r:gz') as tar_ref:
+                    tar_ref.extractall(LOCAL_APP_DIR)
+                    
+            os.remove(archive_path)
             cli_executable = LOCAL_CLI_PATH
+            
+            # Grant execution permissions on Linux/macOS
+            if system_os in ["Linux", "Darwin"]:
+                st = os.stat(cli_executable)
+                os.chmod(cli_executable, st.st_mode | stat.S_IEXEC)
+                
             SETUP_STATE["log"] += "Extraction complete.\n"
             
         SETUP_STATE["cli_path"] = cli_executable
-        
         # Check CLI version
         try:
             ver_res = subprocess.run([cli_executable, "version"], capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)

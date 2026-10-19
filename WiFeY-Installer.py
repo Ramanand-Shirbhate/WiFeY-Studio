@@ -9,6 +9,8 @@ import json
 import socket
 import webbrowser
 import urllib.parse
+import threading
+import itertools
 
 # Ensure UTF-8 output encoding across Windows consoles
 if hasattr(sys.stdout, 'reconfigure'):
@@ -23,6 +25,62 @@ def check_python_version():
         print(f"Current version: {sys.version}")
         sys.exit(1)
 
+# --- ANIMATED LOADER ---
+spinner_stop = False
+def spinner_task(message):
+    spinner = itertools.cycle(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'])
+    while not spinner_stop:
+        sys.stdout.write(f'\r[*] {message} {next(spinner)}')
+        sys.stdout.flush()
+        time.sleep(0.1)
+    sys.stdout.write('\r' + ' ' * (len(message) + 6) + '\r') # Clear line
+
+def run_with_spinner(message, command):
+    global spinner_stop
+    spinner_stop = False
+    thread = threading.Thread(target=spinner_task, args=(message,))
+    thread.start()
+    
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        spinner_stop = True
+        thread.join()
+        return True, result.stdout
+    except subprocess.CalledProcessError as e:
+        spinner_stop = True
+        thread.join()
+        return False, e.stderr
+
+# --- LINUX SYSTEM DEPENDENCY BOOTSTRAPPER ---
+def ensure_linux_system_deps():
+    if platform.system() != "Linux":
+        return
+        
+    if shutil.which("apt"):
+        print("\n[*] Linux detected. Auto-installing required system UI and Venv libraries...")
+        print("[*] (You may be prompted for your sudo password to install these packages)")
+        
+        # Silently update apt
+        subprocess.run(["sudo", "apt-get", "update"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        # Install Venv, Pip, and core GTK requirements for PyWebview
+        core_deps = ["python3-venv", "python3-pip", "python3-gi", "python3-gi-cairo", "gir1.2-gtk-3.0"]
+        subprocess.run(["sudo", "apt-get", "install", "-y"] + core_deps)
+        
+        # WebKit versioning varies between older/newer Ubuntu (22.04+ uses 4.1, older uses 4.0)
+        res = subprocess.run(["sudo", "apt-get", "install", "-y", "gir1.2-webkit2-4.1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode != 0:
+            subprocess.run(["sudo", "apt-get", "install", "-y", "gir1.2-webkit2-4.0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+    elif shutil.which("dnf"):
+        print("\n[*] Fedora/RHEL Linux detected. Auto-installing required system UI libraries...")
+        subprocess.run(["sudo", "dnf", "install", "-y", "python3-pip", "python3-gobject", "gtk3", "webkit2gtk3"])
+        
+    elif shutil.which("pacman"):
+        print("\n[*] Arch Linux detected. Auto-installing required system UI libraries...")
+        subprocess.run(["sudo", "pacman", "-S", "--noconfirm", "python-pip", "python-gobject", "gtk3", "webkit2gtk"])
+
+# --- DEPENDENCY & VENV MANAGEMENT ---
 def ensure_dependencies():
     packages = {
         "flask": "flask",
@@ -35,14 +93,48 @@ def ensure_dependencies():
         "pyinstaller": "PyInstaller"
     }
 
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    venv_dir = os.path.join(base_dir, "venv")
+    
+    # 1. Check if running inside virtual environment
+    in_venv = hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix)
+
+    # 2. If not in venv, initialize environment and relaunch script BEFORE displaying the menu
+    if not in_venv:
+        ensure_linux_system_deps()
+        
+        python_executable = os.path.join(venv_dir, "bin" if os.name != "nt" else "Scripts", "python" + (".exe" if os.name == "nt" else ""))
+        
+        if not os.path.exists(python_executable):
+            if os.path.exists(venv_dir):
+                shutil.rmtree(venv_dir)
+            print("\n[*] Initializing isolated Python environment (venv)...")
+            success, err = run_with_spinner("Creating virtual environment", [sys.executable, "-m", "venv", "--system-site-packages", venv_dir])
+            
+            if not success:
+                print(f"\n[ERROR] Failed to create virtual environment.\nError details: {err}")
+                sys.exit(1)
+
+        print("[*] Entering secure virtual environment...\n")
+        script_path = os.path.abspath(sys.argv[0])
+        result = subprocess.run([python_executable, script_path] + sys.argv[1:])
+        sys.exit(result.returncode)
+
+    # 3. Inside venv: Ensure pip is bootstrapped properly
+    if importlib.util.find_spec("pip") is None:
+        run_with_spinner("Bootstrapping pip", [sys.executable, "-m", "ensurepip", "--upgrade"])
+
+    # 4. Install missing packages
     missing = [pkg for pkg, mod in packages.items() if not importlib.util.find_spec(mod)]
     if missing:
-        print(f"[*] Installing missing dependencies: {', '.join(missing)}...")
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", *missing, "--quiet"])
-        except subprocess.CalledProcessError as e:
-            print(f"[ERROR] Failed installing packages: {e}")
+        success, err = run_with_spinner(
+            f"Installing {len(missing)} packages ({', '.join(missing)})", 
+            [sys.executable, "-m", "pip", "install", *missing, "--quiet"]
+        )
+        if not success:
+            print(f"\n[ERROR] Failed installing packages: {err}")
             sys.exit(1)
+        print("[+] All dependencies installed successfully!\n")
     return True
 
 def ensure_config_files():
@@ -108,7 +200,7 @@ Categories=Development;
 # --- INSTALLATION PIPELINE ---
 def run_build_pipeline():
     os_name = platform.system()
-    print("\n==================================================")
+    print("==================================================")
     print(f">> Compiling WiFeY Studio ({os_name})")
     print("==================================================\n")
 
@@ -123,12 +215,12 @@ def run_build_pipeline():
         "app.py"
     ]
 
-    print("[*] Running PyInstaller build (this may take a few minutes)...")
-    try:
-        subprocess.run(build_command, check=True)
-        print("\n[+] Compilation successful! Standalone executable generated in 'dist/' folder.")
-    except subprocess.CalledProcessError as e:
-        print(f"\n[ERROR] Compilation failed. Error: {e}")
+    success, err = run_with_spinner("Running PyInstaller build (this may take a few minutes)", build_command)
+    
+    if success:
+        print("[+] Compilation successful! Standalone executable generated in 'dist/' folder.")
+    else:
+        print(f"\n[ERROR] Compilation failed. Error details:\n{err}")
         return
 
     base_exe = "WiFeY_Studio.exe" if os_name == "Windows" else "WiFeY_Studio"
@@ -152,7 +244,7 @@ def verify_uninstall_auth():
     db_path = os.path.join(base_dir, "wifey_db.json")
     
     if not os.path.exists(db_path):
-        return True # No DB exists, safe to delete remaining files
+        return True
 
     try:
         with open(db_path, 'r', encoding='utf-8') as f:
@@ -165,7 +257,7 @@ def verify_uninstall_auth():
     expected_email = prof.get("email")
 
     if not expected_sub:
-        return True # No user currently signed in
+        return True
 
     print(f"\n[SECURITY] Protected Uninstallation Enabled.")
     print(f"[*] This WiFeY Studio instance is currently linked to: {expected_email}")
@@ -215,7 +307,6 @@ def verify_uninstall_auth():
             print("[ERROR] Authorization code missing. Uninstallation aborted.")
             return False
 
-        # Exchange code for token
         token_resp = requests.post("https://oauth2.googleapis.com/token", data={
             "code": code,
             "client_id": CLIENT_ID,
@@ -257,7 +348,12 @@ def uninstall_wifey():
     print(">> Uninstalling WiFeY Studio")
     print("==================================================")
 
-    # 1. Verify User
+    # Require explicit user confirmation
+    confirm = input("\n[WARNING] This will completely wipe all databases, configurations, and caches.\nType 'DELETE' to confirm uninstallation: ").strip()
+    if confirm != "DELETE":
+        print("\n[!] Uninstallation cancelled by user.")
+        return
+
     if not verify_uninstall_auth():
         print("[!] Uninstallation aborted due to authorization failure.")
         return
@@ -267,38 +363,26 @@ def uninstall_wifey():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     os_name = platform.system()
 
-    # Define targets to remove
-    files_to_remove = [
-        "wifey_db.json", 
-        "wifey_db.json.tmp", 
-        ".env", 
-        "WiFeY_Studio.spec"
-    ]
-    folders_to_remove = [
-        "build", 
-        "dist", 
-        "build_cache", 
-        "core_cache", 
-        "sketch_source", 
-        "__pycache__", 
-        ".wrangler"
-    ]
+    files_to_remove = ["wifey_db.json", "wifey_db.json.tmp", ".env", "WiFeY_Studio.spec"]
+    folders_to_remove = ["build", "dist", "build_cache", "core_cache", "sketch_source", "__pycache__", ".wrangler", "venv"]
 
-    # Delete local files
     for f in files_to_remove:
         path = os.path.join(base_dir, f)
         if os.path.exists(path):
             os.remove(path)
             print(f"[-] Deleted: {f}")
 
-    # Delete local caches
     for d in folders_to_remove:
         path = os.path.join(base_dir, d)
         if os.path.exists(path):
-            shutil.rmtree(path)
-            print(f"[-] Deleted cache folder: {d}")
+            if d == "venv" and os.name == "nt":
+                # Schedule active venv folder deletion 2 seconds after Python exits
+                subprocess.Popen(f'cmd /c timeout /t 2 /nobreak > NUL & rmdir /s /q "{path}"', shell=True)
+                print(f"[-] Scheduled cache folder for deletion upon exit: {d}")
+            else:
+                shutil.rmtree(path)
+                print(f"[-] Deleted cache folder: {d}")
 
-    # Delete AppData (Arduino CLI storage)
     if os_name == "Windows":
         appdata_path = os.path.join(os.environ.get('APPDATA', ''), 'WiFeY_Studio')
         desktop_lnk = os.path.join(os.path.expanduser("~"), "Desktop", "WiFeY Studio.lnk")
@@ -319,11 +403,13 @@ def uninstall_wifey():
         if os.path.exists(desktop_lnk): os.remove(desktop_lnk)
 
     print("\n[+] Uninstallation Complete. All configurations, databases, and caches have been removed.")
-    print("[+] Note: You may now delete the remaining WiFeY-Installer.py file manually.")
 
 # --- MAIN MENU ---
 if __name__ == "__main__":
     check_python_version()
+    
+    # Bootstrap environment & packages BEFORE presenting options to the user
+    ensure_dependencies()
     
     print("==================================================")
     print("      WiFeY Studio Setup & Manager Utility        ")
@@ -335,11 +421,9 @@ if __name__ == "__main__":
     choice = input("\nSelect an option [1-3]: ").strip()
     
     if choice == '1':
-        if ensure_dependencies():
-            run_build_pipeline()
+        run_build_pipeline()
     elif choice == '2':
-        if ensure_dependencies(): # Ensures requests & flask are available for the auth flow
-            uninstall_wifey()
+        uninstall_wifey()
     else:
         print("Exiting...")
         sys.exit(0)

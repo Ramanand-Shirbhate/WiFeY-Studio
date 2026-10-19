@@ -76,74 +76,190 @@ After a **one-time USB provisioning step**, every device in the field becomes re
 
 ---
 
-## 2. Installation
+## 2.🚀 Installation
 
-WiFeY Studio ships with a single cross-platform installer script, **`WiFeY-Installer.py`**, which handles dependencies, packaging, and shortcuts.
+WiFeY Studio ships with a single cross-platform installer, **`WiFeY-Installer.py`**, that does everything for you: it creates an isolated Python virtual environment, installs all dependencies, packages the app into a native desktop executable with PyInstaller, and adds a desktop shortcut. It can also **securely uninstall** everything later.
 
-### Prerequisites
+No manual `pip install` juggling required. 🎉
 
-- **Python 3.10 or newer** (with `pip`)
-- An internet connection for the first run (dependencies and the Arduino toolchain are downloaded)
+---
 
-### Install
+### 1. 📋 Prerequisites
+
+Before running the installer, make sure you have:
+
+- ✅ **Python 3.10 or newer**
+- ✅ **An internet connection** (the installer downloads packages and toolchains)
+
+#### 🔍 Check your Python version
+
+Open a terminal (Command Prompt / PowerShell on Windows, Terminal on macOS and Linux) and run:
+
+```bash
+python --version
+```
+
+On macOS and Linux, the command is usually `python3`:
+
+```bash
+python3 --version
+```
+
+If you see `Python 3.10.x` or higher, you're ready to go and can skip to [Installation](#2--installation-1). Otherwise, install Python using the commands below.
+
+#### 🛠️ Installing Python on a brand-new system
+
+<details open>
+<summary><b>🪟 Windows</b></summary>
+
+Using **winget** (built into Windows 10/11):
+
+```powershell
+winget install Python.Python.3.11
+```
+
+> 💡 **Using the installer from [python.org](https://www.python.org/downloads/) instead?** Make sure to tick **"Add Python to PATH"** on the first screen of the installer, otherwise `python` won't be recognised in your terminal.
+
+After installing, **close and reopen your terminal** so the new PATH takes effect.
+
+</details>
+
+<details open>
+<summary><b>🍎 macOS</b></summary>
+
+Using [Homebrew](https://brew.sh/):
+
+```bash
+brew install python
+```
+
+</details>
+
+<details open>
+<summary><b>🐧 Linux</b></summary>
+
+**Debian / Ubuntu**
+
+```bash
+sudo apt update && sudo apt install -y python3 python3-pip python3-venv
+```
+
+**Fedora**
+
+```bash
+sudo dnf install -y python3 python3-pip
+```
+
+**Arch Linux**
+
+```bash
+sudo pacman -S --noconfirm python python-pip
+```
+
+</details>
+
+---
+
+### 2. 📦 Installation
+
+From the root folder of the project, launch the installer:
 
 ```bash
 python WiFeY-Installer.py
 ```
 
-Then choose **Option 1** from the interactive menu:
-
-```text
-==============================
-        WiFeY Installer
-==============================
-  1) Install WiFeY Studio
-  2) Secure Uninstall
-==============================
-Select an option: 1
-```
-
-#### What the installer does
-
-| Step | Action |
-|:---:|---|
-| 1 | Detects your operating system (Windows, macOS, or Linux). |
-| 2 | Automatically installs any missing `pip` dependencies: `flask`, `pyserial`, `boto3`, `pyngrok`, `pywebview`, `requests`, `python-dotenv`, and `PyInstaller`. |
-| 3 | Compiles the Flask application into a **standalone native executable** using PyInstaller. |
-| 4 | Creates a **desktop shortcut** automatically so you can launch WiFeY Studio like any other app. |
-
-**Resulting artifacts per platform**
-
-| Platform | Output |
-|---|---|
-| 🪟 Windows | `.exe` |
-| 🍎 macOS | `.app` bundle |
-| 🐧 Linux | Native binary |
-
-### Secure Uninstaller
-
-Uninstalling WiFeY Studio removes cached data, environment variables, and the managed toolchain. Because that is destructive, the uninstaller is **protected against unauthorized wipes**.
+On macOS and Linux:
 
 ```bash
-python WiFeY-Installer.py   # then select Option 2
+python3 WiFeY-Installer.py
 ```
 
-**How the secure uninstall works**
+You'll be greeted by the interactive setup menu:
 
-1. The installer **spawns a temporary local server on port `5000`**.
-2. You are forced through a **Google OAuth login** in your browser.
-3. The installer takes your Google account's unique `google_sub` ID and **verifies it against the owner record in the local `wifey_db.json`**.
-4. Only if the IDs match does it proceed to delete:
-   - 🗑️ Application caches
-   - 🗑️ Environment variables set by WiFeY Studio
-   - 🗑️ The managed Arduino toolchain
+```text
+==================================================
+      WiFeY Studio Setup & Manager Utility
+==================================================
+1. Install / Compile WiFeY Studio (Creates Desktop App)
+2. Uninstall WiFeY Studio (Secure Wipe)
+3. Exit
 
-If verification fails, nothing is removed.
+Select an option [1-3]:
+```
 
-> **Note:** Port `5000` must be free during uninstallation.
+Type **`1`** and press **Enter** to build the app. Grab a coffee ☕ - the first run downloads and compiles several things.
+
+#### ⚙️ What the Installer Does
+
+| Step | Action | Details |
+| :--- | :----- | :------ |
+| 🖥️ **1. OS detection** | Detects Windows, macOS, or Linux | Chooses the right paths, build flags, and shortcut format automatically |
+| 🐍 **2. `venv` bootstrapping** | Creates a local virtual environment | Keeps WiFeY Studio's dependencies isolated from your system Python |
+| 📥 **3. Package installation** | Installs all required libraries inside the `venv` | `flask`, `pyserial`, `boto3`, `pyngrok`, `pywebview`, `requests`, `python-dotenv`, `pyinstaller` |
+| 🏗️ **4. PyInstaller build** | Packages the app into a native executable | Outputs to the `dist/` folder (temporary files go to `build/`) |
+| 🔗 **5. Desktop shortcuts** | Creates launchers for your platform | Desktop and Start Menu on Windows, Desktop on macOS and Linux |
+
+#### 📂 Output Artifacts per Platform
+
+| Platform | Executable | Shortcuts Created |
+| :------- | :--------- | :---------------- |
+| 🪟 **Windows** | `dist/WiFeY_Studio.exe` | Desktop shortcut and Start Menu shortcut |
+| 🍎 **macOS** | `dist/WiFeY_Studio.app` | Desktop shortcut |
+| 🐧 **Linux** | `dist/WiFeY_Studio` | Desktop `.desktop` shortcut |
+
+Once the installer finishes, double-click the **WiFeY Studio** icon on your desktop to launch the app. 🎊
 
 ---
 
+### 3. 🗑️ Secure Uninstaller
+
+Want to remove WiFeY Studio completely? Run the installer again and choose **Option 2**:
+
+```bash
+python WiFeY-Installer.py
+```
+
+```text
+   Select an option (1-3): 2
+```
+
+The secure uninstaller **wipes application caches, configuration files, and toolchains**, leaving nothing behind. Because this action is destructive (and your project database may contain device tokens and credentials), it is protected by a two-layer safety check: a typed confirmation **and** owner verification via Google sign-in.
+
+You'll first be asked to confirm by typing `DELETE` in **all caps**:
+
+```text
+==================================================
+>> Uninstalling WiFeY Studio
+==================================================
+
+[WARNING] This will completely wipe all databases, configurations, and caches.
+Type 'DELETE' to confirm uninstallation: 
+```
+
+#### 🔐 How the Secure Uninstall Works
+
+1. **✋ Confirmation prompt**
+   You must type `DELETE` exactly (case-sensitive). Anything else cancels the uninstall and nothing is touched.
+
+2. **🌐 Local OAuth callback server**
+   The installer spawns a temporary local server on **port `5000`** and opens your browser to the **Google OAuth** login page so you can prove who you are.
+
+3. **🪪 Owner verification**
+   After you sign in, the installer compares your Google account's unique `google_sub` ID against the owner recorded in `wifey_db.json`. Only the verified owner may continue; if the IDs don't match, the uninstall is aborted.
+
+4. **🧹 Complete cleanup**
+   Once verified, everything below is permanently removed:
+
+   - 🗄️ **`wifey_db.json`**: your local database
+   - 🔑 **`.env`**: environment variables and saved secrets
+   - 🐍 **`venv/`**: the Python virtual environment
+   - 🏗️ **`build/`**: PyInstaller temporary build files
+   - 📦 **`dist/`**: the compiled WiFeY Studio executable / app bundle
+   - 🧠 **Core cache**: cached board cores and compiler data
+   - 🔧 **Arduino CLI toolchains**: downloaded compilers and tools
+   - 🔗 **Desktop shortcuts**: Desktop, Start Menu (Windows), and `.desktop` launcher (Linux)
+
+> ⚠️ **Important:** Port **`5000`** must be **free** during uninstallation. If another app (a dev server, AirPlay Receiver on macOS, etc.) is using it, the Google OAuth callback will fail. Close the conflicting program, then run the uninstaller again.
 ## 3. Usage & Features
 
 ### Quick Start Workflow
