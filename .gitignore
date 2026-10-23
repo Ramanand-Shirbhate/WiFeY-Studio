@@ -16,3 +16,4 @@ dist/
 # Python specifics
 __pycache__/
 *.pyc
+.wrangler/

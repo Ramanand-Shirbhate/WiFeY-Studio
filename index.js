@@ -48,7 +48,8 @@ export default {
       }
 
       // 2. Upload Firmware Binary (Isolated per user)
-      if (url.pathname === "/api/firmware/upload" && request.method === "POST") {
+      // FIX 1: Use endsWith instead of === to prevent path errors if a double slash happens
+      if (url.pathname.endsWith("/api/firmware/upload") && request.method === "POST") {
         const userId = await getUserId(request);
         if (!userId) return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: corsHeaders });
       
@@ -63,7 +64,8 @@ export default {
         const fileUrl = `${url.origin}/${objectKey}`;
       
         // Save the firmware binary
-        await env.FIRMWARE_BUCKET.put(objectKey, await file.arrayBuffer(), {
+        // FIX 2: Pass the 'file' object directly to prevent memory crashes
+        await env.FIRMWARE_BUCKET.put(objectKey, file, {
           httpMetadata: { contentType: "application/octet-stream" }
         });
       
