@@ -71,10 +71,11 @@ OUTPUT_DIR = os.path.join(BUILD_CACHE_DIR, "output")
 VERIFIED_DIR = os.path.join(BUILD_CACHE_DIR, "verified_bins")    # <source-hash>.bin: verified binaries reused by Deploy
 LAN_FIRMWARE_DIR = os.path.join(BUILD_CACHE_DIR, "lan_firmware") # per-fleet/build copies served to LAN nodes
 SKETCH_DIR = os.path.join(APP_DIR, "sketch_source", "WiFeYSketch")
+
 SKETCH_FILE = os.path.join(SKETCH_DIR, "WiFeYSketch.ino")
 for _d in (OUTPUT_DIR, VERIFIED_DIR, LAN_FIRMWARE_DIR, SKETCH_DIR):
     os.makedirs(_d, exist_ok=True)
-FQBN = "esp32:esp32:esp32"
+DEFAULT_FQBN = "esp32:esp32:esp32"
 TEMPLATE_VERSION = "2"
 
 # --- DATABASE MANAGER (Persistent, Thread-Safe JSON Store) ---
@@ -599,18 +600,28 @@ def setup_environment_thread():
             start_warmup()
             return
 
-        # Configure ESP32 Board Manager
-        SETUP_STATE["stage"] = "Configuring ESP32 Board Manager..."
+        # Configure ESP32 & ESP8266 Board Managers
+        SETUP_STATE["stage"] = "Configuring Board Managers..."
         subprocess.run([cli_executable, "config", "init"], capture_output=True, creationflags=CREATE_NO_WINDOW) 
-        subprocess.run([cli_executable, "config", "set", "board_manager.additional_urls", "https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json"], capture_output=True, creationflags=CREATE_NO_WINDOW)
+        subprocess.run([cli_executable, "config", "set", "board_manager.additional_urls", "https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json,https://arduino.esp8266.com/stable/package_esp8266com_index.json"], capture_output=True, creationflags=CREATE_NO_WINDOW)
         
         SETUP_STATE["stage"] = "Updating Arduino Core Index..."
         subprocess.run([cli_executable, "core", "update-index"], capture_output=True, creationflags=CREATE_NO_WINDOW)
         
         if not has_esp32:
-            SETUP_STATE["stage"] = "Installing ESP32 Core (Downloading Toolchains)..."
+            SETUP_STATE["stage"] = "Installing ESP32 Core..."
             SETUP_STATE["log"] += "Downloading Xtensa toolchains and ESP32 board files...\n"
             process = subprocess.Popen([cli_executable, "core", "install", "esp32:esp32"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
+            for line in process.stdout:
+                SETUP_STATE["log"] += line
+            process.wait()
+
+        # Check and Install ESP8266 Core
+        check_esp82 = subprocess.run([cli_executable, "core", "list"], capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
+        if "esp8266:esp8266" not in check_esp82.stdout:
+            SETUP_STATE["stage"] = "Installing ESP8266 Core..."
+            SETUP_STATE["log"] += "Downloading ESP8266 toolchains (this takes a moment)...\n"
+            process = subprocess.Popen([cli_executable, "core", "install", "esp8266:esp8266"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
             for line in process.stdout:
                 SETUP_STATE["log"] += line
             process.wait()
@@ -1046,7 +1057,7 @@ def close_serial_connection():
             SERIAL_STATE["serial_obj"] = None
 
 # --- REGEX RULES FOR SMART CODE WRAPPING ---
-RE_INCLUDES = re.compile(r'#include\s*[<"](WiFi\.h|WiFiUdp\.h|WiFiClientSecure\.h|PubSubClient\.h|HTTPClient\.h|HTTPUpdate\.h|ArduinoJson\.h)[>"]')
+RE_INCLUDES = re.compile(r'#include\s*[<"](WiFi\.h|ESP8266WiFi\.h|WiFiUdp\.h|WiFiClientSecure\.h|PubSubClient\.h|HTTPClient\.h|ESP8266HTTPClient\.h|HTTPUpdate\.h|ESP8266httpUpdate\.h|ArduinoJson\.h)[>"]')
 RE_CONFIGS = re.compile(r'^\s*(const\s+)?(char\s*\*|int|String)\s*(ssid|password|api_url|api_base_url|auth_token|device_token|device_id|fleet_id|current_version|CURRENT_BUILD)\s*=.*;', re.MULTILINE)
 RE_WIFI_BEGIN = re.compile(r'^\s*WiFi\.begin\(.*\);', re.MULTILINE)
 RE_WIFI_MODE = re.compile(r'^\s*WiFi\.mode\(.*\);', re.MULTILINE)
@@ -1607,6 +1618,228 @@ void loop() {
   {USER_LOOP}
 }
 """
+# --- ESP8266 LITE OTA TEMPLATE (Compact, LittleFS identity, No Serial Mirror) ---
+ESP8266_CPP_TEMPLATE = r"""#include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
+#include <WiFiClient.h>
+#include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <LittleFS.h>
+{USER_INCLUDES}
+
+const char* ssid = "{WIFI_SSID}";
+const char* password = "{WIFI_PASS}";
+const char* api_base_url = "{API_BASE_URL}";
+const char* WIFEY_DEFAULT_FLEET = "{FLEET_ID}";
+const char* WIFEY_DEFAULT_DEVICE_ID = "{DEVICE_ID}";
+const char* WIFEY_DEFAULT_TOKEN = "{DEVICE_TOKEN}";
+const int CURRENT_BUILD = {CURRENT_BUILD};
+
+#define WIFEY_FORCE_IDENTITY {FORCE_IDENTITY}
+#define WIFEY_POLL_SECONDS {POLL_SECONDS}
+#define WIFEY_UDP_PORT 53535
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2
+#endif
+#define WIFEY_LED LED_BUILTIN
+
+String device_id;
+String fleet_id;
+String device_token;
+int wifey_applied_build = 0;
+
+WiFiUDP wifey_udp;
+unsigned long wifey_last_beacon = 0;
+unsigned long wifey_last_poll = 0;
+bool wifey_force_check = false;
+
+#define WIFEY_PRINT(msg) do { \
+  Serial.println(msg); \
+  if (WiFi.status() == WL_CONNECTED) { \
+    wifey_udp.beginPacket(IPAddress(255, 255, 255, 255), WIFEY_UDP_PORT); \
+    wifey_udp.print(String("[") + device_id + "] " + msg); \
+    wifey_udp.endPacket(); \
+  } \
+} while(0)
+
+{USER_GLOBALS}
+
+void wifey_service();
+
+int wifey_effective_build() { return CURRENT_BUILD > wifey_applied_build ? CURRENT_BUILD : wifey_applied_build; }
+
+String wifey_urlencode(const String& s) {
+  String out;
+  const char* hex = "0123456789ABCDEF";
+  for (size_t i = 0; i < s.length(); i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += (char)c;
+    else { out += '%'; out += hex[c >> 4]; out += hex[c & 15]; }
+  }
+  return out;
+}
+
+void wifey_load_identity() {
+  LittleFS.begin();
+#if WIFEY_FORCE_IDENTITY
+  device_id = WIFEY_DEFAULT_DEVICE_ID;
+  device_token = WIFEY_DEFAULT_TOKEN;
+  fleet_id = WIFEY_DEFAULT_FLEET;
+  wifey_applied_build = 0;
+  
+  File f = LittleFS.open("/wifey_id.txt", "w");
+  if(f) {
+    f.println(device_id); f.println(device_token); f.println(fleet_id); f.println(wifey_applied_build);
+    f.close();
+  }
+#else
+  File f = LittleFS.open("/wifey_id.txt", "r");
+  if(f) {
+    device_id = f.readStringUntil('\n'); device_id.trim();
+    device_token = f.readStringUntil('\n'); device_token.trim();
+    fleet_id = f.readStringUntil('\n'); fleet_id.trim();
+    String b = f.readStringUntil('\n'); b.trim(); wifey_applied_build = b.toInt();
+    f.close();
+  } else {
+    device_id = String("node_8266_") + String(ESP.getChipId(), HEX);
+    device_token = "dt_fallback";
+    fleet_id = "DefaultFleet";
+  }
+#endif
+}
+
+void smartDelay(unsigned long ms) {
+  unsigned long start = millis();
+  do {
+    wifey_service();
+    delay(1);
+  } while (millis() - start < ms);
+}
+
+void send_lan_beacon() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  char beacon_buf[256];
+  snprintf(beacon_buf, sizeof(beacon_buf),
+    "{\"device_id\":\"%s\",\"device_token\":\"%s\",\"ip\":\"%s\",\"build\":%d,\"tcp\":0}",
+    device_id.c_str(), device_token.c_str(), WiFi.localIP().toString().c_str(), wifey_effective_build());
+  wifey_udp.beginPacket(IPAddress(255, 255, 255, 255), WIFEY_UDP_PORT);
+  wifey_udp.print(beacon_buf);
+  wifey_udp.endPacket();
+}
+
+void wifey_udp_receive() {
+  int guard = 0;
+  while (wifey_udp.parsePacket() > 0 && guard++ < 5) {
+    char buf[256];
+    int len = wifey_udp.read(buf, sizeof(buf) - 1);
+    if (len > 0) {
+      buf[len] = 0;
+      if (buf[0] == '{' && strstr(buf, "\"cmd\":\"check_update\"") != NULL) wifey_force_check = true;
+    }
+  }
+}
+
+void check_for_updates() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  String manifest_url = String(api_base_url) + "/api/manifest?fleet=" + wifey_urlencode(fleet_id) + "&device=" + wifey_urlencode(device_id) + "&build=" + String(wifey_effective_build());
+  
+  WiFiClient client;
+  HTTPClient http;
+  if (http.begin(client, manifest_url)) {
+    http.addHeader("Authorization", String("Bearer ") + device_token);
+    http.addHeader("ngrok-skip-browser-warning", "true");
+    int code = http.GET();
+    if (code == 200) {
+      String payload = http.getString();
+      JsonDocument doc;
+      if (!deserializeJson(doc, payload)) {
+        int target_build = doc["target_build"] | 0;
+        String download_url = doc["download_url"].as<String>();
+        if (target_build > wifey_effective_build() && download_url.length() > 0 && download_url != "null") {
+          Serial.printf("[WiFeY] OTA Build #%d available. Updating...\n", target_build);
+          ESPhttpUpdate.rebootOnUpdate(false);
+          t_httpUpdate_return ret;
+          
+          if (download_url.startsWith("https://")) {
+            std::unique_ptr<BearSSL::WiFiClientSecure> uc(new BearSSL::WiFiClientSecure);
+            uc->setInsecure();
+            ret = ESPhttpUpdate.update(*uc, download_url);
+          } else {
+            WiFiClient uc;
+            ret = ESPhttpUpdate.update(uc, download_url);
+          }
+          
+          if (ret == HTTP_UPDATE_OK) {
+            File f = LittleFS.open("/wifey_id.txt", "w");
+            if(f) {
+              f.println(device_id); f.println(device_token); f.println(fleet_id); f.println(target_build);
+              f.close();
+            }
+            Serial.println("[WiFeY] Update successful, rebooting...");
+            
+            // Notify flash success
+            String notify_url = String(api_base_url) + "/api/device/notify_flash";
+            char body[224];
+            snprintf(body, sizeof(body), "{\"device_id\":\"%s\",\"device_token\":\"%s\",\"status\":\"SUCCESS\",\"new_build\":%d}", device_id.c_str(), device_token.c_str(), target_build);
+            HTTPClient nhttp;
+            if(nhttp.begin(client, notify_url)) {
+                nhttp.addHeader("Content-Type", "application/json");
+                nhttp.POST(body);
+                nhttp.end();
+            }
+            delay(500);
+            ESP.restart();
+          }
+        }
+      }
+    }
+    http.end();
+  }
+}
+
+void wifey_service() {
+  static bool busy = false;
+  if (busy) return;
+  busy = true;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifey_udp_receive();
+    if (millis() - wifey_last_beacon >= 5000) {
+      wifey_last_beacon = millis();
+      send_lan_beacon();
+    }
+    bool due = (WIFEY_POLL_SECONDS > 0) && (millis() - wifey_last_poll >= (unsigned long)WIFEY_POLL_SECONDS * 1000UL);
+    if (wifey_force_check || due) {
+      wifey_force_check = false;
+      wifey_last_poll = millis();
+      check_for_updates();
+    }
+  }
+  busy = false;
+}
+
+void setup() {
+  Serial.begin(115200);
+  wifey_load_identity();
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(100); }
+  
+  wifey_udp.begin(WIFEY_UDP_PORT);
+  check_for_updates();
+  wifey_last_poll = millis();
+  
+  {USER_SETUP}
+}
+
+void loop() {
+  wifey_service();
+  {USER_LOOP}
+}
+"""
 
 RE_WIFI_MODE_STA = re.compile(r'^\s*WiFi\.mode\(\s*WIFI_STA\s*\)\s*;', re.MULTILINE)
 NET_MODE_IDS = {"sta": 0, "ap_sta": 1, "ota_ap": 2}
@@ -1709,13 +1942,12 @@ def get_wrapper_options(data=None):
     }
 
 def generate_wrapped_code(ssid, passw, api_url, topic, user_code, build_num=0, device_token=None,
-                          opts=None, provision=False, device_id=None, fleet_id=None):
-    """Builds the final .ino. OTA/compile builds are identity-neutral (node identity lives in NVS);
-    USB provisioning (provision=True) bakes the identity in and forces the node to adopt it."""
+                          opts=None, provision=False, device_id=None, fleet_id=None, fqbn=DEFAULT_FQBN):
+    """Builds the final .ino using the correct hardware template."""
     opts = opts or get_wrapper_options()
     user_code = user_code or ""
     net_mode = detect_net_mode(user_code, opts.get("net_mode"))
-    uses_wifi = bool(re.search(r'WiFi\.', user_code) or re.search(r'#include\s*[<"]WiFi\.h[>"]', user_code))
+    uses_wifi = bool(re.search(r'WiFi\.', user_code) or re.search(r'#include\s*[<"](WiFi|ESP8266WiFi)\.h[>"]', user_code))
 
     user_loop, remaining = extract_block(user_code, "loop")
     user_setup, user_globals = extract_block(remaining, "setup")
@@ -1758,18 +1990,23 @@ def generate_wrapped_code(ssid, passw, api_url, topic, user_code, build_num=0, d
         "USER_LOOP": user_loop,
         "WIFI_FAIL_ACTION": wifi_fail_action,
     }
-    return fill_template(values)
+    
+    # Pick the template based on the FQBN
+    active_template = ESP8266_CPP_TEMPLATE if "esp8266" in fqbn.lower() else MASTER_CPP_TEMPLATE
+    
+    # Single-pass substitution
+    return re.sub(r'\{([A-Z_]+)\}', lambda m: str(values.get(m.group(1), m.group(0))), active_template)
 
 def build_firmware_source(data):
-    """Returns (code, hash, info). The hash covers everything that changes the binary, so an unchanged
-    sketch reuses the verified .bin instead of recompiling."""
+    """Returns (code, hash, info)."""
     data = data or {}
+    fqbn = data.get('fqbn', DEFAULT_FQBN)
     opts = get_wrapper_options(data)
     code = generate_wrapped_code(data.get('ssid'), data.get('pass'), data.get('api_url'), data.get('topic'),
-                                 data.get('code'), build_num=0, opts=opts)
-    digest = hashlib.sha256((TEMPLATE_VERSION + "|" + FQBN + "|" + code).encode("utf-8")).hexdigest()
+                                 data.get('code'), build_num=0, opts=opts, fqbn=fqbn)
+    digest = hashlib.sha256((TEMPLATE_VERSION + "|" + fqbn + "|" + code).encode("utf-8")).hexdigest()
     net_mode = detect_net_mode(data.get('code') or "", opts.get("net_mode"))
-    return code, digest, {"net_mode": net_mode, "auto": (opts.get("net_mode") or "auto") == "auto", "opts": opts}
+    return code, digest, {"net_mode": net_mode, "auto": (opts.get("net_mode") or "auto") == "auto", "opts": opts, "fqbn": fqbn}
 
 # --- SPLASH SCREEN HTML ---
 SETUP_HTML = """<!DOCTYPE html>
@@ -1868,6 +2105,9 @@ IDE_HTML = """<!DOCTYPE html>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/@phosphor-icons/web"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/clike/clike.min.js"></script>
     
     <script>
         const NGROK_API_URL = "{{ ngrok_url }}"; 
@@ -1877,6 +2117,7 @@ IDE_HTML = """<!DOCTYPE html>
         let currentTargetType = "fleet"; 
         let currentDeviceId = "node_1";
         let currentTopic = "DefaultFleet/fleet/update";
+        let cmEditor;
     </script>
 
     <script>
@@ -1923,6 +2164,20 @@ IDE_HTML = """<!DOCTYPE html>
         select.flat-input { min-width: 0; max-width: 100%; text-overflow: ellipsis; }
         #prov_port, #serial_port, #wserial_device { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
         .refresh-btn-fixed { flex-shrink: 0; }
+        /* CodeMirror IDE Theme Overrides */
+        .CodeMirror { height: 100% !important; width: 100% !important; font-family: 'JetBrains Mono', monospace !important; font-size: 13px !important; background-color: transparent !important; color: #d4d4d4 !important; }
+        .CodeMirror-gutters { background-color: #121316 !important; border-right: 1px solid #2c2e36 !important; }
+        .CodeMirror-linenumber { color: #8b92a5 !important; }
+        .CodeMirror-cursor { border-left: 2px solid #00b4b6 !important; }
+        .cm-s-default .cm-keyword { color: #c678dd; }
+        .cm-s-default .cm-def { color: #61afef; }
+        .cm-s-default .cm-variable, .cm-s-default .cm-variable-2, .cm-s-default .cm-variable-3 { color: #e06c75; }
+        .cm-s-default .cm-string { color: #98c379; }
+        .cm-s-default .cm-number { color: #d19a66; }
+        .cm-s-default .cm-comment { color: #5c6370; font-style: italic; }
+        .cm-s-default .cm-type { color: #e5c07b; }
+        .cm-s-default .cm-builtin { color: #56b6c2; }
+        .cm-s-default .cm-property { color: #61afef; }
     </style>
 </head>
 <body class="h-screen w-screen flex flex-col text-sm antialiased selection:bg-ardTeal selection:text-white">
@@ -1944,6 +2199,12 @@ IDE_HTML = """<!DOCTYPE html>
                 </svg>
                 <span>Continue with Google</span>
             </button>
+            
+            <!-- FALLBACK LINK CONTAINER -->
+            <div id="auth-fallback-container" class="hidden mt-4 text-center">
+                <p class="text-xs text-ardTextMuted mb-1">Browser didn't open automatically?</p>
+                <a id="auth-link" href="#" target="_blank" class="text-ardTeal text-xs underline font-mono break-all hover:text-white">Click here to sign in with Google</a>
+            </div>
             
             <div id="auth-spinner" class="hidden flex-col items-center mt-6">
                 <i class="ph-bold ph-spinner animate-spin text-2xl text-ardTeal mb-2"></i>
@@ -1991,7 +2252,7 @@ IDE_HTML = """<!DOCTYPE html>
                 <div class="text-center text-ardTextMuted text-sm py-4">Loading libraries...</div>
             </div>
         </div>
-    </div>sel
+    </div>
     <!-- TOP HEADER -->
     <header class="h-12 bg-ardBg border-b border-ardBorder flex items-center justify-between px-3 flex-shrink-0 z-30 select-none">
         <div class="flex items-center gap-2.5">
@@ -2174,11 +2435,8 @@ IDE_HTML = """<!DOCTYPE html>
                     </div>
 
                     <!-- Tab: Raw Sketch -->
-                    <div id="tab-raw" class="editor-content flex-1 flex overflow-hidden bg-ardPanel relative">
-                        <div id="line-numbers" class="w-12 text-right pr-3 py-4 font-mono text-xs text-ardTextMuted bg-ardBg select-none border-r border-ardBorder line-numbers flex flex-col overflow-hidden">
-                            <span>1</span>
-                        </div>
-                        <textarea id="code-editor" class="editor-textarea flex-1 p-4 bg-transparent text-[#d4d4d4] font-mono text-sm whitespace-pre leading-6" spellcheck="false" oninput="handleCodeInput()" onscroll="syncLineScroll()" onkeydown="handleEditorKeydown(event)">int ledPin = 2;
+                    <div id="tab-raw" class="editor-content flex-1 flex flex-col overflow-hidden bg-ardPanel relative">
+                        <textarea id="code-editor" class="hidden">int ledPin = 2;
 
 void setup() {
   pinMode(ledPin, OUTPUT);
@@ -2205,14 +2463,25 @@ void loop() {
                     </div>
 
                     <!-- Editor Footer Status Bar -->
-                    <div class="h-6 bg-ardBg border-t border-ardBorder flex items-center justify-between px-3 text-[11px] text-ardTextMuted select-none font-mono">
+                    <div class="h-6 bg-ardBg border-t border-ardBorder flex items-center justify-between px-3 text-[11px] text-ardTextMuted select-none font-mono flex-shrink-0">
                         <div class="flex items-center gap-4">
                             <span id="char-count">Lines: 12 | Length: 228</span>
                             <span>Target: <span id="status-target" class="text-white">DefaultFleet/fleet</span></span>
                         </div>
-                        <div class="flex items-center gap-3">
+                        <div class="flex items-center gap-2">
                             <span id="warmup-chip" class="hidden"></span>
-                            <span>Board: ESP32 Dev Module</span>
+                            <div class="flex items-center gap-1">
+                                <span>Board:</span>
+                                <select id="board-selector" class="bg-ardBg text-white outline-none cursor-pointer border border-transparent hover:border-ardBorder rounded px-1 -ml-1" onchange="syncBoardSelectors(this.value)">
+                                    <option value="esp32:esp32:esp32" class="bg-ardBg">ESP32 Dev Module</option>
+                                    <option value="esp32:esp32:esp32cam" class="bg-ardBg">ESP32-CAM (AI Thinker)</option>
+                                    <option value="esp32:esp32:esp32s2" class="bg-ardBg">ESP32-S2</option>
+                                    <option value="esp32:esp32:esp32s3" class="bg-ardBg">ESP32-S3</option>
+                                    <option value="esp32:esp32:esp32c3" class="bg-ardBg">ESP32-C3</option>
+                                    <option value="esp8266:esp8266:nodemcuv2" class="bg-ardBg">NodeMCU 1.0 (ESP-12E)</option>
+                                    <option value="esp8266:esp8266:generic" class="bg-ardBg">Generic ESP8266</option>
+                                </select>
+                            </div>
                             <span>Speed: 115200</span>
                         </div>
                     </div>
@@ -2239,10 +2508,25 @@ void loop() {
                                         </button>
                                     </div>
                                 </div>
+                                
+                                <div>
+                                    <label class="block text-xs font-semibold text-ardTextMuted mb-1.5 uppercase tracking-wider">Target Board Variant</label>
+                                    <select id="prov_board_selector" class="flat-input w-full p-2.5 rounded-lg text-white text-xs cursor-pointer font-mono" onchange="syncBoardSelectors(this.value)">
+                                        <option value="esp32:esp32:esp32">ESP32 Dev Module</option>
+                                        <option value="esp32:esp32:esp32cam">ESP32-CAM (AI Thinker)</option>
+                                        <option value="esp32:esp32:esp32s2">ESP32-S2</option>
+                                        <option value="esp32:esp32:esp32s3">ESP32-S3</option>
+                                        <option value="esp32:esp32:esp32c3">ESP32-C3</option>
+                                        <option value="esp8266:esp8266:nodemcuv2">NodeMCU 1.0 (ESP-12E)</option>
+                                        <option value="esp8266:esp8266:generic">Generic ESP8266</option>
+                                    </select>
+                                </div>
+                                
                                 <div>
                                     <label class="block text-xs font-semibold text-ardTextMuted mb-1.5 uppercase tracking-wider">Target Fleet Name</label>
                                     <input type="text" id="prov_fleet_id" value="DefaultFleet" class="flat-input w-full p-2.5 rounded-lg text-white text-xs font-mono">
                                 </div>
+
                                 <div>
                                     <label class="block text-xs font-semibold text-ardTextMuted mb-1.5 uppercase tracking-wider">Device ID (Unique identifier)</label>
                                     <div class="flex gap-2">
@@ -2252,6 +2536,7 @@ void loop() {
                                         </button>
                                     </div>
                                 </div>
+
                                 <div>
                                     <label class="block text-xs font-semibold text-ardTextMuted mb-1.5 uppercase tracking-wider">Flashing Baud Rate</label>
                                     <select id="prov_baud" class="flat-input w-full p-2.5 rounded-lg text-white text-xs cursor-pointer font-mono">
@@ -2531,9 +2816,18 @@ void loop() {
                 </main>
             </div>
 
-            <!-- BOTTOM PANEL (Live CLI Output & Full-Featured Serial Monitor) -->
-            <!-- BOTTOM PANEL (Resizable, Live CLI Output & High-Visibility Serial Monitor) -->
-            <div id="bottom-panel" class="flex flex-col border-t border-ardBorder bg-ardPanel flex-shrink-0 z-20" style="height: 280px; min-height: 120px; max-height: 80vh; resize: vertical; overflow: hidden;">
+            <!-- BOTTOM PANEL CONTAINER -->
+            <div class="w-full flex-shrink-0 z-20 flex flex-col">
+                
+            <!-- DRAGGABLE RESIZER BAR -->
+            <div id="panel-resizer" class="w-full h-2 cursor-ns-resize bg-ardBorder hover:bg-ardTeal flex items-center justify-center transition-colors z-30 group" title="Drag to resize">
+                <div class="w-12 h-1 bg-gray-500 rounded-full group-hover:bg-white transition-colors"></div>
+            </div>
+            
+            <!-- BOTTOM PANEL -->
+            <div id="bottom-panel" class="w-full flex-none flex flex-col bg-ardPanel z-20" style="height: 250px; min-height: 120px; max-height: 75vh; overflow: hidden;">
+                
+                <!-- Top Bar -->
                 <div class="flex items-center justify-between h-8 bg-ardBg px-2 border-b border-ardBorder select-none flex-shrink-0">
                     <div class="flex items-center h-full gap-1">
                         <button onclick="switchPanelTab('panel-out')" id="btn-panel-out" class="panel-tab flex items-center px-3 h-full text-xs font-medium text-white border-b-2 border-ardTeal transition-colors">
@@ -2578,9 +2872,9 @@ void loop() {
                             <option value="460800">460800 baud</option>
                             <option value="921600">921600 baud</option>
                         </select>
-                        
+
                         <div class="h-4 w-px bg-ardBorder mx-1"></div>
-                        
+
                         <button id="btn-serial-connect" onclick="connectSerial()" class="flex items-center gap-1.5 px-3 py-1 rounded-lg border border-emerald-500/30 text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/20 transition-colors font-medium">
                             <i class="ph-bold ph-plug"></i> Connect
                         </button>
@@ -2598,7 +2892,7 @@ void loop() {
                         </label>
                     </div>
 
-                    <!-- Serial Data Log View (High Contrast & Smooth Scroll) -->
+                    <!-- Serial Data Log View -->
                     <div id="serial_out" class="flex-1 p-3 overflow-y-auto font-mono text-xs text-[#e0e2ec] leading-relaxed whitespace-pre-wrap select-text bg-[#121316] min-h-0" style="user-select: text; -webkit-user-select: text;"><span class="text-ardTextMuted italic">--- Serial Monitor Disconnected ---</span></div>
 
                     <!-- Serial Send Bar -->
@@ -2635,10 +2929,33 @@ void loop() {
             loadSerialPorts();
             loadFleetsAndDevices();
             loadSettings();
-            updateLineNumbers();
             checkAuthStatus(true);
             initLiveFeatures();
             populateLibraryExamples();
+            
+            // Initialize CodeMirror IDE
+            cmEditor = CodeMirror.fromTextArea(document.getElementById('code-editor'), {
+                mode: "text/x-c++src",
+                lineNumbers: true,
+                indentUnit: 2,
+                tabSize: 2,
+                lineWrapping: false,
+                extraKeys: {
+                    "Ctrl-S": function(cm) { triggerCompileOnly(); },
+                    "Cmd-S": function(cm) { triggerCompileOnly(); },
+                    "Ctrl-U": function(cm) { deployFirmware(); },
+                    "Cmd-U": function(cm) { deployFirmware(); }
+                }
+            });
+            
+            cmEditor.on("change", function() {
+                const val = cmEditor.getValue();
+                document.getElementById('char-count').innerText = `Lines: ${cmEditor.lineCount()} | Length: ${val.length}`;
+                if (typeof setVerifyChip === 'function' && !activeBin) setVerifyChip('');
+            });
+            
+            // Trigger initial char count
+            CodeMirror.signal(cmEditor, "change", cmEditor);
             
             // Check status badge
             if (NGROK_API_URL.includes("localhost") || NGROK_API_URL.includes("127.0.0.1")) {
@@ -2863,68 +3180,99 @@ void loop() {
         }
         
         // --- LINE NUMBERS & EDITOR INDENTATION ---
-        function updateLineNumbers() {
-            const editor = document.getElementById('code-editor');
-            const linesContainer = document.getElementById('line-numbers');
-            const lines = editor.value.split('\\n').length;
-            let spans = '';
-            for (let i = 1; i <= lines; i++) {
-                spans += `<span>${i}</span>`;
-            }
-            linesContainer.innerHTML = spans;
-            document.getElementById('char-count').innerText = `Lines: ${lines} | Length: ${editor.value.length}`;
-        }
-
-        function handleCodeInput() {
-            updateLineNumbers();
-            if (typeof setVerifyChip === 'function' && !activeBin) setVerifyChip('');
-        }
-
-        function syncLineScroll() {
-            const editor = document.getElementById('code-editor');
-            const lines = document.getElementById('line-numbers');
-            lines.scrollTop = editor.scrollTop;
-        }
-
-        function handleEditorKeydown(e) {
-            const textarea = e.target;
-            if (e.key === 'Tab') {
-                e.preventDefault();
-                const start = textarea.selectionStart;
-                const end = textarea.selectionEnd;
-                textarea.value = textarea.value.substring(0, start) + "  " + textarea.value.substring(end);
-                textarea.selectionStart = textarea.selectionEnd = start + 2;
-                updateLineNumbers();
-            } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
-                e.preventDefault();
-                triggerCompileOnly();
-            } else if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'u' || e.key === 'Enter')) {
-                e.preventDefault();
-                deployFirmware();
-            }
-        }
+        
 
         function newSketch() {
             if (confirm("Reset editor to empty starter sketch?")) {
-                document.getElementById('code-editor').value = `void setup() {\\n  Serial.begin(115200);\\n  Serial.println("WiFeY Sketch Initialized");\\n}\\n\\nvoid loop() {\\n  delay(1000);\\n}`;
-                updateLineNumbers();
+                cmEditor.setValue(`void setup() {\\n  Serial.begin(115200);\\n  Serial.println("WiFeY Sketch Initialized");\\n}\\n\\nvoid loop() {\\n  delay(1000);\\n}`);
                 logToOutput("[File] Created new starter sketch.");
             }
         }
 
         function copyEditorCode() {
-            const code = document.getElementById('code-editor').value;
-            navigator.clipboard.writeText(code);
+            navigator.clipboard.writeText(cmEditor.getValue());
             logToOutput("[File] Code copied to clipboard.");
         }
 
         function loadExampleSketch(key) {
             if (EXAMPLE_SKETCHES[key]) {
-                document.getElementById('code-editor').value = EXAMPLE_SKETCHES[key];
-                updateLineNumbers();
+                cmEditor.setValue(EXAMPLE_SKETCHES[key].replace(/\\n/g, '\\n'));
                 logToOutput(`[File] Loaded example sketch: ${key}`);
             }
         }
+
+        function loadExampleFromPath(path) {
+            fetch('/api/lib/example/content', {
+                method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({path: path})
+            })
+            .then(r => r.json()).then(data => {
+                if (data.code) {
+                    cmEditor.setValue(data.code);
+                    logToOutput(`[File] Loaded library example from disk.`);
+                } else {
+                    alert("Failed to load example: " + (data.error || "Unknown error"));
+                }
+            });
+        }
+        
+        function fetchPreview() {
+            const rawCode = cmEditor.getValue();
+            const payload = {
+                ssid: document.getElementById('top-wifi-ssid').value,
+                pass: document.getElementById('top-wifi-pass').value,
+                api_url: NGROK_API_URL, 
+                topic: currentTopic, 
+                code: rawCode
+            };
+            document.getElementById('preview-textarea').value = "Generating smart OTA preview...";
+            fetch('/preview', { 
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) 
+            })
+            .then(res => res.json()).then(data => { document.getElementById('preview-textarea').value = data.code; })
+            .catch(err => { document.getElementById('preview-textarea').value = "// Error: " + err; });
+        }
+        
+        function buildPayload(extra) {
+            return Object.assign({
+                ssid: document.getElementById('top-wifi-ssid').value,
+                pass: document.getElementById('top-wifi-pass').value,
+                api_url: NGROK_API_URL,
+                topic: currentTopic,
+                code: cmEditor.getValue(),
+                fqbn: document.getElementById('prov_board_selector').value
+            }, extra || {});
+        }
+        // --- Bottom Panel Resizer Logic ---
+        const resizer = document.getElementById('panel-resizer');
+        const bottomPanel = document.getElementById('bottom-panel');
+        let isResizing = false;
+        
+        resizer.addEventListener('mousedown', function(e) {
+            e.preventDefault(); 
+            document.body.style.cursor = 'ns-resize'; 
+        });
+        
+        window.addEventListener('mousemove', function(e) {
+            if (!isResizing) return;
+            const newHeight = window.innerHeight - e.clientY;
+            if (newHeight >= 120 && newHeight <= (window.innerHeight * 0.75)) {
+                bottomPanel.style.height = newHeight + 'px';
+            }
+        });
+        
+        window.addEventListener('mouseup', function() {
+            if (isResizing) {
+                isResizing = false;
+                document.body.style.cursor = ''; 
+            }
+        });
+
+        window.addEventListener('blur', function() {
+            if (isResizing) {
+                isResizing = false;
+                document.body.style.cursor = '';
+            }
+        });
 
         // --- NAVIGATION & TABS ---
         function switchMainView(viewId) {
@@ -3820,6 +4168,13 @@ void loop() {
             document.getElementById('prov_device_id').value = `node_${rand}`;
         }
 
+        function syncBoardSelectors(value) {
+            const el1 = document.getElementById('board-selector');
+            const el2 = document.getElementById('prov_board_selector');
+            if (el1 && el1.value !== value) el1.value = value;
+            if (el2 && el2.value !== value) el2.value = value;
+        }
+
         function flashDevice() {
             const port = document.getElementById('prov_port').value;
             if (!port) return alert("Select a COM port first.");
@@ -3845,7 +4200,8 @@ void loop() {
                 api_url: NGROK_API_URL,
                 fleet_id: document.getElementById('prov_fleet_id').value,
                 device_id: document.getElementById('prov_device_id').value,
-                auth_token: "secret_abc123"
+                auth_token: "secret_abc123",
+                fqbn: document.getElementById('prov_board_selector').value
             };
 
             runStreamingTask('/flash/stream', payload, 
@@ -3880,7 +4236,8 @@ void loop() {
                 pass: document.getElementById('top-wifi-pass').value,
                 api_url: NGROK_API_URL,
                 topic: currentTopic,
-                code: document.getElementById('code-editor').value
+                code: document.getElementById('code-editor').value,
+                fqbn: document.getElementById('prov_board_selector').value
             }, extra || {});
         }
 
@@ -4239,30 +4596,38 @@ void loop() {
         }
 
         // --- GOOGLE OAUTH & PROFILE MANAGEMENT ---
-        let authPollInterval = null;
+        var authPollInterval = null;
 
         function startGoogleAuth() {
             const spinner = document.getElementById('auth-spinner');
             if (spinner) spinner.classList.remove('hidden');
 
-            fetch('/api/auth/login')
+            fetch('/api/auth/login', { method: 'POST' })
                 .then(r => r.json())
                 .then(data => {
-                    if (!data.success) {
+                    if (!data.success || !data.auth_url) {
                         if (spinner) spinner.classList.add('hidden');
                         alert('Authentication Notice: ' + (data.error || 'Failed to initiate login.'));
                         return;
                     }
-                    logToOutput('[Auth] Google OAuth authorization URL opened in browser. Awaiting login...');
+
+                    const fallbackContainer = document.getElementById('auth-fallback-container');
+                    const authLink = document.getElementById('auth-link');
+                    if (fallbackContainer && authLink) {
+                        authLink.href = data.auth_url;
+                        fallbackContainer.classList.remove('hidden');
+                    }
+
+                    logToOutput('[Auth] Google OAuth authorization URL opened. Awaiting login...');
                     if (authPollInterval) clearInterval(authPollInterval);
                     authPollInterval = setInterval(() => checkAuthStatus(false), 1500);
                 })
                 .catch(err => {
                     if (spinner) spinner.classList.add('hidden');
-                    alert('Error connecting to authentication service: ' + err);
+                    alert('Error starting Google Login: ' + err);
                 });
         }
-
+        
         function checkAuthStatus(isInitialLoad = false) {
             fetch('/api/auth/status')
                 .then(r => r.json())
@@ -4410,7 +4775,7 @@ AUTH_CALLBACK_HTML = """<!DOCTYPE html>
 </html>
 """
 
-@app.route('/api/auth/login')
+@app.route('/api/auth/login', methods=['GET', 'POST'])
 def auth_login():
     global GOOGLE_CLIENT_ID
     client_id = GOOGLE_CLIENT_ID or os.getenv("GOOGLE_CLIENT_ID", "")
@@ -4450,12 +4815,9 @@ def auth_login():
         "code_challenge_method": "S256"
     }
     auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(params)}"
-    
-    try:
-        webbrowser.open(auth_url)
-    except Exception as e:
-        print(f"[OAuth] Error launching browser: {e}")
 
+    import webbrowser
+    webbrowser.open_new_tab(auth_url)
     return jsonify({"success": True, "auth_url": auth_url, "state": state})
 
 @app.route('/api/auth/callback')
@@ -4969,7 +5331,7 @@ def warmup_toolchain():
                 code = generate_wrapped_code("", "", "http://127.0.0.1:5050", "", user_code, build_num=0)
                 write_sketch_if_changed(code)
                 res = subprocess.run(
-                    [cli, "compile", "--fqbn", FQBN, "--build-path", BUILD_CACHE_DIR, "-j", "0", SKETCH_FILE],
+                    [cli, "compile", "--fqbn", DEFAULT_FQBN, "--build-path", BUILD_CACHE_DIR, "-j", "0", SKETCH_FILE],
                     capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
                 if res.returncode == 0:
                     ok = True
@@ -5109,7 +5471,7 @@ def compile_stream_route():
 
             compile_cmd = [
                 cli_path, "compile",
-                "--fqbn", FQBN,
+                "--fqbn", info["fqbn"],
                 "--build-path", BUILD_CACHE_DIR,
                 "--output-dir", OUTPUT_DIR,
                 "-j", "0",
@@ -5469,6 +5831,7 @@ def flash_stream_route():
     baud = str(data.get('baud', '115200'))
     fleet_id = (data.get('fleet_id') or 'DefaultFleet').strip() or 'DefaultFleet'
     device_id = (data.get('device_id') or 'node_1').strip() or 'node_1'
+    fqbn = data.get('fqbn', DEFAULT_FQBN)
 
     # Automatically generate cryptographically random device_token (dt_ + 16 hex chars)
     device_token = data.get('device_token') or data.get('auth_token')
@@ -5493,7 +5856,7 @@ def flash_stream_route():
         full_code = generate_wrapped_code(
             data.get('ssid', ''), data.get('pass', ''), data.get('api_url'), "", PROV_USER_CODE,
             build_num=initial_build, device_token=device_token, opts=opts,
-            provision=True, device_id=device_id, fleet_id=fleet_id)
+            provision=True, device_id=device_id, fleet_id=fleet_id, fqbn=fqbn)
 
         yield f"[System] Generated device token: {device_token}\n"
         yield f"[System] Stamping initial firmware build: #{initial_build}\n"
@@ -5508,8 +5871,8 @@ def flash_stream_route():
                 yield f"[Hardware] [ERROR] Failed to write provisioning sketch: {e}\n"
                 return
 
-            yield "[Build] Compiling Pull-OTA bootloader sketch (shared build cache)...\n"
-            compile_cmd = [cli_path, "compile", "--fqbn", FQBN, "--build-path", BUILD_CACHE_DIR, "-j", "0", SKETCH_FILE]
+            yield f"[Build] Compiling Pull-OTA bootloader sketch for {fqbn} (shared build cache)...\n"
+            compile_cmd = [cli_path, "compile", "--fqbn", fqbn, "--build-path", BUILD_CACHE_DIR, "-j", "0", SKETCH_FILE]
             proc_comp = subprocess.Popen(compile_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                          encoding='utf-8', errors='replace', bufsize=1, creationflags=CREATE_NO_WINDOW)
             for line in proc_comp.stdout:
@@ -5522,7 +5885,7 @@ def flash_stream_route():
                 return
 
             yield f"[Upload] Starting USB upload to {port} @ {baud} baud...\n"
-            upload_cmd = [cli_path, "upload", "-p", port, "--fqbn", FQBN, "--input-dir", BUILD_CACHE_DIR,
+            upload_cmd = [cli_path, "upload", "-p", port, "--fqbn", fqbn, "--input-dir", BUILD_CACHE_DIR,
                           "--upload-property", f"upload.speed={baud}", SKETCH_FILE]
             proc_up = subprocess.Popen(upload_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                        encoding='utf-8', errors='replace', bufsize=1, creationflags=CREATE_NO_WINDOW)
@@ -5796,6 +6159,16 @@ class DesktopApi:
         import webview
         fd = getattr(webview, "FileDialog", None)
         return getattr(fd, name) if fd is not None else getattr(webview, name + "_DIALOG")
+
+    def open_url(self, url):
+        import webbrowser
+        try:
+            # Use webbrowser for all OS types; it safely handles URL encoding
+            webbrowser.open_new_tab(url)
+            return True
+        except Exception as e:
+            print(f"[DesktopApi] Error opening URL: {e}")
+            return False
 
     def choose_bin(self):
         import webview
