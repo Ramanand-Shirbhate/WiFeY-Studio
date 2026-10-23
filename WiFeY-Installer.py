@@ -212,6 +212,9 @@ def run_build_pipeline():
         "--noconsole",
         "--clean",
         "--name", "WiFeY_Studio",
+        "--collect-data", "botocore",
+        "--copy-metadata", "botocore",
+        "--hidden-import", "serial.tools.list_ports",
         "app.py"
     ]
 
@@ -266,9 +269,20 @@ def verify_uninstall_auth():
 
     import requests
 
-    CLIENT_ID = "778920138283-clgb04rusodrhefvmb0lnmlnkjhn06pa.apps.googleusercontent.com"
-    CLIENT_SECRET = "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"
-    REDIRECT_URI = "http://127.0.0.1:5000/api/auth/callback"
+    # Check .env for configured credentials, with fallback defaults
+    env_path = os.path.join(base_dir, ".env")
+    env_vars = {}
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as ef:
+            for eline in ef:
+                eline = eline.strip()
+                if eline and not eline.startswith("#") and "=" in eline:
+                    ek, ev = eline.split("=", 1)
+                    env_vars[ek.strip()] = ev.strip()
+
+    CLIENT_ID = env_vars.get("GOOGLE_CLIENT_ID") or "778920138283-clgb04rusodrhefvmb0lnmlnkjhn06pa.apps.googleusercontent.com"
+    CLIENT_SECRET = env_vars.get("GOOGLE_CLIENT_SECRET") or "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"
+    REDIRECT_URI = "http://127.0.0.1:5050/api/auth/callback"
 
     params = {
         "client_id": CLIENT_ID,
@@ -286,7 +300,7 @@ def verify_uninstall_auth():
     try:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(('127.0.0.1', 5000))
+        server.bind(('127.0.0.1', 5050))
         server.listen(1)
         client, _ = server.accept()
         request = client.recv(2048).decode('utf-8')
@@ -363,8 +377,8 @@ def uninstall_wifey():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     os_name = platform.system()
 
-    files_to_remove = ["wifey_db.json", "wifey_db.json.tmp", ".env", "WiFeY_Studio.spec"]
-    folders_to_remove = ["build", "dist", "build_cache", "core_cache", "sketch_source", "__pycache__", ".wrangler", "venv"]
+    files_to_remove = ["wifey_db.json", "wifey_db.json.tmp", "wifey_prefs.json", "wifey_prefs.json.tmp", ".env", "WiFeY_Studio.spec"]
+    folders_to_remove = ["build", "dist", "build_cache", "core_cache", "sketch_source", "__pycache__", ".wrangler", "cloud_vault", "webview_data", "venv"]
 
     for f in files_to_remove:
         path = os.path.join(base_dir, f)

@@ -64,6 +64,8 @@ os.makedirs(CORE_CACHE_DIR, exist_ok=True)
 os.makedirs(BUILD_CACHE_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(APP_DIR, "wifey_db.json")
+CLOUD_VAULT_DIR = os.path.join(APP_DIR, "cloud_vault")
+os.makedirs(CLOUD_VAULT_DIR, exist_ok=True)
 
 # --- BUILD / FIRMWARE LOCATIONS (one sketch path + one build path = every build reuses the compiled core & libraries) ---
 PREFS_PATH = os.path.join(APP_DIR, "wifey_prefs.json")          # local-only preferences (never synced to the cloud)
@@ -82,7 +84,7 @@ TEMPLATE_VERSION = "2"
 class DatabaseManager:
     def __init__(self, db_path):
         self.db_path = db_path
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self._data = {
             "user_profile": {
                 "google_sub": "",
@@ -91,9 +93,15 @@ class DatabaseManager:
                 "picture": ""
             },
             "manifest": {},
-            "devices": {}
+            "devices": {},
+            "access_requests": [],
+            "outgoing_requests": [],
+            "access_grants": [],
+            "shared_with_me": [],
+            "applied_mutations": []
         }
         self._dirty = False
+        self._cloud_dirty = False
         self.load()
         threading.Thread(target=self._flush_loop, daemon=True).start()
 
@@ -126,6 +134,9 @@ class DatabaseManager:
                 self._data["manifest"] = {}
             if "devices" not in self._data or not isinstance(self._data["devices"], dict):
                 self._data["devices"] = {}
+            for _list_key in ("access_requests", "outgoing_requests", "access_grants", "shared_with_me", "applied_mutations"):
+                if _list_key not in self._data or not isinstance(self._data[_list_key], list):
+                    self._data[_list_key] = []
 
             # Schema migration for manifest (integer target_build and firmware_url)
             for fleet_name, fleet_data in list(self._data["manifest"].items()):
@@ -172,9 +183,11 @@ class DatabaseManager:
                 if "custom_firmware_url" not in dev_data:
                     dev_data["custom_firmware_url"] = None
 
-    def save(self):
+    def save(self, sync_cloud=True):
         with self.lock:
             self._dirty = False
+            if sync_cloud:
+                self._cloud_dirty = True
             tmp_path = self.db_path + ".tmp"
             try:
                 with open(tmp_path, "w", encoding="utf-8") as f:
@@ -375,6 +388,58 @@ class DatabaseManager:
             except Exception:
                 base = 100
             return max(base + 1, 101)
+
+    def get_active_shared_grants(self):
+        now = time.time()
+        with self.lock:
+            grants = list(self._data.get("shared_with_me", []))
+        active = []
+        for g in grants:
+            if not isinstance(g, dict):
+                continue
+            if g.get("status", "approved") != "approved":
+                continue
+            exp = float(g.get("expires_at", 0) or 0)
+            if exp > now:
+                active.append(dict(g))
+        return active
+
+    def get_all_accessible_devices(self):
+        """Returns combined dictionary of own devices + currently active shared devices."""
+        with self.lock:
+            own = {k: dict(v) for k, v in self._data.get("devices", {}).items() if isinstance(v, dict)}
+        for g in self.get_active_shared_grants():
+            owner_email = g.get("owner_email", "")
+            s_devs = g.get("devices", {}) or {}
+            for dev_id, d in s_devs.items():
+                if dev_id not in own and isinstance(d, dict):
+                    merged = dict(d)
+                    merged["shared"] = True
+                    merged["owner_email"] = owner_email
+                    merged["owner_sub"] = g.get("owner_sub", "")
+                    merged["grant_id"] = g.get("grant_id", "")
+                    merged["expires_at"] = float(g.get("expires_at", 0) or 0)
+                    own[dev_id] = merged
+        return own
+
+    def reset_workspace_for_account_switch(self):
+        with self.lock:
+            self._data = {
+                "user_profile": {
+                    "google_sub": "",
+                    "email": "",
+                    "id_token": "",
+                    "picture": ""
+                },
+                "manifest": {},
+                "devices": {},
+                "access_requests": [],
+                "outgoing_requests": [],
+                "access_grants": [],
+                "shared_with_me": [],
+                "applied_mutations": []
+            }
+        self.save(sync_cloud=False)
 
 db = DatabaseManager(DB_PATH)
 
@@ -766,10 +831,15 @@ def udp_beacon_listener():
                     ip = beacon.get("ip") or addr[0]
                     build = beacon.get("build", 100)
 
-                    if device_id and device_token:
-                        # Multi-User Isolation Check:
-                        # Match device_token against user's registered devices in wifey_db.json
-                        registered = db.get_device(device_id)
+                    if beacon.get("wifey_collab"):
+                        try:
+                            handle_lan_collab_packet(beacon, addr[0])
+                        except Exception:
+                            pass
+                    elif device_id and device_token:
+                        # Multi-User & Shared-Access Isolation Check:
+                        # Match device_token against user's own or time-bound shared devices
+                        registered = db.get_all_accessible_devices().get(device_id)
                         if registered and registered.get("device_token") == device_token:
                             now = time.time()
                             with LAN_NODES_LOCK:
@@ -844,7 +914,7 @@ def nudge_devices(device_ids=None, fleet=None):
     return sent
 
 def compute_live():
-    """One consistent snapshot of fleets + nodes with live online flags (LAN beacon or cloud check-in)."""
+    """One consistent snapshot of own + time-bound shared fleets & nodes with live online flags."""
     now = time.time()
     snapshot = db.get_all()
     poll = int(prefs.get("poll_seconds", 30) or 0)
@@ -855,8 +925,19 @@ def compute_live():
     devices = {}
     fleets = {}
     for name, f in snapshot.get("manifest", {}).items():
-        fleets[name] = {"target_build": int(f.get("target_build", 100)), "total": 0, "online": 0}
-    fleets.setdefault("DefaultFleet", {"target_build": 100, "total": 0, "online": 0})
+        fleets[name] = {
+            "target_build": int(f.get("target_build", 100)),
+            "total": 0,
+            "online": 0,
+            "shared": False,
+            "owner_email": "",
+            "expires_at": None,
+            "remaining_sec": None
+        }
+    fleets.setdefault("DefaultFleet", {
+        "target_build": 100, "total": 0, "online": 0,
+        "shared": False, "owner_email": "", "expires_at": None, "remaining_sec": None
+    })
 
     lan_online_total = 0
     online_total = 0
@@ -875,17 +956,93 @@ def compute_live():
             "last_seen": last_seen,
             "ago": max(0, int(now - last_seen)),
             "override": d.get("custom_build_override"),
+            "shared": False,
+            "owner_email": "",
+            "expires_at": None,
+            "remaining_sec": None
         }
-        fl = fleets.setdefault(fleet, {"target_build": 100, "total": 0, "online": 0})
+        fl = fleets.setdefault(fleet, {
+            "target_build": 100, "total": 0, "online": 0,
+            "shared": False, "owner_email": "", "expires_at": None, "remaining_sec": None
+        })
         fl["total"] += 1
         if online:
             fl["online"] += 1
             online_total += 1
         if lan_online:
             lan_online_total += 1
+
+    # Merge active time-bound shared fleets & nodes granted to this user
+    active_shared = db.get_active_shared_grants()
+    for g in active_shared:
+        owner_email = g.get("owner_email", "partner")
+        exp = float(g.get("expires_at", 0) or 0)
+        rem_sec = max(0, int(exp - now))
+        s_manifests = g.get("manifest", {}) or {}
+        s_devices = g.get("devices", {}) or {}
+
+        for fname, fdata in s_manifests.items():
+            if fname not in fleets:
+                fleets[fname] = {
+                    "target_build": int((fdata or {}).get("target_build", 100)),
+                    "total": 0,
+                    "online": 0,
+                    "shared": True,
+                    "owner_email": owner_email,
+                    "expires_at": exp,
+                    "remaining_sec": rem_sec,
+                    "grant_id": g.get("grant_id", "")
+                }
+
+        for dev_id, d in s_devices.items():
+            if dev_id in devices or not isinstance(d, dict):
+                continue
+            li = lan.get(dev_id)
+            lan_online = bool(li and (now - li.get("last_seen", 0)) < LAN_ONLINE_SECS and li.get("device_token") == d.get("device_token"))
+            last_seen = max(float(d.get("last_seen", 0) or 0), float(li.get("last_seen", 0)) if li else 0.0)
+            online = lan_online or (now - last_seen) < cloud_window
+            fleet = d.get("fleet", "DefaultFleet")
+            devices[dev_id] = {
+                "fleet": fleet,
+                "build": int(d.get("current_build", 100)),
+                "online": online,
+                "lan": lan_online,
+                "ip": li.get("ip", "") if (li and lan_online) else "",
+                "last_seen": last_seen,
+                "ago": max(0, int(now - last_seen)),
+                "override": d.get("custom_build_override"),
+                "shared": True,
+                "owner_email": owner_email,
+                "expires_at": exp,
+                "remaining_sec": rem_sec,
+                "grant_id": g.get("grant_id", "")
+            }
+            fl = fleets.setdefault(fleet, {
+                "target_build": int((s_manifests.get(fleet) or {}).get("target_build", 100)),
+                "total": 0,
+                "online": 0,
+                "shared": True,
+                "owner_email": owner_email,
+                "expires_at": exp,
+                "remaining_sec": rem_sec,
+                "grant_id": g.get("grant_id", "")
+            })
+            fl["total"] += 1
+            if online:
+                fl["online"] += 1
+                online_total += 1
+            if lan_online:
+                lan_online_total += 1
+
+    pending_incoming = sum(1 for r in snapshot.get("access_requests", []) if isinstance(r, dict) and r.get("status") == "pending")
+    active_grants_out = sum(1 for g in snapshot.get("access_grants", []) if isinstance(g, dict) and g.get("status") == "approved" and float(g.get("expires_at", 0) or 0) > now)
+
     return {
         "now": now, "fleets": fleets, "devices": devices,
         "lan_online": lan_online_total, "online_nodes": online_total, "total_nodes": len(devices),
+        "pending_requests": pending_incoming,
+        "active_grants_count": active_grants_out,
+        "shared_with_me_count": len(active_shared)
     }
 
 class WirelessSerialSession:
@@ -1033,6 +1190,606 @@ def upload_firmware_to_cloud(fleet_id, binary_bytes, build_num, id_token=None):
 
     # 3. LAN HTTP fallback
     return lan_firmware_url(lan_name)
+
+# =====================================================================
+#  MULTI-PC ACCOUNT AUTO-RECOVERY & TIME-BOUND COLLABORATION ENGINE
+# =====================================================================
+def normalize_email(email_str):
+    return str(email_str or "").strip().lower()
+
+def email_storage_key(email_str):
+    clean = normalize_email(email_str)
+    if not clean:
+        return ""
+    return "email_" + re.sub(r'[^a-z0-9._-]', '_', clean)
+
+def _vault_path(slot_key):
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', str(slot_key))
+    return os.path.join(CLOUD_VAULT_DIR, f"{safe}.json")
+
+def cloud_store_write_json(slot_key, payload_dict, token=None):
+    """Writes a JSON state object to Local Vault, Cloudflare Worker, and Cloudflare R2."""
+    if not slot_key:
+        return False
+    raw_bytes = json.dumps(payload_dict, indent=2).encode("utf-8")
+    wrote_any = False
+
+    # 1. Always persist in local multi-account vault (enables instant local recovery & testing)
+    try:
+        vp = _vault_path(slot_key)
+        tmp = f"{vp}.{secrets.token_hex(4)}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(raw_bytes.decode("utf-8"))
+        os.replace(tmp, vp)
+        wrote_any = True
+    except Exception as e:
+        print(f"[CloudVault] Local write error for {slot_key}: {e}")
+
+    tok = token or db.get_user_profile().get("id_token")
+
+    # 2. Cloudflare Worker Gateway
+    if WORKER_BASE_URL and tok:
+        try:
+            url = f"{WORKER_BASE_URL}/users/{slot_key}/wifey_db.json"
+            resp = requests.put(
+                url,
+                data=raw_bytes,
+                headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
+                timeout=(1.5, 3.0)
+            )
+            if resp.status_code in (200, 201, 204):
+                wrote_any = True
+        except Exception as e:
+            print(f"[CloudStore Worker PUT] {slot_key}: {e}")
+
+    # 3. Direct Cloudflare R2 S3 fallback
+    if R2_ACCOUNT_ID and R2_ACCESS_KEY and R2_SECRET_KEY:
+        try:
+            s3 = get_s3_client()
+            s3.put_object(
+                Bucket=R2_BUCKET,
+                Key=f"users/{slot_key}/wifey_db.json",
+                Body=raw_bytes,
+                ContentType="application/json"
+            )
+            wrote_any = True
+        except Exception as e:
+            print(f"[CloudStore R2 PUT] {slot_key}: {e}")
+
+    return wrote_any
+
+def cloud_store_read_json(slot_key, token=None):
+    """Reads the freshest JSON state object from Cloudflare Worker, Cloudflare R2, or Local Vault."""
+    if not slot_key:
+        return None
+    candidates = []
+    tok = token or db.get_user_profile().get("id_token")
+
+    # 1. Cloudflare Worker Gateway
+    if WORKER_BASE_URL and tok:
+        try:
+            url = f"{WORKER_BASE_URL}/users/{slot_key}/wifey_db.json"
+            resp = requests.get(url, headers={"Authorization": f"Bearer {tok}"}, timeout=(1.5, 3.0))
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict):
+                    candidates.append(data)
+        except Exception:
+            pass
+
+    # 2. Cloudflare R2 S3
+    if R2_ACCOUNT_ID and R2_ACCESS_KEY and R2_SECRET_KEY:
+        try:
+            s3 = get_s3_client()
+            obj = s3.get_object(Bucket=R2_BUCKET, Key=f"users/{slot_key}/wifey_db.json")
+            data = json.loads(obj['Body'].read().decode('utf-8'))
+            if isinstance(data, dict):
+                candidates.append(data)
+        except Exception:
+            pass
+
+    # 3. Local multi-account vault fallback
+    vp = _vault_path(slot_key)
+    if os.path.exists(vp):
+        try:
+            with open(vp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                candidates.append(data)
+        except Exception:
+            pass
+
+    if not candidates:
+        return None
+    # Pick candidate with latest updated_at timestamp (or richest device set)
+    candidates.sort(
+        key=lambda d: (float(d.get("updated_at", 0) or 0), len(d.get("devices", {}) or {})),
+        reverse=True
+    )
+    return candidates[0]
+
+def broadcast_lan_collab(packet):
+    """Broadcasts a real-time collaboration event over UDP port 53535 so LAN Studio peers react instantly."""
+    try:
+        msg = dict(packet)
+        msg["wifey_collab"] = True
+        raw = json.dumps(msg).encode("utf-8")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if hasattr(socket, "SO_BROADCAST"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        try:
+            sock.sendto(raw, ("255.255.255.255", UDP_PORT))
+            sock.sendto(raw, ("127.0.0.1", UDP_PORT))
+        finally:
+            sock.close()
+    except Exception:
+        pass
+
+def build_owner_grant_snapshot(snapshot_data, scope_type, target_id):
+    """Extracts the permitted manifest and devices subset for a given grant scope."""
+    all_manifests = snapshot_data.get("manifest", {}) or {}
+    all_devices = snapshot_data.get("devices", {}) or {}
+    perm_manifests = {}
+    perm_devices = {}
+
+    if scope_type == "all" or target_id == "*":
+        for k, v in all_manifests.items():
+            perm_manifests[k] = dict(v) if isinstance(v, dict) else {"target_build": 100, "firmware_url": ""}
+        for k, v in all_devices.items():
+            if isinstance(v, dict):
+                perm_devices[k] = dict(v)
+    elif scope_type == "fleet":
+        if target_id in all_manifests and isinstance(all_manifests[target_id], dict):
+            perm_manifests[target_id] = dict(all_manifests[target_id])
+        else:
+            perm_manifests[target_id] = {"target_build": 100, "firmware_url": ""}
+        for k, v in all_devices.items():
+            if isinstance(v, dict) and v.get("fleet") == target_id:
+                perm_devices[k] = dict(v)
+    elif scope_type == "node":
+        dev = all_devices.get(target_id)
+        if isinstance(dev, dict):
+            perm_devices[target_id] = dict(dev)
+            fl_name = dev.get("fleet", "DefaultFleet")
+            if fl_name in all_manifests and isinstance(all_manifests[fl_name], dict):
+                perm_manifests[fl_name] = dict(all_manifests[fl_name])
+            else:
+                perm_manifests[fl_name] = {"target_build": 100, "firmware_url": ""}
+
+    return perm_manifests, perm_devices
+
+def sync_account_to_cloud(force=False):
+    """Pushes the signed-in user's database and collaboration mailbox to Cloud & Vault."""
+    prof = db.get_user_profile()
+    sub = (prof.get("google_sub") or "").strip()
+    email = normalize_email(prof.get("email"))
+    token = (prof.get("id_token") or "").strip()
+    if not sub and not email:
+        return False
+
+    now = time.time()
+    with db.lock:
+        if not force and not db._cloud_dirty:
+            return False
+        db._cloud_dirty = False
+        db._data["updated_at"] = now
+        snapshot = json.loads(json.dumps(db._data))
+
+    # Write primary user DB under both google_sub and email_storage_key so any PC can recover by either key
+    if sub:
+        cloud_store_write_json(sub, snapshot, token=token)
+    ekey = email_storage_key(email)
+    if ekey:
+        cloud_store_write_json(ekey, snapshot, token=token)
+
+        # Also update the owner's public collaboration mailbox ({ekey}_collab)
+        collab_slot = f"{ekey}_collab"
+        existing_box = cloud_store_read_json(collab_slot, token=token) or {}
+        existing_inbox = existing_box.get("inbox_requests", []) if isinstance(existing_box, dict) else []
+        existing_mutations = existing_box.get("shared_mutations", []) if isinstance(existing_box, dict) else []
+
+        # Merge any local access_requests statuses back into the mailbox
+        by_id = {r.get("request_id"): dict(r) for r in existing_inbox if isinstance(r, dict) and r.get("request_id")}
+        for local_req in snapshot.get("access_requests", []):
+            if isinstance(local_req, dict) and local_req.get("request_id"):
+                by_id[local_req["request_id"]] = dict(local_req)
+
+        # Refresh live snapshots inside active grants
+        active_grants = []
+        for g in snapshot.get("access_grants", []):
+            if not isinstance(g, dict):
+                continue
+            g_copy = dict(g)
+            if g_copy.get("status") == "approved" and float(g_copy.get("expires_at", 0) or 0) > now:
+                pm, pd = build_owner_grant_snapshot(snapshot, g_copy.get("scope_type", "all"), g_copy.get("target_id", "*"))
+                g_copy["manifest"] = pm
+                g_copy["devices"] = pd
+                g_copy["owner_email"] = email
+                g_copy["owner_sub"] = sub
+                g_copy["owner_url"] = NGROK_URL
+            active_grants.append(g_copy)
+
+        catalog_fleets = list((snapshot.get("manifest") or {}).keys())
+        if "DefaultFleet" not in catalog_fleets and snapshot.get("devices"):
+            catalog_fleets.insert(0, "DefaultFleet")
+        catalog_nodes = [
+            {"id": did, "fleet": d.get("fleet", "DefaultFleet"), "build": int(d.get("current_build", 100))}
+            for did, d in (snapshot.get("devices") or {}).items() if isinstance(d, dict)
+        ]
+
+        collab_payload = {
+            "owner_email": email,
+            "owner_sub": sub,
+            "owner_url": NGROK_URL,
+            "updated_at": now,
+            "public_catalog": {
+                "fleets": catalog_fleets,
+                "nodes": catalog_nodes
+            },
+            "inbox_requests": list(by_id.values()),
+            "active_grants": active_grants,
+            "shared_mutations": existing_mutations[-100:]
+        }
+        cloud_store_write_json(collab_slot, collab_payload, token=token)
+
+    return True
+
+def recover_account_state_from_cloud(google_sub, email, id_token="", clear_previous_if_different=True):
+    """Recovers all active nodes, fleets, and collaboration permissions for the user across any PC."""
+    email_norm = normalize_email(email)
+    sub_clean = str(google_sub or "").strip()
+    ekey = email_storage_key(email_norm)
+
+    prev_prof = db.get_user_profile()
+    prev_email = normalize_email(prev_prof.get("email"))
+    prev_sub = str(prev_prof.get("google_sub") or "").strip()
+
+    # If switching directly from one signed-in user to a different user, save previous user first and reset workspace
+    if clear_previous_if_different and ((prev_email and email_norm and prev_email != email_norm) or (prev_sub and sub_clean and prev_sub != sub_clean)):
+        try:
+            sync_account_to_cloud(force=True)
+        except Exception:
+            pass
+        db.reset_workspace_for_account_switch()
+        with LAN_NODES_LOCK:
+            LAN_NODES.clear()
+
+    # Fetch remote state from sub slot and email slot
+    remote_by_sub = cloud_store_read_json(sub_clean, token=id_token) if sub_clean else None
+    remote_by_email = cloud_store_read_json(ekey, token=id_token) if ekey else None
+
+    recovered_nodes = 0
+    recovered_fleets = 0
+    with db.lock:
+        for remote in (remote_by_sub, remote_by_email):
+            if not isinstance(remote, dict):
+                continue
+            # Merge manifests (fleets)
+            for fl_name, fl_data in (remote.get("manifest") or {}).items():
+                if not isinstance(fl_data, dict):
+                    continue
+                local_fl = db._data["manifest"].get(fl_name)
+                if not local_fl or int(fl_data.get("target_build", 100)) >= int(local_fl.get("target_build", 100)):
+                    db._data["manifest"][fl_name] = {
+                        "target_build": int(fl_data.get("target_build", 100)),
+                        "firmware_url": fl_data.get("firmware_url", "") or (local_fl or {}).get("firmware_url", "")
+                    }
+            # Merge active hardware nodes (devices)
+            for dev_id, dev_data in (remote.get("devices") or {}).items():
+                if not isinstance(dev_data, dict):
+                    continue
+                local_dev = db._data["devices"].get(dev_id)
+                if not local_dev:
+                    db._data["devices"][dev_id] = dict(dev_data)
+                else:
+                    # Keep the most recently seen / highest build state
+                    rem_seen = float(dev_data.get("last_seen", 0) or 0)
+                    loc_seen = float(local_dev.get("last_seen", 0) or 0)
+                    if rem_seen >= loc_seen:
+                        merged = dict(local_dev)
+                        merged.update(dev_data)
+                        merged["current_build"] = max(int(local_dev.get("current_build", 100)), int(dev_data.get("current_build", 100)))
+                        db._data["devices"][dev_id] = merged
+
+            # Merge collaboration lists by ID
+            for key_name, id_field in (
+                ("access_requests", "request_id"),
+                ("outgoing_requests", "request_id"),
+                ("access_grants", "grant_id"),
+                ("shared_with_me", "grant_id")
+            ):
+                existing_map = {item.get(id_field): item for item in db._data.get(key_name, []) if isinstance(item, dict) and item.get(id_field)}
+                for item in (remote.get(key_name) or []):
+                    if isinstance(item, dict) and item.get(id_field):
+                        existing_map[item[id_field]] = dict(item)
+                db._data[key_name] = list(existing_map.values())
+
+        recovered_nodes = len(db._data.get("devices", {}))
+        recovered_fleets = len(db._data.get("manifest", {}))
+
+    db.save(sync_cloud=True)
+    # Also pull latest collaboration mailbox updates (incoming requests & shared grants)
+    poll_collaboration_updates()
+    sync_account_to_cloud(force=True)
+
+    emit_ui_log(f"🎉 [Account Sync] Recovered {recovered_nodes} active node(s) and {recovered_fleets} fleet(s) for {email_norm or sub_clean}.")
+    return {"recovered_nodes": recovered_nodes, "recovered_fleets": recovered_fleets}
+
+def poll_collaboration_updates():
+    """Polls the signed-in user's collaboration mailbox for incoming requests, collaborator mutations,
+    and refreshes any shared grants from other owners."""
+    prof = db.get_user_profile()
+    my_email = normalize_email(prof.get("email"))
+    my_sub = (prof.get("google_sub") or "").strip()
+    my_token = (prof.get("id_token") or "").strip()
+    if not my_email:
+        return
+
+    now = time.time()
+    my_ekey = email_storage_key(my_email)
+    changed_local = False
+
+    # 1. Check our own collaboration mailbox ({my_ekey}_collab) for incoming requests & collaborator mutations
+    my_box = cloud_store_read_json(f"{my_ekey}_collab", token=my_token)
+    if isinstance(my_box, dict):
+        with db.lock:
+            known_reqs = {r.get("request_id"): r for r in db._data.get("access_requests", []) if isinstance(r, dict) and r.get("request_id")}
+            for req in (my_box.get("inbox_requests") or []):
+                if not isinstance(req, dict) or not req.get("request_id"):
+                    continue
+                rid = req["request_id"]
+                if rid not in known_reqs:
+                    known_reqs[rid] = dict(req)
+                    changed_local = True
+                    emit_ui_log(f"🔔 [Collab] New permission request from {req.get('requester_email')} for {req.get('scope_type')}: '{req.get('target_id')}' ({req.get('requested_duration_min')}m)")
+                elif req.get("status") != known_reqs[rid].get("status") and known_reqs[rid].get("status") == "pending":
+                    known_reqs[rid].update(req)
+                    changed_local = True
+            db._data["access_requests"] = list(known_reqs.values())
+
+            # Apply any mutations pushed by authorized collaborators within their valid grant window
+            applied_ids = set(db._data.get("applied_mutations", []))
+            grants_by_id = {
+                g.get("grant_id"): g for g in db._data.get("access_grants", [])
+                if isinstance(g, dict) and g.get("status") == "approved"
+            }
+            for mut in (my_box.get("shared_mutations") or []):
+                if not isinstance(mut, dict):
+                    continue
+                mid = mut.get("mutation_id")
+                gid = mut.get("grant_id")
+                if not mid or mid in applied_ids:
+                    continue
+                grant = grants_by_id.get(gid)
+                mut_time = float(mut.get("timestamp", 0) or 0)
+                if not grant or mut_time > float(grant.get("expires_at", 0) or 0):
+                    applied_ids.add(mid)
+                    continue
+
+                mtype = mut.get("type")
+                actor = mut.get("actor_email", "collaborator")
+                if mtype == "deploy_fleet":
+                    fl = mut.get("fleet")
+                    bnum = int(mut.get("target_build", 101))
+                    furl = mut.get("firmware_url", "")
+                    db._data.setdefault("manifest", {})[fl] = {"target_build": bnum, "firmware_url": furl}
+                    changed_local = True
+                    emit_ui_log(f"🤝 [Collab] {actor} deployed Build #{bnum} to your fleet '{fl}'.")
+                    nudge_devices(fleet=fl)
+                elif mtype == "deploy_nodes":
+                    bnum = int(mut.get("target_build", 101))
+                    furl = mut.get("firmware_url", "")
+                    nids = mut.get("device_ids") or []
+                    for did in nids:
+                        if did in db._data.get("devices", {}):
+                            db._data["devices"][did]["custom_build_override"] = bnum
+                            db._data["devices"][did]["custom_firmware_url"] = furl
+                    changed_local = True
+                    emit_ui_log(f"🤝 [Collab] {actor} deployed Build #{bnum} to node(s): {', '.join(nids)}.")
+                    nudge_devices(device_ids=nids)
+                elif mtype == "override_node":
+                    did = mut.get("device_id")
+                    if did in db._data.get("devices", {}):
+                        if mut.get("clear"):
+                            db._data["devices"][did]["custom_build_override"] = None
+                            db._data["devices"][did]["custom_firmware_url"] = None
+                        else:
+                            db._data["devices"][did]["custom_build_override"] = int(mut.get("build_num", 100))
+                            db._data["devices"][did]["custom_firmware_url"] = mut.get("firmware_url")
+                        changed_local = True
+                        emit_ui_log(f"🤝 [Collab] {actor} updated build override on node '{did}'.")
+                elif mtype == "reassign_fleet":
+                    did = mut.get("device_id")
+                    nfl = mut.get("new_fleet")
+                    if did in db._data.get("devices", {}) and nfl:
+                        db._data["devices"][did]["fleet"] = nfl
+                        db._data.setdefault("manifest", {}).setdefault(nfl, {"target_build": 100, "firmware_url": ""})
+                        changed_local = True
+                        emit_ui_log(f"🤝 [Collab] {actor} reassigned node '{did}' to fleet '{nfl}'.")
+
+                applied_ids.add(mid)
+            db._data["applied_mutations"] = list(applied_ids)[-200:]
+
+            # Mark expired grants on owner side
+            for g in db._data.get("access_grants", []):
+                if isinstance(g, dict) and g.get("status") == "approved" and float(g.get("expires_at", 0) or 0) <= now:
+                    g["status"] = "expired"
+                    changed_local = True
+                    emit_ui_log(f"⏱ [Collab] Shared access for {g.get('grantee_email')} on '{g.get('target_id')}' has expired.")
+
+    # 2. Check outgoing requests & active shared grants from other owners
+    with db.lock:
+        tracked_owners = {
+            normalize_email(r.get("owner_email"))
+            for r in (db._data.get("outgoing_requests", []) + db._data.get("shared_with_me", []))
+            if isinstance(r, dict) and r.get("owner_email")
+        }
+
+    new_shared_with_me = {}
+    with db.lock:
+        for g in db._data.get("shared_with_me", []):
+            if isinstance(g, dict) and g.get("grant_id"):
+                new_shared_with_me[g["grant_id"]] = dict(g)
+
+    for owner_email in tracked_owners:
+        if not owner_email or owner_email == my_email:
+            continue
+        o_ekey = email_storage_key(owner_email)
+        o_box = cloud_store_read_json(f"{o_ekey}_collab", token=my_token)
+        if not isinstance(o_box, dict):
+            continue
+
+        # Update outgoing request statuses
+        remote_reqs = {r.get("request_id"): r for r in (o_box.get("inbox_requests") or []) if isinstance(r, dict) and r.get("request_id")}
+        with db.lock:
+            for out_r in db._data.get("outgoing_requests", []):
+                rid = out_r.get("request_id")
+                if rid and rid in remote_reqs:
+                    r_stat = remote_reqs[rid].get("status", "pending")
+                    if out_r.get("status") != r_stat:
+                        out_r.update(remote_reqs[rid])
+                        changed_local = True
+                        if r_stat == "approved":
+                            emit_ui_log(f"🎉 [Collab] {owner_email} approved your access request for '{out_r.get('target_id')}' ({out_r.get('approved_duration_min')} mins)!")
+                        elif r_stat == "denied":
+                            emit_ui_log(f"❌ [Collab] {owner_email} declined your access request for '{out_r.get('target_id')}'.")
+
+        # Refresh active grants granted to my_email
+        for g in (o_box.get("active_grants") or []):
+            if not isinstance(g, dict) or normalize_email(g.get("grantee_email")) != my_email:
+                continue
+            gid = g.get("grant_id")
+            if not gid:
+                continue
+            prev_g = new_shared_with_me.get(gid)
+            new_shared_with_me[gid] = dict(g)
+            if not prev_g and g.get("status") == "approved" and float(g.get("expires_at", 0) or 0) > now:
+                changed_local = True
+                emit_ui_log(f"🔓 [Collab] Active shared access granted by {owner_email} for {g.get('scope_type')}: '{g.get('target_id')}'.")
+            elif prev_g and prev_g.get("status") == "approved" and g.get("status") == "revoked":
+                changed_local = True
+                emit_ui_log(f"🔒 [Collab] Shared access from {owner_email} for '{g.get('target_id')}' was revoked.")
+
+    # Expire any shared_with_me entries whose duration elapsed
+    for gid, g in list(new_shared_with_me.items()):
+        if g.get("status") == "approved" and float(g.get("expires_at", 0) or 0) <= now:
+            g["status"] = "expired"
+            changed_local = True
+            emit_ui_log(f"⏱ [Collab] Your shared access to {g.get('owner_email')}'s '{g.get('target_id')}' has expired.")
+
+    with db.lock:
+        if new_shared_with_me != {g.get("grant_id"): g for g in db._data.get("shared_with_me", []) if isinstance(g, dict) and g.get("grant_id")}:
+            db._data["shared_with_me"] = list(new_shared_with_me.values())
+            changed_local = True
+
+    if changed_local:
+        db.save(sync_cloud=True)
+
+def handle_lan_collab_packet(packet, sender_ip):
+    """Handles real-time UDP collaboration notifications on the same LAN."""
+    prof = db.get_user_profile()
+    my_email = normalize_email(prof.get("email"))
+    if not my_email:
+        return
+    target_email = normalize_email(packet.get("target_email"))
+    if target_email and target_email == my_email:
+        threading.Thread(target=poll_collaboration_updates, daemon=True).start()
+
+def push_shared_mutation_to_owner(grant, mutation_dict):
+    """Writes a collaborator's action (deploy / override / reassign) to the owner's cloud collab mailbox."""
+    owner_email = normalize_email(grant.get("owner_email"))
+    owner_sub = (grant.get("owner_sub") or "").strip()
+    if not owner_email:
+        return False
+    now = time.time()
+    if float(grant.get("expires_at", 0) or 0) <= now or grant.get("status", "approved") != "approved":
+        raise ValueError("Shared access permission has expired or been revoked.")
+
+    o_ekey = email_storage_key(owner_email)
+    collab_slot = f"{o_ekey}_collab"
+    box = cloud_store_read_json(collab_slot) or {
+        "owner_email": owner_email,
+        "owner_sub": owner_sub,
+        "updated_at": now,
+        "public_catalog": {"fleets": [], "nodes": []},
+        "inbox_requests": [],
+        "active_grants": [],
+        "shared_mutations": []
+    }
+    mut = dict(mutation_dict)
+    mut["mutation_id"] = f"mut_{secrets.token_hex(8)}"
+    mut["grant_id"] = grant.get("grant_id")
+    mut["actor_email"] = normalize_email(db.get_user_profile().get("email")) or "collaborator"
+    mut["timestamp"] = now
+    box.setdefault("shared_mutations", []).append(mut)
+
+    # Also update the live snapshot inside the grant so the collaborator sees their new build immediately
+    for ag in box.get("active_grants", []):
+        if isinstance(ag, dict) and ag.get("grant_id") == grant.get("grant_id"):
+            if mut.get("type") == "deploy_fleet":
+                fl = mut.get("fleet")
+                ag.setdefault("manifest", {})[fl] = {
+                    "target_build": int(mut.get("target_build", 101)),
+                    "firmware_url": mut.get("firmware_url", "")
+                }
+            elif mut.get("type") == "deploy_nodes":
+                for did in (mut.get("device_ids") or []):
+                    if did in (ag.get("devices") or {}):
+                        ag["devices"][did]["custom_build_override"] = int(mut.get("target_build", 101))
+                        ag["devices"][did]["custom_firmware_url"] = mut.get("firmware_url", "")
+    box["updated_at"] = now
+    cloud_store_write_json(collab_slot, box)
+
+    # Also update the owner's primary cloud DB slots (if R2 / Vault accessible) so the owner's nodes/PCs get it even if owner PC is offline
+    for owner_slot in filter(None, [owner_sub, o_ekey]):
+        owner_db = cloud_store_read_json(owner_slot)
+        if isinstance(owner_db, dict):
+            if mut.get("type") == "deploy_fleet":
+                fl = mut.get("fleet")
+                owner_db.setdefault("manifest", {})[fl] = {
+                    "target_build": int(mut.get("target_build", 101)),
+                    "firmware_url": mut.get("firmware_url", "")
+                }
+            elif mut.get("type") == "deploy_nodes":
+                for did in (mut.get("device_ids") or []):
+                    if did in (owner_db.get("devices") or {}):
+                        owner_db["devices"][did]["custom_build_override"] = int(mut.get("target_build", 101))
+                        owner_db["devices"][did]["custom_firmware_url"] = mut.get("firmware_url", "")
+            owner_db["updated_at"] = now
+            cloud_store_write_json(owner_slot, owner_db)
+
+    # Update local shared_with_me copy immediately
+    with db.lock:
+        for sg in db._data.get("shared_with_me", []):
+            if isinstance(sg, dict) and sg.get("grant_id") == grant.get("grant_id"):
+                if mut.get("type") == "deploy_fleet":
+                    fl = mut.get("fleet")
+                    sg.setdefault("manifest", {})[fl] = {
+                        "target_build": int(mut.get("target_build", 101)),
+                        "firmware_url": mut.get("firmware_url", "")
+                    }
+                elif mut.get("type") == "deploy_nodes":
+                    for did in (mut.get("device_ids") or []):
+                        if did in (sg.get("devices") or {}):
+                            sg["devices"][did]["custom_build_override"] = int(mut.get("target_build", 101))
+                            sg["devices"][did]["custom_firmware_url"] = mut.get("firmware_url", "")
+    db.save(sync_cloud=False)
+    broadcast_lan_collab({"target_email": owner_email, "event": "shared_mutation"})
+    return True
+
+def background_cloud_collab_loop():
+    """Background daemon that syncs local account changes to the cloud and polls for collaboration updates."""
+    last_poll = 0
+    while True:
+        time.sleep(3)
+        try:
+            if db._cloud_dirty:
+                sync_account_to_cloud(force=False)
+            if time.time() - last_poll >= 7:
+                last_poll = time.time()
+                poll_collaboration_updates()
+        except Exception:
+            pass
 
 # --- SERIAL COMMUNICATION STATE & LOCK ---
 SERIAL_LOCK = threading.Lock()
@@ -2347,6 +3104,10 @@ IDE_HTML = """<!DOCTYPE html>
                 <span id="lan-dot" class="w-2 h-2 rounded-full bg-gray-500"></span>
                 <span id="lan-pill-text" class="font-mono text-[11px]">LAN idle</span>
             </div>
+            <button id="collab-pill" onclick="openCollabSection()" class="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-ardCard hover:bg-ardHover border border-ardBorder text-xs text-ardTextMuted hover:text-white transition-colors cursor-pointer" title="Team Collaboration & Shared Node Access">
+                <i class="ph-bold ph-users-three text-ardTeal text-xs"></i>
+                <span id="collab-pill-text" class="font-mono text-[11px]">Collab</span>
+            </button>
             <div class="flex items-center gap-2 pl-2 border-l border-ardBorder">
                 <i class="ph-bold ph-cpu text-2xl text-ardTeal"></i>
                 <span class="font-bold tracking-wide text-white text-base"><span class="text-ardTeal">WiFeY</span> Studio</span>
@@ -2571,14 +3332,17 @@ void loop() {
                                 </h2>
                                 <p class="text-xs text-ardTextMuted mt-1">Monitor connected ESP32 nodes, target versions, LAN beacons, and custom build overrides.</p>
                             </div>
-                            <div class="flex items-center gap-2">
+                            <div class="flex flex-wrap items-center gap-2">
+                                <button onclick="syncAccountNodesNow()" class="px-3 py-2 rounded-lg bg-ardCard hover:bg-ardHover border border-ardBorder text-xs text-white flex items-center gap-1.5 transition-colors" title="Recover & sync all active nodes associated with your Google account">
+                                    <i class="ph-bold ph-cloud-arrow-down text-emerald-400"></i> Sync Account Nodes
+                                </button>
                                 <button onclick="promptNewFleet()" class="px-3 py-2 rounded-lg bg-ardCard hover:bg-ardHover border border-ardBorder text-xs text-white flex items-center gap-1.5 transition-colors">
                                     <i class="ph-bold ph-plus text-ardTeal"></i> Create Fleet
                                 </button>
                                 <button onclick="triggerBatchFleetDeploy()" class="px-3 py-2 rounded-lg bg-ardCard hover:bg-ardHover border border-ardBorder text-xs text-white flex items-center gap-1.5 transition-colors">
                                     <i class="ph-bold ph-paper-plane-tilt text-ardTeal"></i> Batch Deploy
                                 </button>
-                                <button onclick="loadFleetDashboard()" class="px-3 py-2 rounded-lg bg-ardCard hover:bg-ardHover border border-ardBorder text-xs text-white flex items-center gap-1.5 transition-colors">
+                                <button onclick="loadFleetDashboard(); loadCollabState();" class="px-3 py-2 rounded-lg bg-ardCard hover:bg-ardHover border border-ardBorder text-xs text-white flex items-center gap-1.5 transition-colors">
                                     <i class="ph-bold ph-arrows-clockwise text-ardTeal"></i> Refresh
                                 </button>
                             </div>
@@ -2661,6 +3425,116 @@ void loop() {
                                         <tr><td colspan="9" class="p-6 text-center text-ardTextMuted">Loading device list...</td></tr>
                                     </tbody>
                                 </table>
+                            </div>
+                        </div>
+
+                        <!-- TEAM COLLABORATION & TIME-BOUND ACCESS PERMISSIONS -->
+                        <div id="collab-section" class="bg-ardCard border border-ardBorder rounded-xl overflow-hidden shadow-xl">
+                            <div class="p-4 border-b border-ardBorder flex flex-wrap items-center justify-between gap-2">
+                                <div class="flex items-center gap-2">
+                                    <i class="ph-bold ph-users-three text-ardTeal text-base"></i>
+                                    <span class="font-semibold text-white text-xs uppercase tracking-wider">Team Collaboration & Time-Bound Node / Fleet Permissions</span>
+                                </div>
+                                <span class="text-xs text-ardTextMuted">Request temporary access to a teammate's node or fleet, or approve incoming requests with a custom duration timer.</span>
+                            </div>
+
+                            <div class="p-5 grid grid-cols-1 lg:grid-cols-12 gap-6">
+                                <!-- Left Column: Request Access Form -->
+                                <div class="lg:col-span-5 bg-ardPanel border border-ardBorder rounded-xl p-4 space-y-3.5">
+                                    <div class="text-xs font-semibold text-white uppercase tracking-wider flex items-center gap-1.5">
+                                        <i class="ph-bold ph-key text-ardTeal"></i> Request Access to Partner's Node / Fleet
+                                    </div>
+                                    <div>
+                                        <label class="block text-[11px] text-ardTextMuted mb-1">Owner's Google Email</label>
+                                        <div class="flex gap-2">
+                                            <input type="email" id="collab_owner_email" placeholder="teammate@gmail.com" class="flat-input flex-1 min-w-0 p-2 rounded-lg text-xs font-mono text-white">
+                                            <button type="button" onclick="lookupOwnerCatalog()" class="px-2.5 py-1.5 rounded-lg border border-ardBorder bg-ardCard hover:bg-ardHover text-xs text-ardTeal font-medium flex-shrink-0" title="Fetch owner's fleets and nodes">
+                                                Lookup
+                                            </button>
+                                        </div>
+                                        <div id="collab_catalog_hint" class="text-[10px] text-ardTextMuted mt-1 hidden"></div>
+                                    </div>
+
+                                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                        <div>
+                                            <label class="block text-[11px] text-ardTextMuted mb-1">Permission Scope</label>
+                                            <select id="collab_scope_type" onchange="onCollabScopeChange()" class="flat-input w-full p-2 rounded-lg text-xs text-white cursor-pointer">
+                                                <option value="all">Entire Project (All Fleets & Nodes)</option>
+                                                <option value="fleet" selected>Specific Fleet</option>
+                                                <option value="node">Specific Node</option>
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label class="block text-[11px] text-ardTextMuted mb-1">Requested Duration</label>
+                                            <select id="collab_duration_min" class="flat-input w-full p-2 rounded-lg text-xs text-white cursor-pointer font-mono">
+                                                <option value="15">15 Minutes</option>
+                                                <option value="30">30 Minutes</option>
+                                                <option value="60" selected>1 Hour</option>
+                                                <option value="120">2 Hours</option>
+                                                <option value="240">4 Hours</option>
+                                                <option value="480">8 Hours</option>
+                                                <option value="1440">24 Hours (1 Day)</option>
+                                                <option value="4320">3 Days</option>
+                                                <option value="10080">7 Days</option>
+                                            </select>
+                                        </div>
+                                    </div>
+
+                                    <div id="collab_target_row">
+                                        <label class="block text-[11px] text-ardTextMuted mb-1" id="collab_target_label">Target Fleet Name or Node ID</label>
+                                        <input type="text" id="collab_target_id" list="collab_target_suggestions" value="DefaultFleet" placeholder="e.g. DefaultFleet or node_1" class="flat-input w-full p-2 rounded-lg text-xs font-mono text-white">
+                                        <datalist id="collab_target_suggestions"></datalist>
+                                    </div>
+
+                                    <div>
+                                        <label class="block text-[11px] text-ardTextMuted mb-1">Reason / Project Note (Optional)</label>
+                                        <input type="text" id="collab_note" placeholder="e.g. Testing updated sensor telemetry firmware" class="flat-input w-full p-2 rounded-lg text-xs text-white">
+                                    </div>
+
+                                    <button type="button" onclick="sendCollabAccessRequest()" class="w-full py-2.5 px-4 bg-ardTeal hover:bg-[#009b9d] text-white font-semibold text-xs rounded-lg transition-all flex items-center justify-center gap-1.5 shadow-md">
+                                        <i class="ph-bold ph-paper-plane-right"></i> Ask Permission
+                                    </button>
+                                </div>
+
+                                <!-- Right Column: Incoming Requests, Active Grants & Shared Access -->
+                                <div class="lg:col-span-7 flex flex-col gap-4">
+                                    <!-- Incoming Requests (Owner approves & picks duration) -->
+                                    <div class="bg-ardPanel border border-ardBorder rounded-xl p-4">
+                                        <div class="flex items-center justify-between mb-2.5">
+                                            <span class="text-xs font-semibold text-white uppercase tracking-wider flex items-center gap-1.5">
+                                                <i class="ph-bold ph-bell-ringing text-amber-400"></i> Incoming Permission Requests (Select Duration & Permit)
+                                            </span>
+                                            <span id="incoming-req-badge" class="text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30">0 Pending</span>
+                                        </div>
+                                        <div id="collab-incoming-list" class="space-y-2 max-h-48 overflow-y-auto text-xs">
+                                            <div class="text-ardTextMuted text-xs py-2 text-center">No pending permission requests.</div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Active Permissions Granted by You -->
+                                    <div class="bg-ardPanel border border-ardBorder rounded-xl p-4">
+                                        <div class="flex items-center justify-between mb-2.5">
+                                            <span class="text-xs font-semibold text-white uppercase tracking-wider flex items-center gap-1.5">
+                                                <i class="ph-bold ph-shield-check text-emerald-400"></i> Active Permissions Granted by You
+                                            </span>
+                                        </div>
+                                        <div id="collab-my-grants-list" class="space-y-2 max-h-44 overflow-y-auto text-xs">
+                                            <div class="text-ardTextMuted text-xs py-2 text-center">No active permissions granted right now.</div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Shared With You & Your Outgoing Requests -->
+                                    <div class="bg-ardPanel border border-ardBorder rounded-xl p-4">
+                                        <div class="flex items-center justify-between mb-2.5">
+                                            <span class="text-xs font-semibold text-white uppercase tracking-wider flex items-center gap-1.5">
+                                                <i class="ph-bold ph-share-network text-cyan-400"></i> Shared With You & Outgoing Requests
+                                            </span>
+                                        </div>
+                                        <div id="collab-shared-with-me-list" class="space-y-2 max-h-44 overflow-y-auto text-xs">
+                                            <div class="text-ardTextMuted text-xs py-2 text-center">No shared nodes/fleets or outgoing requests yet.</div>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -3293,7 +4167,7 @@ void loop() {
             }
 
             if (viewId === 'view-usb') loadSerialPorts();
-            if (viewId === 'view-fleets') loadFleetDashboard();
+            if (viewId === 'view-fleets') { loadFleetDashboard(); loadCollabState(); }
             if (viewId === 'view-settings') loadSettings();
         }
 
@@ -3493,6 +4367,17 @@ void loop() {
             }).catch(() => {});
         }
 
+        function formatDurationRemaining(sec) {
+            if (sec === null || sec === undefined) return '';
+            sec = Math.max(0, Math.floor(sec));
+            if (sec <= 0) return 'Expired';
+            if (sec < 60) return sec + 's left';
+            if (sec < 3600) return Math.floor(sec / 60) + 'm ' + (sec % 60) + 's left';
+            const h = Math.floor(sec / 3600);
+            const m = Math.floor((sec % 3600) / 60);
+            return h + 'h ' + m + 'm left';
+        }
+
         function renderLiveChrome(data) {
             const dot = document.getElementById('lan-dot');
             const text = document.getElementById('lan-pill-text');
@@ -3500,6 +4385,23 @@ void loop() {
                 const n = data.lan_online || 0;
                 text.innerText = n > 0 ? `LAN ${n} live` : 'LAN idle';
                 dot.className = 'w-2 h-2 rounded-full ' + (n > 0 ? 'bg-cyan-400 pulse-live' : 'bg-gray-500');
+            }
+            const cPill = document.getElementById('collab-pill');
+            const cText = document.getElementById('collab-pill-text');
+            if (cPill && cText) {
+                const pending = data.pending_requests || 0;
+                const sharedIn = data.shared_with_me_count || 0;
+                const grantsOut = data.active_grants_count || 0;
+                if (pending > 0) {
+                    cText.innerText = `${pending} Request${pending > 1 ? 's' : ''}`;
+                    cPill.className = 'flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-500/15 border border-amber-500/40 text-xs text-amber-300 cursor-pointer';
+                } else if (sharedIn > 0 || grantsOut > 0) {
+                    cText.innerText = `Shared (${sharedIn + grantsOut})`;
+                    cPill.className = 'flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-cyan-500/15 border border-cyan-500/30 text-xs text-cyan-300 cursor-pointer';
+                } else {
+                    cText.innerText = 'Collab';
+                    cPill.className = 'flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-ardCard hover:bg-ardHover border border-ardBorder text-xs text-ardTextMuted hover:text-white transition-colors cursor-pointer';
+                }
             }
         }
 
@@ -3584,10 +4486,13 @@ void loop() {
 
                 const left = document.createElement('div');
                 left.className = 'flex items-center gap-2 min-w-0';
-                left.innerHTML = `<i class="ph-bold ph-tree-structure text-ardTeal"></i>
+                const sharedTag = info.shared
+                    ? `<span class="text-[10px] text-cyan-300 bg-cyan-500/15 border border-cyan-500/30 px-1.5 py-0.2 rounded ml-1">Shared • ${escHtml(formatDurationRemaining(info.remaining_sec))}</span>`
+                    : `<span class="text-xs text-ardTextMuted font-normal">(Entire Fleet)</span>`;
+                left.innerHTML = `<i class="ph-bold ph-tree-structure ${info.shared ? 'text-cyan-400' : 'text-ardTeal'}"></i>
                     <div class="min-w-0">
-                        <div class="font-semibold text-white truncate">${escHtml(fleet)} <span class="text-xs text-ardTextMuted font-normal">(Entire Fleet)</span></div>
-                        <div class="text-[10px] text-ardTextMuted">Target Build: #${info.target_build}</div>
+                        <div class="font-semibold text-white truncate">${escHtml(fleet)} ${sharedTag}</div>
+                        <div class="text-[10px] text-ardTextMuted">Target Build: #${info.target_build}${info.owner_email ? ' • ' + escHtml(info.owner_email) : ''}</div>
                     </div>`;
                 const right = document.createElement('div');
                 right.className = 'flex items-center gap-1.5 flex-shrink-0';
@@ -3714,18 +4619,28 @@ void loop() {
             fleets.forEach(([name, f]) => {
                 const row = document.createElement('tr');
                 row.className = 'hover:bg-ardPanel/50 transition-colors border-b border-ardBorder/50';
+                const sharedFleetBadge = f.shared
+                    ? `<span class="ml-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-mono bg-cyan-500/15 text-cyan-300 border border-cyan-500/30"><i class="ph-bold ph-clock"></i> Shared by ${escHtml(f.owner_email)} (${escHtml(formatDurationRemaining(f.remaining_sec))})</span>`
+                    : '';
                 row.innerHTML = `
-                    <td class="p-3 font-medium text-white">${escHtml(name)}</td>
+                    <td class="p-3 font-medium text-white">${escHtml(name)}${sharedFleetBadge}</td>
                     <td class="p-3 font-mono text-ardTeal font-semibold">Build #${f.target_build}</td>
                     <td class="p-3 text-ardTextMain">${f.online}/${f.total} online</td>
                     <td class="p-3 text-right space-x-1">
+                        <button class="act-target-fleet px-2 py-1 text-xs text-cyan-300 hover:underline font-medium">Target Fleet</button>
                         <button class="act-select px-2 py-1 text-xs text-ardTeal hover:underline font-medium">Select nodes</button>
                         <button class="act-remove px-2 py-1 text-xs text-red-400 hover:underline">Remove</button>
                     </td>`;
+                row.querySelector('.act-target-fleet').addEventListener('click', () => { selectedNodes.clear(); syncSelectionUI(); selectTarget(name, 'fleet'); switchMainView('view-editor'); });
                 row.querySelector('.act-select').addEventListener('click', () => selectFleetNodes(name));
                 const rm = row.querySelector('.act-remove');
-                if (name === 'DefaultFleet') { rm.disabled = true; rm.className = 'px-2 py-1 text-xs text-ardTextMuted opacity-40 cursor-not-allowed'; rm.title = 'DefaultFleet is built-in'; }
-                else rm.addEventListener('click', () => deleteFleet(name));
+                if (name === 'DefaultFleet' || f.shared) {
+                    rm.disabled = true;
+                    rm.className = 'px-2 py-1 text-xs text-ardTextMuted opacity-40 cursor-not-allowed';
+                    rm.title = f.shared ? 'Shared fleets are owned by a collaborator' : 'DefaultFleet is built-in';
+                } else {
+                    rm.addEventListener('click', () => deleteFleet(name));
+                }
                 fbody.appendChild(row);
             });
 
@@ -3749,11 +4664,14 @@ void loop() {
                 else if (dev.online) statusHtml = '<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>Online (cloud)</span>';
                 else statusHtml = '<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-medium bg-gray-500/10 text-gray-400 border border-gray-500/20"><span class="w-1.5 h-1.5 rounded-full bg-gray-500"></span>Offline</span>';
 
+                const sharedNodeBadge = dev.shared
+                    ? `<div class="text-[10px] font-mono text-cyan-300 mt-0.5"><i class="ph-bold ph-clock"></i> Shared by ${escHtml(dev.owner_email)} • ${escHtml(formatDurationRemaining(dev.remaining_sec))}</div>`
+                    : '';
                 const row = document.createElement('tr');
                 row.className = 'hover:bg-ardPanel/50 transition-colors border-b border-ardBorder/50';
                 row.innerHTML = `
                     <td class="p-3 w-8"><input type="checkbox" class="node-cb rounded border-ardBorder" data-dev="${escHtml(devId)}"></td>
-                    <td class="p-3 font-mono font-medium text-white">${escHtml(devId)}</td>
+                    <td class="p-3 font-mono font-medium text-white">${escHtml(devId)}${sharedNodeBadge}</td>
                     <td class="p-3"><span class="font-medium text-ardTextMain">${escHtml(dev.fleet)}</span>
                         <button class="act-reassign ml-1.5 text-ardTextMuted hover:text-ardTeal text-xs" title="Reassign Fleet"><i class="ph-bold ph-pencil-simple"></i></button></td>
                     <td class="p-3 font-mono text-ardTeal font-semibold">Build #${dev.build}</td>
@@ -4649,7 +5567,11 @@ void loop() {
                         if (spinner) spinner.classList.add('hidden');
 
                         if (!isInitialLoad) {
-                            logToOutput(`[Auth] Google Authentication successful! Welcome, ${data.user.email || 'User'}.`);
+                            logToOutput(`[Auth] Google Authentication successful! Welcome, ${data.user.email || 'User'}. Recovering your active nodes and fleets...`);
+                            syncAccountNodesNow(true);
+                        } else {
+                            loadCollabState();
+                            refreshLiveNow();
                         }
                     } else if (isInitialLoad) {
                         const overlay = document.getElementById('auth-overlay');
@@ -4701,11 +5623,278 @@ void loop() {
                     const spinner = document.getElementById('auth-spinner');
                     if (spinner) spinner.classList.add('hidden');
 
-                    logToOutput('[Auth] User signed out successfully.');
+                    dropdownSig = '';
+                    dashboardSig = '';
+                    refreshLiveNow();
+                    logToOutput('[Auth] User signed out and cloud state synced.');
                 })
                 .catch(err => {
                     alert('Error signing out: ' + err);
                 });
+        }
+
+        // --- ACCOUNT AUTO-RECOVERY & COLLABORATIVE ACCESS JS ---
+        function openCollabSection() {
+            switchMainView('view-fleets');
+            loadCollabState();
+            const el = document.getElementById('collab-section');
+            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+
+        function syncAccountNodesNow(silent = false) {
+            if (!silent) logToOutput('[Account Sync] Recovering active nodes, fleets, and shared access from your account...');
+            fetch('/api/account/recover', { method: 'POST' })
+                .then(r => r.json())
+                .then(res => {
+                    if (res.success) {
+                        dropdownSig = '';
+                        dashboardSig = '';
+                        refreshLiveNow();
+                        loadCollabState();
+                    } else if (!silent && res.error) {
+                        alert(res.error);
+                    }
+                })
+                .catch(err => {
+                    if (!silent) logToOutput('[Account Sync] [ERROR] ' + err);
+                });
+        }
+
+        function onCollabScopeChange() {
+            const scope = document.getElementById('collab_scope_type').value;
+            const row = document.getElementById('collab_target_row');
+            const label = document.getElementById('collab_target_label');
+            const input = document.getElementById('collab_target_id');
+            if (scope === 'all') {
+                row.classList.add('hidden');
+                input.value = '*';
+            } else {
+                row.classList.remove('hidden');
+                if (scope === 'fleet') {
+                    label.innerText = 'Target Fleet Name';
+                    if (input.value === '*' || !input.value) input.value = 'DefaultFleet';
+                } else {
+                    label.innerText = 'Target Node / Device ID';
+                    if (input.value === '*' || input.value === 'DefaultFleet') input.value = 'node_1';
+                }
+            }
+        }
+
+        function lookupOwnerCatalog() {
+            const email = (document.getElementById('collab_owner_email').value || '').trim();
+            const hint = document.getElementById('collab_catalog_hint');
+            const datalist = document.getElementById('collab_target_suggestions');
+            if (!email) return alert("Enter the owner's Google email first.");
+            fetch('/api/collab/catalog?owner_email=' + encodeURIComponent(email))
+                .then(r => r.json())
+                .then(res => {
+                    hint.classList.remove('hidden');
+                    datalist.innerHTML = '';
+                    if (res.success && res.catalog) {
+                        const fleets = res.catalog.fleets || [];
+                        const nodes = res.catalog.nodes || [];
+                        hint.className = 'text-[10px] text-emerald-400 mt-1 font-mono';
+                        hint.innerText = `Found ${fleets.length} fleet(s) and ${nodes.length} node(s) for ${email}.`;
+                        fleets.forEach(f => {
+                            const opt = document.createElement('option');
+                            opt.value = f;
+                            opt.label = `Fleet: ${f}`;
+                            datalist.appendChild(opt);
+                        });
+                        nodes.forEach(n => {
+                            const opt = document.createElement('option');
+                            opt.value = n.id;
+                            opt.label = `Node: ${n.id} (${n.fleet})`;
+                            datalist.appendChild(opt);
+                        });
+                    } else {
+                        hint.className = 'text-[10px] text-amber-300 mt-1';
+                        hint.innerText = res.error || 'Could not fetch catalog; enter target name manually.';
+                    }
+                })
+                .catch(err => {
+                    hint.classList.remove('hidden');
+                    hint.className = 'text-[10px] text-red-400 mt-1';
+                    hint.innerText = 'Lookup error: ' + err;
+                });
+        }
+
+        function sendCollabAccessRequest() {
+            const ownerEmail = (document.getElementById('collab_owner_email').value || '').trim();
+            const scopeType = document.getElementById('collab_scope_type').value;
+            const targetId = scopeType === 'all' ? '*' : (document.getElementById('collab_target_id').value || '').trim();
+            const durationMin = parseInt(document.getElementById('collab_duration_min').value, 10) || 60;
+            const note = (document.getElementById('collab_note').value || '').trim();
+
+            if (!ownerEmail) return alert("Please enter the owner's Google email address.");
+            if (scopeType !== 'all' && !targetId) return alert("Please enter the target Fleet name or Node ID.");
+
+            fetch('/api/collab/request', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    owner_email: ownerEmail,
+                    scope_type: scopeType,
+                    target_id: targetId,
+                    duration_min: durationMin,
+                    note: note
+                })
+            })
+            .then(r => r.json())
+            .then(res => {
+                if (res.error) {
+                    alert(res.error);
+                    return;
+                }
+                document.getElementById('collab_note').value = '';
+                loadCollabState();
+                refreshLiveNow();
+            })
+            .catch(err => alert('Error sending request: ' + err));
+        }
+
+        function respondCollabRequest(requestId, decision) {
+            const sel = document.getElementById('dur_sel_' + requestId);
+            let durationMin = sel ? parseInt(sel.value, 10) : 60;
+            if (sel && sel.value === 'custom') {
+                const customStr = prompt('Enter assigned permission duration in minutes:', '90');
+                if (!customStr) return;
+                durationMin = parseInt(customStr.trim(), 10);
+                if (isNaN(durationMin) || durationMin <= 0) return alert('Please enter a valid number of minutes.');
+            }
+            fetch('/api/collab/respond', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    request_id: requestId,
+                    decision: decision,
+                    duration_min: durationMin
+                })
+            })
+            .then(r => r.json())
+            .then(res => {
+                if (res.error) return alert(res.error);
+                dropdownSig = '';
+                dashboardSig = '';
+                loadCollabState();
+                refreshLiveNow();
+            });
+        }
+
+        function revokeCollabGrant(grantId) {
+            if (!confirm('Revoke this collaborator permission immediately?')) return;
+            fetch('/api/collab/revoke', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({grant_id: grantId})
+            })
+            .then(r => r.json())
+            .then(res => {
+                if (res.error) return alert(res.error);
+                dropdownSig = '';
+                dashboardSig = '';
+                loadCollabState();
+                refreshLiveNow();
+            });
+        }
+
+        function extendCollabGrant(grantId, addMinutes) {
+            fetch('/api/collab/extend', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({grant_id: grantId, add_minutes: addMinutes})
+            })
+            .then(r => r.json())
+            .then(res => {
+                if (res.error) return alert(res.error);
+                loadCollabState();
+                refreshLiveNow();
+            });
+        }
+
+        function loadCollabState() {
+            fetch('/api/collab/state')
+                .then(r => r.json())
+                .then(renderCollabState)
+                .catch(() => {});
+        }
+
+        function renderCollabState(state) {
+            const inList = document.getElementById('collab-incoming-list');
+            const badge = document.getElementById('incoming-req-badge');
+            const myGrantsList = document.getElementById('collab-my-grants-list');
+            const sharedList = document.getElementById('collab-shared-with-me-list');
+            if (!inList || !myGrantsList || !sharedList) return;
+
+            const incoming = (state.incoming_requests || []).filter(r => r.status === 'pending');
+            if (badge) badge.innerText = `${incoming.length} Pending`;
+
+            if (incoming.length === 0) {
+                inList.innerHTML = '<div class="text-ardTextMuted text-xs py-2 text-center">No pending permission requests.</div>';
+            } else {
+                inList.innerHTML = incoming.map(r => {
+                    const reqMin = parseInt(r.requested_duration_min, 10) || 60;
+                    const presets = [15, 30, 60, 120, 240, 480, 1440, 10080];
+                    const opts = presets.map(m => {
+                        const lbl = m < 60 ? `${m}m` : (m < 1440 ? `${m/60}h` : `${m/1440}d`);
+                        return `<option value="${m}" ${m === reqMin ? 'selected' : ''}>Permit ${lbl}</option>`;
+                    }).join('') + `<option value="custom">Custom mins...</option>`;
+                    return `
+                        <div class="p-2.5 rounded-lg bg-ardCard border border-amber-500/30 flex flex-wrap items-center justify-between gap-2">
+                            <div class="min-w-0">
+                                <div class="font-semibold text-white truncate">${escHtml(r.requester_email)} <span class="text-amber-300 font-mono text-[11px]">→ ${escHtml(r.scope_type.toUpperCase())}: ${escHtml(r.target_id)}</span></div>
+                                <div class="text-[11px] text-ardTextMuted">Requested: ${reqMin} mins${r.note ? ' • "' + escHtml(r.note) + '"' : ''}</div>
+                            </div>
+                            <div class="flex items-center gap-1.5 flex-shrink-0">
+                                <select id="dur_sel_${escHtml(r.request_id)}" class="flat-input text-[11px] py-1 px-2 rounded text-white font-mono">${opts}</select>
+                                <button onclick="respondCollabRequest('${escHtml(r.request_id)}', 'approve')" class="px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 font-semibold text-[11px]">Permit</button>
+                                <button onclick="respondCollabRequest('${escHtml(r.request_id)}', 'deny')" class="px-2 py-1 rounded bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30 text-[11px]">Deny</button>
+                            </div>
+                        </div>`;
+                }).join('');
+            }
+
+            const activeGrants = (state.my_grants || []).filter(g => g.status === 'approved' && g.remaining_sec > 0);
+            if (activeGrants.length === 0) {
+                myGrantsList.innerHTML = '<div class="text-ardTextMuted text-xs py-2 text-center">No active permissions granted right now.</div>';
+            } else {
+                myGrantsList.innerHTML = activeGrants.map(g => `
+                    <div class="p-2.5 rounded-lg bg-ardCard border border-ardBorder flex flex-wrap items-center justify-between gap-2">
+                        <div class="min-w-0">
+                            <div class="font-semibold text-white truncate">${escHtml(g.grantee_email)} <span class="text-ardTeal font-mono text-[11px]">(${escHtml(g.scope_type)}: ${escHtml(g.target_id)})</span></div>
+                            <div class="text-[11px] text-emerald-400 font-mono"><i class="ph-bold ph-timer"></i> ${escHtml(formatDurationRemaining(g.remaining_sec))}</div>
+                        </div>
+                        <div class="flex items-center gap-1.5 flex-shrink-0">
+                            <button onclick="extendCollabGrant('${escHtml(g.grant_id)}', 30)" class="px-2 py-1 rounded bg-ardPanel hover:bg-ardHover border border-ardBorder text-cyan-300 text-[11px] font-mono">+30m</button>
+                            <button onclick="revokeCollabGrant('${escHtml(g.grant_id)}')" class="px-2.5 py-1 rounded bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30 text-[11px]">Revoke</button>
+                        </div>
+                    </div>`).join('');
+            }
+
+            const sharedActive = (state.shared_with_me || []).filter(g => g.status === 'approved' && g.remaining_sec > 0);
+            const outgoing = (state.outgoing_requests || []).slice(0, 6);
+            if (sharedActive.length === 0 && outgoing.length === 0) {
+                sharedList.innerHTML = '<div class="text-ardTextMuted text-xs py-2 text-center">No shared nodes/fleets or outgoing requests yet.</div>';
+            } else {
+                const sharedHtml = sharedActive.map(g => `
+                    <div class="p-2.5 rounded-lg bg-cyan-500/10 border border-cyan-500/30 flex flex-wrap items-center justify-between gap-2">
+                        <div class="min-w-0">
+                            <div class="font-semibold text-white truncate">Owner: ${escHtml(g.owner_email)} <span class="text-cyan-300 font-mono text-[11px]">(${escHtml(g.scope_type)}: ${escHtml(g.target_id)})</span></div>
+                            <div class="text-[11px] text-cyan-300 font-mono"><i class="ph-bold ph-clock"></i> Active • ${escHtml(formatDurationRemaining(g.remaining_sec))}</div>
+                        </div>
+                        <button onclick="switchMainView('view-editor')" class="px-2.5 py-1 rounded bg-ardTeal text-white font-semibold text-[11px]">Open in IDE</button>
+                    </div>`).join('');
+                const outHtml = outgoing.map(r => {
+                    const st = (r.status || 'pending').toUpperCase();
+                    const tone = st === 'APPROVED' ? 'text-emerald-400' : (st === 'PENDING' ? 'text-amber-300' : 'text-red-400');
+                    return `
+                        <div class="p-2 rounded-lg bg-ardCard border border-ardBorder flex items-center justify-between gap-2 text-[11px]">
+                            <span class="text-ardTextMain truncate">To <span class="text-white font-mono">${escHtml(r.owner_email)}</span> → ${escHtml(r.scope_type)}: <span class="font-mono text-ardTeal">${escHtml(r.target_id)}</span> (${r.requested_duration_min}m)</span>
+                            <span class="font-mono font-semibold ${tone}">${escHtml(st)}</span>
+                        </div>`;
+                }).join('');
+                sharedList.innerHTML = sharedHtml + outHtml;
+            }
         }
         
     </script>
@@ -4896,6 +6085,12 @@ def auth_callback():
         except Exception:
             pass
 
+    # Recover user's active nodes, fleets, and permissions from Cloud/Vault before finalizing sign-in
+    try:
+        recover_account_state_from_cloud(google_sub=google_sub, email=email, id_token=id_token, clear_previous_if_different=True)
+    except Exception as e:
+        print(f"[Auth Callback Recovery] {e}")
+
     # Save to database
     db.set_user_profile(
         google_sub=google_sub,
@@ -4903,6 +6098,7 @@ def auth_callback():
         id_token=id_token,
         picture=picture
     )
+    threading.Thread(target=sync_account_to_cloud, kwargs={"force": True}, daemon=True).start()
 
     return render_template_string(AUTH_CALLBACK_HTML, success=True, email=email or "User")
 
@@ -4918,7 +6114,14 @@ def auth_status():
 
 @app.route('/api/auth/signout', methods=['POST', 'GET'])
 def auth_signout():
-    db.clear_user_profile()
+    # Flush current user's nodes & fleets to Cloud/Vault before clearing local session
+    try:
+        sync_account_to_cloud(force=True)
+    except Exception:
+        pass
+    db.reset_workspace_for_account_switch()
+    with LAN_NODES_LOCK:
+        LAN_NODES.clear()
     return jsonify({"success": True, "status": False, "authenticated": False, "message": "Signed out successfully"})
 
 @app.route('/api/setup_status')
@@ -5070,6 +6273,19 @@ def api_manifest():
                                          current_build=reported_build)
 
     target_build, firmware_url = db.get_target_build(fleet_id, device_id)
+    # Also check if this device belongs to an active shared grant hosted on this Studio instance
+    if device_id and not db.get_device(device_id):
+        for g in db.get_active_shared_grants():
+            s_dev = (g.get("devices") or {}).get(device_id)
+            if isinstance(s_dev, dict):
+                if s_dev.get("custom_build_override") is not None:
+                    target_build = int(s_dev["custom_build_override"])
+                    firmware_url = s_dev.get("custom_firmware_url") or ""
+                else:
+                    s_fl = (g.get("manifest") or {}).get(s_dev.get("fleet", fleet_id), {})
+                    target_build = int(s_fl.get("target_build", target_build))
+                    firmware_url = s_fl.get("firmware_url") or firmware_url
+                break
     firmware_url = refresh_presigned_url(firmware_url)
 
     return jsonify({"target_build": int(target_build), "download_url": firmware_url or ""})
@@ -5120,8 +6336,24 @@ def reassign_fleet_route():
     new_fleet = data.get('new_fleet')
     if not device_id or not new_fleet:
         return jsonify({"error": "Missing device_id or new_fleet"}), 400
-    
-    db.reassign_fleet(device_id, new_fleet)
+
+    if db.get_device(device_id):
+        db.reassign_fleet(device_id, new_fleet)
+    else:
+        # Check if device is in an active shared grant
+        matched_grant = None
+        for g in db.get_active_shared_grants():
+            if device_id in (g.get("devices") or {}):
+                matched_grant = g
+                break
+        if not matched_grant:
+            return jsonify({"error": f"No active permission to modify node '{device_id}'."}), 403
+        push_shared_mutation_to_owner(matched_grant, {
+            "type": "reassign_fleet",
+            "device_id": device_id,
+            "new_fleet": new_fleet
+        })
+
     msg = f"[System] Reassigned node '{device_id}' to fleet '{new_fleet}'."
     emit_ui_log(msg)
     return jsonify({"success": True, "device_id": device_id, "new_fleet": new_fleet})
@@ -5137,12 +6369,29 @@ def device_override_route():
     if not device_id:
         return jsonify({"error": "Missing device_id"}), 400
 
-    if clear or build_num is None:
-        db.clear_node_override(device_id)
-        msg = f"[System] Cleared custom build override for node '{device_id}'."
+    if db.get_device(device_id):
+        if clear or build_num is None:
+            db.clear_node_override(device_id)
+            msg = f"[System] Cleared custom build override for node '{device_id}'."
+        else:
+            db.set_node_override(device_id, int(build_num), firmware_url)
+            msg = f"[System] Set custom override on node '{device_id}': build #{build_num}."
     else:
-        db.set_node_override(device_id, int(build_num), firmware_url)
-        msg = f"[System] Set custom override on node '{device_id}': build #{build_num}."
+        matched_grant = None
+        for g in db.get_active_shared_grants():
+            if device_id in (g.get("devices") or {}):
+                matched_grant = g
+                break
+        if not matched_grant:
+            return jsonify({"error": f"No active permission to override node '{device_id}'."}), 403
+        push_shared_mutation_to_owner(matched_grant, {
+            "type": "override_node",
+            "device_id": device_id,
+            "clear": bool(clear or build_num is None),
+            "build_num": int(build_num) if build_num is not None else None,
+            "firmware_url": firmware_url
+        })
+        msg = f"[Collab] Updated build override on shared node '{device_id}'."
 
     emit_ui_log(msg)
     return jsonify({"success": True, "device_id": device_id})
@@ -5590,33 +6839,83 @@ def parse_id_list(raw):
     return []
 
 def deploy_to_targets(binary_bytes, fleet=None, device_ids=None, target_build=None):
-    """Publishes a firmware image to a fleet or to specific nodes, then nudges LAN nodes to update immediately."""
+    """Publishes a firmware image to own or time-bound shared fleets/nodes, then nudges LAN nodes immediately."""
     err = validate_firmware_image(binary_bytes)
     if err:
         raise ValueError(err)
     snapshot = db.get_all()
-    registry = snapshot.get("devices", {})
+    own_registry = snapshot.get("devices", {})
+    all_accessible = db.get_all_accessible_devices()
+    active_grants = db.get_active_shared_grants()
 
     if device_ids:
-        ids = [d for d in dict.fromkeys(device_ids) if d in registry]
+        ids = [d for d in dict.fromkeys(device_ids) if d in all_accessible]
         if not ids:
-            raise ValueError("None of the selected nodes exist in the database.")
-        needed = [int(registry[d].get("current_build", 100)) + 1 for d in ids]
-        needed += [db.get_next_build_number(f) for f in {registry[d].get("fleet", "DefaultFleet") for d in ids}]
+            raise ValueError("None of the selected nodes exist or your shared access permission has expired.")
+        own_ids = [d for d in ids if d in own_registry]
+        shared_ids = [d for d in ids if d not in own_registry]
+
+        needed = [int(all_accessible[d].get("current_build", 100)) + 1 for d in ids]
+        needed += [db.get_next_build_number(f) for f in {all_accessible[d].get("fleet", "DefaultFleet") for d in ids}]
         build = int(target_build) if target_build else max(needed)
-        url = upload_firmware_to_cloud(registry[ids[0]].get("fleet", "DefaultFleet"), binary_bytes, build)
-        for d in ids:
+        first_fleet = all_accessible[ids[0]].get("fleet", "DefaultFleet")
+        url = upload_firmware_to_cloud(first_fleet, binary_bytes, build)
+
+        for d in own_ids:
             db.set_node_override(d, build, url)
+
+        if shared_ids:
+            # Group shared nodes by grant_id and push mutation to owner
+            by_grant = {}
+            for d in shared_ids:
+                gid = all_accessible[d].get("grant_id")
+                by_grant.setdefault(gid, []).append(d)
+            for gid, g_devs in by_grant.items():
+                grant = next((g for g in active_grants if g.get("grant_id") == gid), None)
+                if not grant:
+                    raise ValueError(f"Shared permission for {', '.join(g_devs)} has expired.")
+                push_shared_mutation_to_owner(grant, {
+                    "type": "deploy_nodes",
+                    "device_ids": g_devs,
+                    "target_build": build,
+                    "firmware_url": url
+                })
+
         nudged = nudge_devices(device_ids=ids)
         label = f"{len(ids)} selected node(s): {', '.join(ids)}"
     else:
         fleet = fleet or "DefaultFleet"
-        build = int(target_build) if target_build else db.get_next_build_number(fleet)
-        url = upload_firmware_to_cloud(fleet, binary_bytes, build)
-        db.set_fleet_target_build(fleet, build, url)
-        nudged = nudge_devices(fleet=fleet)
-        label = f"Entire fleet '{fleet}'"
+        own_has_fleet = (fleet in (snapshot.get("manifest") or {})) or any(d.get("fleet") == fleet for d in own_registry.values())
+        shared_grant = None
+        for g in active_grants:
+            if fleet in (g.get("manifest") or {}) or (g.get("scope_type") == "all") or (g.get("scope_type") == "fleet" and g.get("target_id") == fleet):
+                shared_grant = g
+                break
 
+        if shared_grant and not own_has_fleet:
+            s_fl = (shared_grant.get("manifest") or {}).get(fleet, {})
+            s_builds = [int(s_fl.get("target_build", 100))] + [
+                int(d.get("current_build", 100)) for d in (shared_grant.get("devices") or {}).values()
+                if isinstance(d, dict) and d.get("fleet") == fleet
+            ]
+            build = int(target_build) if target_build else max(max(s_builds) + 1, 101)
+            url = upload_firmware_to_cloud(fleet, binary_bytes, build)
+            push_shared_mutation_to_owner(shared_grant, {
+                "type": "deploy_fleet",
+                "fleet": fleet,
+                "target_build": build,
+                "firmware_url": url
+            })
+            nudged = nudge_devices(fleet=fleet)
+            label = f"Shared fleet '{fleet}' (owner: {shared_grant.get('owner_email')})"
+        else:
+            build = int(target_build) if target_build else db.get_next_build_number(fleet)
+            url = upload_firmware_to_cloud(fleet, binary_bytes, build)
+            db.set_fleet_target_build(fleet, build, url)
+            nudged = nudge_devices(fleet=fleet)
+            label = f"Entire fleet '{fleet}'"
+
+    threading.Thread(target=sync_account_to_cloud, kwargs={"force": True}, daemon=True).start()
     poll = int(prefs.get("poll_seconds", 30) or 0)
     lines = [f"🎉 SUCCESS! Deployed build #{build} to {label}."]
     if url.startswith("http://"):
@@ -5729,6 +7028,310 @@ def prefs_route():
 @app.route('/api/live', methods=['GET'])
 def live_route():
     return jsonify(compute_live())
+
+# --- ACCOUNT RECOVERY & COLLABORATIVE ACCESS ROUTES ---
+@app.route('/api/account/recover', methods=['POST'])
+def account_recover_route():
+    prof = db.get_user_profile()
+    sub = prof.get("google_sub", "")
+    email = prof.get("email", "")
+    token = prof.get("id_token", "")
+    if not sub and not email:
+        return jsonify({"success": False, "error": "Please sign in with Google first."}), 400
+    res = recover_account_state_from_cloud(sub, email, token, clear_previous_if_different=False)
+    return jsonify({"success": True, **res, "live": compute_live()})
+
+@app.route('/api/collab/state', methods=['GET'])
+def collab_state_route():
+    poll_collaboration_updates()
+    now = time.time()
+    snap = db.get_all()
+    prof = snap.get("user_profile", {})
+
+    incoming = []
+    for r in snap.get("access_requests", []):
+        if isinstance(r, dict):
+            incoming.append(dict(r))
+    incoming.sort(key=lambda x: float(x.get("created_at", 0) or 0), reverse=True)
+
+    outgoing = []
+    for r in snap.get("outgoing_requests", []):
+        if isinstance(r, dict):
+            rc = dict(r)
+            exp = float(rc.get("expires_at", 0) or 0)
+            rc["remaining_sec"] = max(0, int(exp - now)) if exp > now else 0
+            outgoing.append(rc)
+    outgoing.sort(key=lambda x: float(x.get("created_at", 0) or 0), reverse=True)
+
+    grants = []
+    for g in snap.get("access_grants", []):
+        if isinstance(g, dict):
+            gc = dict(g)
+            exp = float(gc.get("expires_at", 0) or 0)
+            gc["remaining_sec"] = max(0, int(exp - now)) if exp > now else 0
+            if gc.get("status") == "approved" and exp <= now:
+                gc["status"] = "expired"
+            grants.append(gc)
+    grants.sort(key=lambda x: float(x.get("granted_at", 0) or 0), reverse=True)
+
+    shared_with_me = []
+    for g in snap.get("shared_with_me", []):
+        if isinstance(g, dict):
+            gc = dict(g)
+            exp = float(gc.get("expires_at", 0) or 0)
+            gc["remaining_sec"] = max(0, int(exp - now)) if exp > now else 0
+            if gc.get("status") == "approved" and exp <= now:
+                gc["status"] = "expired"
+            shared_with_me.append(gc)
+    shared_with_me.sort(key=lambda x: float(x.get("granted_at", 0) or 0), reverse=True)
+
+    return jsonify({
+        "my_email": prof.get("email", ""),
+        "incoming_requests": incoming,
+        "outgoing_requests": outgoing,
+        "my_grants": grants,
+        "shared_with_me": shared_with_me,
+        "now": now
+    })
+
+@app.route('/api/collab/catalog', methods=['GET'])
+def collab_catalog_route():
+    owner_email = normalize_email(request.args.get('owner_email', ''))
+    if not owner_email:
+        return jsonify({"error": "Enter the owner's Google email address first."}), 400
+    o_ekey = email_storage_key(owner_email)
+    box = cloud_store_read_json(f"{o_ekey}_collab")
+    if isinstance(box, dict) and isinstance(box.get("public_catalog"), dict):
+        return jsonify({"success": True, "owner_email": owner_email, "catalog": box["public_catalog"]})
+
+    # Fallback: read owner's primary email slot if available
+    owner_db = cloud_store_read_json(o_ekey)
+    if isinstance(owner_db, dict):
+        fleets = list((owner_db.get("manifest") or {}).keys())
+        nodes = [
+            {"id": did, "fleet": d.get("fleet", "DefaultFleet"), "build": int(d.get("current_build", 100))}
+            for did, d in (owner_db.get("devices") or {}).items() if isinstance(d, dict)
+        ]
+        return jsonify({"success": True, "owner_email": owner_email, "catalog": {"fleets": fleets, "nodes": nodes}})
+
+    return jsonify({
+        "success": False,
+        "error": f"No published fleet catalog found yet for '{owner_email}'. You can still type the Fleet or Node ID manually and send the request."
+    })
+
+@app.route('/api/collab/request', methods=['POST'])
+def collab_request_route():
+    data = request.json or {}
+    prof = db.get_user_profile()
+    requester_email = normalize_email(prof.get("email") or data.get("requester_email"))
+    requester_sub = (prof.get("google_sub") or "").strip()
+    if not requester_email:
+        return jsonify({"error": "Please sign in with Google before requesting access to another user's nodes."}), 400
+
+    owner_email = normalize_email(data.get("owner_email"))
+    if not owner_email:
+        return jsonify({"error": "Owner's Google email is required."}), 400
+    if owner_email == requester_email:
+        return jsonify({"error": "You already own the nodes on your account."}), 400
+
+    scope_type = str(data.get("scope_type") or "all").strip().lower()
+    if scope_type not in ("all", "fleet", "node"):
+        scope_type = "all"
+    target_id = "*" if scope_type == "all" else str(data.get("target_id") or "").strip()
+    if not target_id:
+        return jsonify({"error": f"Please specify the target {scope_type} name/ID."}), 400
+
+    try:
+        duration_min = max(1, min(43200, int(data.get("duration_min", 60))))
+    except Exception:
+        duration_min = 60
+
+    note = str(data.get("note") or "").strip()[:240]
+    now = time.time()
+    req_obj = {
+        "request_id": f"req_{secrets.token_hex(6)}",
+        "requester_email": requester_email,
+        "requester_sub": requester_sub,
+        "owner_email": owner_email,
+        "scope_type": scope_type,
+        "target_id": target_id,
+        "requested_duration_min": duration_min,
+        "note": note,
+        "status": "pending",
+        "created_at": now,
+        "approved_duration_min": None,
+        "expires_at": None
+    }
+
+    # Save to owner's collaboration mailbox in Cloud & Vault
+    o_ekey = email_storage_key(owner_email)
+    collab_slot = f"{o_ekey}_collab"
+    box = cloud_store_read_json(collab_slot) or {
+        "owner_email": owner_email,
+        "owner_sub": "",
+        "updated_at": now,
+        "public_catalog": {"fleets": [], "nodes": []},
+        "inbox_requests": [],
+        "active_grants": [],
+        "shared_mutations": []
+    }
+    box.setdefault("inbox_requests", []).append(req_obj)
+    box["updated_at"] = now
+    cloud_store_write_json(collab_slot, box)
+
+    # Save in requester's outgoing_requests
+    with db.lock:
+        db._data.setdefault("outgoing_requests", []).append(req_obj)
+    db.save(sync_cloud=True)
+    threading.Thread(target=sync_account_to_cloud, kwargs={"force": True}, daemon=True).start()
+    broadcast_lan_collab({"target_email": owner_email, "event": "access_request"})
+
+    msg = f"[Collab] Sent permission request to {owner_email} for {scope_type}: '{target_id}' ({duration_min} mins)."
+    emit_ui_log(msg)
+    return jsonify({"success": True, "request": req_obj, "message": msg})
+
+@app.route('/api/collab/respond', methods=['POST'])
+def collab_respond_route():
+    data = request.json or {}
+    request_id = str(data.get("request_id") or "").strip()
+    decision = str(data.get("decision") or "").strip().lower()
+    if not request_id or decision not in ("approve", "deny"):
+        return jsonify({"error": "Invalid request_id or decision."}), 400
+
+    try:
+        assigned_duration_min = max(1, min(43200, int(data.get("duration_min", 60))))
+    except Exception:
+        assigned_duration_min = 60
+
+    now = time.time()
+    prof = db.get_user_profile()
+    my_email = normalize_email(prof.get("email"))
+    my_sub = (prof.get("google_sub") or "").strip()
+
+    target_req = None
+    grant_obj = None
+    with db.lock:
+        for r in db._data.get("access_requests", []):
+            if isinstance(r, dict) and r.get("request_id") == request_id:
+                target_req = r
+                break
+        if not target_req:
+            return jsonify({"error": "Permission request not found."}), 404
+
+        if decision == "deny":
+            target_req["status"] = "denied"
+            target_req["responded_at"] = now
+        else:
+            expires_at = now + (assigned_duration_min * 60)
+            target_req["status"] = "approved"
+            target_req["approved_duration_min"] = assigned_duration_min
+            target_req["granted_at"] = now
+            target_req["expires_at"] = expires_at
+            target_req["responded_at"] = now
+
+            pm, pd = build_owner_grant_snapshot(db._data, target_req.get("scope_type", "all"), target_req.get("target_id", "*"))
+            grant_obj = {
+                "grant_id": f"grant_{secrets.token_hex(6)}",
+                "request_id": request_id,
+                "owner_email": my_email or target_req.get("owner_email", ""),
+                "owner_sub": my_sub,
+                "owner_url": NGROK_URL,
+                "grantee_email": normalize_email(target_req.get("requester_email")),
+                "grantee_sub": target_req.get("requester_sub", ""),
+                "scope_type": target_req.get("scope_type", "all"),
+                "target_id": target_req.get("target_id", "*"),
+                "duration_min": assigned_duration_min,
+                "granted_at": now,
+                "expires_at": expires_at,
+                "status": "approved",
+                "manifest": pm,
+                "devices": pd
+            }
+            db._data.setdefault("access_grants", []).append(grant_obj)
+
+    db.save(sync_cloud=True)
+    sync_account_to_cloud(force=True)
+
+    requester_email = normalize_email(target_req.get("requester_email"))
+    broadcast_lan_collab({"target_email": requester_email, "event": "request_responded"})
+
+    if decision == "approve":
+        msg = f"✅ [Collab] Permitted {requester_email} to access {target_req.get('scope_type')} '{target_req.get('target_id')}' for {assigned_duration_min} minute(s)."
+    else:
+        msg = f"🚫 [Collab] Denied access request from {requester_email} for '{target_req.get('target_id')}'."
+    emit_ui_log(msg)
+    return jsonify({"success": True, "request": target_req, "grant": grant_obj, "message": msg})
+
+@app.route('/api/collab/revoke', methods=['POST'])
+def collab_revoke_route():
+    data = request.json or {}
+    grant_id = str(data.get("grant_id") or "").strip()
+    if not grant_id:
+        return jsonify({"error": "Missing grant_id"}), 400
+
+    now = time.time()
+    grantee_email = ""
+    target_id = ""
+    with db.lock:
+        for g in db._data.get("access_grants", []):
+            if isinstance(g, dict) and g.get("grant_id") == grant_id:
+                g["status"] = "revoked"
+                g["expires_at"] = now
+                grantee_email = normalize_email(g.get("grantee_email"))
+                target_id = g.get("target_id", "*")
+                req_id = g.get("request_id")
+                for r in db._data.get("access_requests", []):
+                    if isinstance(r, dict) and r.get("request_id") == req_id:
+                        r["status"] = "revoked"
+                        r["expires_at"] = now
+                break
+
+    if not grantee_email:
+        return jsonify({"error": "Grant not found"}), 404
+
+    db.save(sync_cloud=True)
+    sync_account_to_cloud(force=True)
+    broadcast_lan_collab({"target_email": grantee_email, "event": "grant_revoked"})
+
+    msg = f"🔒 [Collab] Revoked {grantee_email}'s access to '{target_id}'."
+    emit_ui_log(msg)
+    return jsonify({"success": True, "message": msg})
+
+@app.route('/api/collab/extend', methods=['POST'])
+def collab_extend_route():
+    data = request.json or {}
+    grant_id = str(data.get("grant_id") or "").strip()
+    try:
+        add_min = max(1, min(10080, int(data.get("add_minutes", 30))))
+    except Exception:
+        add_min = 30
+
+    now = time.time()
+    grantee_email = ""
+    target_id = ""
+    new_exp = 0
+    with db.lock:
+        for g in db._data.get("access_grants", []):
+            if isinstance(g, dict) and g.get("grant_id") == grant_id:
+                base_exp = max(now, float(g.get("expires_at", 0) or 0))
+                new_exp = base_exp + (add_min * 60)
+                g["expires_at"] = new_exp
+                g["status"] = "approved"
+                g["duration_min"] = int(g.get("duration_min", 0) or 0) + add_min
+                grantee_email = normalize_email(g.get("grantee_email"))
+                target_id = g.get("target_id", "*")
+                break
+
+    if not grantee_email:
+        return jsonify({"error": "Grant not found"}), 404
+
+    db.save(sync_cloud=True)
+    sync_account_to_cloud(force=True)
+    broadcast_lan_collab({"target_email": grantee_email, "event": "grant_extended"})
+
+    msg = f"⏱ [Collab] Extended {grantee_email}'s access to '{target_id}' by +{add_min}m."
+    emit_ui_log(msg)
+    return jsonify({"success": True, "expires_at": new_exp, "message": msg})
 
 # --- WIRELESS (LAN) SERIAL MONITOR ---
 @app.route('/api/wserial/connect', methods=['POST'])
@@ -6221,6 +7824,7 @@ if __name__ == '__main__':
     udp_thread = threading.Thread(target=udp_beacon_listener, daemon=True)
     udp_thread.start()
     threading.Thread(target=lan_monitor_thread, daemon=True).start()
+    threading.Thread(target=background_cloud_collab_loop, daemon=True).start()
 
     # Wait until the web server really accepts connections (instead of a blind sleep)
     for _ in range(60):
