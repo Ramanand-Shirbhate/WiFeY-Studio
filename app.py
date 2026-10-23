@@ -80,6 +80,11 @@ for _d in (OUTPUT_DIR, VERIFIED_DIR, LAN_FIRMWARE_DIR, SKETCH_DIR):
 DEFAULT_FQBN = "esp32:esp32:esp32"
 TEMPLATE_VERSION = "2"
 
+def apply_ota_partition(fqbn):
+    """Forces the 'Minimal SPIFFS (Large APPS with OTA)' scheme for all ESP32s."""
+    if "esp32:esp32:" in fqbn and "PartitionScheme" not in fqbn:
+        return fqbn + ":PartitionScheme=min_spiffs"
+    return fqbn
 # --- DATABASE MANAGER (Persistent, Thread-Safe JSON Store) ---
 class DatabaseManager:
     def __init__(self, db_path):
@@ -2760,7 +2765,7 @@ def generate_wrapped_code(ssid, passw, api_url, topic, user_code, build_num=0, d
 def build_firmware_source(data):
     """Returns (code, hash, info)."""
     data = data or {}
-    fqbn = data.get('fqbn', DEFAULT_FQBN)
+    fqbn = apply_ota_partition(data.get('fqbn', DEFAULT_FQBN))
     opts = get_wrapper_options(data)
     code = generate_wrapped_code(data.get('ssid'), data.get('pass'), data.get('api_url'), data.get('topic'),
                                  data.get('code'), build_num=0, opts=opts, fqbn=fqbn)
@@ -6583,7 +6588,7 @@ def warmup_toolchain():
                 code = generate_wrapped_code("", "", "http://127.0.0.1:5050", "", user_code, build_num=0)
                 write_sketch_if_changed(code)
                 res = subprocess.run(
-                    [cli, "compile", "--fqbn", DEFAULT_FQBN, "--build-path", BUILD_CACHE_DIR, "-j", "0", SKETCH_FILE],
+                    [cli, "compile", "--fqbn", apply_ota_partition(DEFAULT_FQBN), "--build-path", BUILD_CACHE_DIR, "-j", "0", SKETCH_FILE],
                     capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
                 if res.returncode == 0:
                     ok = True
@@ -7437,7 +7442,7 @@ def flash_stream_route():
     baud = str(data.get('baud', '115200'))
     fleet_id = (data.get('fleet_id') or 'DefaultFleet').strip() or 'DefaultFleet'
     device_id = (data.get('device_id') or 'node_1').strip() or 'node_1'
-    fqbn = data.get('fqbn', DEFAULT_FQBN)
+    fqbn = apply_ota_partition(data.get('fqbn', DEFAULT_FQBN))
 
     # Automatically generate cryptographically random device_token (dt_ + 16 hex chars)
     device_token = data.get('device_token') or data.get('auth_token')
