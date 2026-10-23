@@ -1152,7 +1152,7 @@ def upload_firmware_to_cloud(fleet_id, binary_bytes, build_num, id_token=None):
     # 1. Cloudflare Worker Gateway (Delegated Auth)
     if WORKER_BASE_URL and token:
         try:
-            worker_upload_url = f"{WORKER_BASE_URL}api/firmware/upload"
+            worker_upload_url = f"{WORKER_BASE_URL}/api/firmware/upload"
             headers = {
                 "Authorization": f"Bearer {token}",
                 "X-Fleet-ID": fleet_id,
