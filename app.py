@@ -21,6 +21,9 @@ import boto3
 from botocore.config import Config
 from dotenv import load_dotenv
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import random
 import ctypes
 import webbrowser
 import hashlib
@@ -67,24 +70,37 @@ DB_PATH = os.path.join(APP_DIR, "wifey_db.json")
 CLOUD_VAULT_DIR = os.path.join(APP_DIR, "cloud_vault")
 os.makedirs(CLOUD_VAULT_DIR, exist_ok=True)
 
-# --- BUILD / FIRMWARE LOCATIONS (one sketch path + one build path = every build reuses the compiled core & libraries) ---
-PREFS_PATH = os.path.join(APP_DIR, "wifey_prefs.json")          # local-only preferences (never synced to the cloud)
-OUTPUT_DIR = os.path.join(BUILD_CACHE_DIR, "output")
-VERIFIED_DIR = os.path.join(BUILD_CACHE_DIR, "verified_bins")    # <source-hash>.bin: verified binaries reused by Deploy
-LAN_FIRMWARE_DIR = os.path.join(BUILD_CACHE_DIR, "lan_firmware") # per-fleet/build copies served to LAN nodes
+# --- BUILD / FIRMWARE LOCATIONS (separated from BUILD_CACHE_DIR so arduino-cli never wipes verified/LAN binaries) ---
+PREFS_PATH = os.path.join(APP_DIR, "wifey_prefs.json")                 # local-only preferences (never synced to the cloud)
+FIRMWARE_STORAGE_DIR = os.path.join(APP_DIR, "firmware_storage")
+OUTPUT_DIR = os.path.join(FIRMWARE_STORAGE_DIR, "output")
+VERIFIED_DIR = os.path.join(FIRMWARE_STORAGE_DIR, "verified_bins")     # <source-hash>.bin: verified binaries reused by Deploy
+LAN_FIRMWARE_DIR = os.path.join(FIRMWARE_STORAGE_DIR, "lan_firmware")  # per-fleet/build copies served to LAN nodes
 SKETCH_DIR = os.path.join(APP_DIR, "sketch_source", "WiFeYSketch")
 
 SKETCH_FILE = os.path.join(SKETCH_DIR, "WiFeYSketch.ino")
-for _d in (OUTPUT_DIR, VERIFIED_DIR, LAN_FIRMWARE_DIR, SKETCH_DIR):
+for _d in (FIRMWARE_STORAGE_DIR, OUTPUT_DIR, VERIFIED_DIR, LAN_FIRMWARE_DIR, SKETCH_DIR):
     os.makedirs(_d, exist_ok=True)
 DEFAULT_FQBN = "esp32:esp32:esp32"
-TEMPLATE_VERSION = "2"
+TEMPLATE_VERSION = "3"
 
 def apply_ota_partition(fqbn):
-    """Forces the 'Minimal SPIFFS (Large APPS with OTA)' scheme for all ESP32s."""
+    """Ensures OTA-compatible partition / flash layout for ESP32, ESP32-CAM, and ESP8266 boards."""
+    fqbn = (fqbn or DEFAULT_FQBN).strip()
     if "esp32:esp32:" in fqbn and "PartitionScheme" not in fqbn:
         return fqbn + ":PartitionScheme=min_spiffs"
+    if "esp8266:esp8266:nodemcuv2" in fqbn and "eesz" not in fqbn:
+        return fqbn + ":eesz=4M2M"
+    if "esp8266:esp8266:generic" in fqbn and "eesz" not in fqbn:
+        return fqbn + ":eesz=1M64"
     return fqbn
+
+def get_board_build_dir(fqbn):
+    """Returns a dedicated build cache directory per board FQBN so switching boards never wipes cached cores."""
+    clean = re.sub(r'[^A-Za-z0-9_.-]', '_', str(fqbn or DEFAULT_FQBN))[:64]
+    path = os.path.join(BUILD_CACHE_DIR, clean)
+    os.makedirs(path, exist_ok=True)
+    return path
 # --- DATABASE MANAGER (Persistent, Thread-Safe JSON Store) ---
 class DatabaseManager:
     def __init__(self, db_path):
@@ -95,6 +111,8 @@ class DatabaseManager:
                 "google_sub": "",
                 "email": "",
                 "id_token": "",
+                "refresh_token": "",
+                "token_expiry": 0,
                 "picture": ""
             },
             "manifest": {},
@@ -128,11 +146,13 @@ class DatabaseManager:
 
             # Ensure user_profile top-level structure
             if "user_profile" not in self._data or not isinstance(self._data["user_profile"], dict):
-                self._data["user_profile"] = {"google_sub": "", "email": "", "id_token": "", "picture": ""}
+                self._data["user_profile"] = {"google_sub": "", "email": "", "id_token": "", "refresh_token": "", "token_expiry": 0, "picture": ""}
             else:
                 self._data["user_profile"].setdefault("google_sub", "")
                 self._data["user_profile"].setdefault("email", "")
                 self._data["user_profile"].setdefault("id_token", "")
+                self._data["user_profile"].setdefault("refresh_token", "")
+                self._data["user_profile"].setdefault("token_expiry", 0)
                 self._data["user_profile"].setdefault("picture", "")
 
             if "manifest" not in self._data or not isinstance(self._data["manifest"], dict):
@@ -214,13 +234,15 @@ class DatabaseManager:
         with self.lock:
             return dict(self._data.get("user_profile", {}))
 
-    def set_user_profile(self, google_sub=None, email=None, id_token=None, picture=None):
+    def set_user_profile(self, google_sub=None, email=None, id_token=None, picture=None, refresh_token=None, token_expiry=None):
         with self.lock:
             prof = self._data.setdefault("user_profile", {})
             if google_sub is not None: prof["google_sub"] = google_sub
             if email is not None: prof["email"] = email
             if id_token is not None: prof["id_token"] = id_token
             if picture is not None: prof["picture"] = picture
+            if refresh_token is not None and refresh_token != "": prof["refresh_token"] = refresh_token
+            if token_expiry is not None: prof["token_expiry"] = float(token_expiry)
         self.save()
 
     def clear_user_profile(self):
@@ -724,33 +746,63 @@ NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN", "")
 
 NGROK_URL = "http://127.0.0.1:5050"
 NGROK_ACTIVE = False
+_NGROK_LOCK = threading.Lock()
 
-if NGROK_STATIC_DOMAIN:
-    try:
-        from pyngrok import ngrok, conf
-        if NGROK_AUTHTOKEN:
-            ngrok.set_auth_token(NGROK_AUTHTOKEN)
-        # Check if already running or connect
-        tunnels = ngrok.get_tunnels()
-        existing = [t for t in tunnels if NGROK_STATIC_DOMAIN in t.public_url]
-        if existing:
-            NGROK_URL = existing[0].public_url
-            NGROK_ACTIVE = True
-        else:
-            try:
-                ngrok_tunnel = ngrok.connect(5050, domain=NGROK_STATIC_DOMAIN, bind_tls=True)
-                NGROK_URL = ngrok_tunnel.public_url
-                NGROK_ACTIVE = True
-            except:
+def ensure_ngrok_tunnel():
+    """Connects or verifies the Ngrok tunnel cleanly, reusing an already-online static domain if active."""
+    global NGROK_URL, NGROK_ACTIVE
+    if not NGROK_STATIC_DOMAIN:
+        NGROK_ACTIVE = False
+        return False
+    with _NGROK_LOCK:
+        # 1. Check if an existing ngrok instance on this PC or another session is already serving the static domain
+        try:
+            probe = requests.get(
+                f"https://{NGROK_STATIC_DOMAIN}/api/setup_status",
+                headers={"ngrok-skip-browser-warning": "true"},
+                timeout=(1.2, 2.0)
+            )
+            if probe.status_code == 200:
                 NGROK_URL = f"https://{NGROK_STATIC_DOMAIN}"
                 NGROK_ACTIVE = True
-    except Exception as e:
-        NGROK_URL = f"https://{NGROK_STATIC_DOMAIN}" if NGROK_STATIC_DOMAIN else "http://127.0.0.1:5050"
+                return True
+        except Exception:
+            pass
+
+        # 2. Otherwise start a local pyngrok tunnel with log_event_callback muted to avoid ERR_NGROK_334 spam
+        try:
+            import logging
+            logging.getLogger("pyngrok").setLevel(logging.CRITICAL)
+            from pyngrok import ngrok, conf
+            pyngrok_cfg = conf.get_default()
+            pyngrok_cfg.log_event_callback = lambda *_a, **_kw: None
+            if NGROK_AUTHTOKEN:
+                ngrok.set_auth_token(NGROK_AUTHTOKEN)
+            tunnels = ngrok.get_tunnels()
+            existing = [t for t in tunnels if NGROK_STATIC_DOMAIN in t.public_url]
+            if existing:
+                NGROK_URL = existing[0].public_url.rstrip('/')
+                NGROK_ACTIVE = True
+                return True
+            ngrok_tunnel = ngrok.connect(5050, domain=NGROK_STATIC_DOMAIN, bind_tls=True)
+            NGROK_URL = ngrok_tunnel.public_url.rstrip('/')
+            NGROK_ACTIVE = True
+            return True
+        except Exception as e:
+            err_str = str(e)
+            if "ERR_NGROK_334" in err_str or "already online" in err_str:
+                NGROK_URL = f"https://{NGROK_STATIC_DOMAIN}"
+                NGROK_ACTIVE = True
+                return True
+            NGROK_ACTIVE = False
+            NGROK_URL = "http://127.0.0.1:5050"
+            return False
+
+ensure_ngrok_tunnel()
 
 app = Flask(__name__)
 
-# --- CLOUDFLARE R2 & WORKER CONFIGURATION ---
-# Cloudflare Worker Gateway & Google OAuth Defaults
+# --- CLOUDFLARE R2, WORKER & RESILIENT HTTP SESSION CONFIGURATION ---
 WORKER_BASE_URL = os.getenv("WORKER_BASE_URL", "https://wifey-gateway.07ramanand.workers.dev/").rstrip('/')
 
 # Split the Client ID for GitHub Push Protection
@@ -765,8 +817,125 @@ R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
 R2_BUCKET = os.getenv("R2_BUCKET", "wifey-firmware")
 OAUTH_STATES = {}
+
+# Persistent connection-pooled HTTP session with automatic retries
+def _build_cloud_session():
+    sess = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=0.5,
+        status_forcelist=(408, 429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=16, pool_maxsize=32)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    return sess
+
+CLOUD_SESSION = _build_cloud_session()
+_TOKEN_REFRESH_LOCK = threading.Lock()
+
+def decode_jwt_exp(token_str):
+    if not token_str or "." not in token_str:
+        return 0
+    try:
+        parts = token_str.split(".")
+        if len(parts) < 2:
+            return 0
+        b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(b64.encode("utf-8")).decode("utf-8"))
+        return float(payload.get("exp", 0) or 0)
+    except Exception:
+        return 0
+
+def get_valid_id_token(explicit_token=None):
+    """Returns a fresh Google ID token, automatically refreshing via refresh_token if expired."""
+    prof = db.get_user_profile()
+    tok = (explicit_token or prof.get("id_token") or "").strip()
+    refresh_tok = (prof.get("refresh_token") or "").strip()
+    if not tok and not refresh_tok:
+        return ""
+    now = time.time()
+    exp = float(prof.get("token_expiry", 0) or 0) or decode_jwt_exp(tok)
+    if tok and (exp == 0 or exp - now > 180):
+        return tok
+    if not refresh_tok or not GOOGLE_CLIENT_ID:
+        return tok
+    with _TOKEN_REFRESH_LOCK:
+        # Re-check after acquiring lock
+        prof = db.get_user_profile()
+        tok2 = (prof.get("id_token") or "").strip()
+        exp2 = float(prof.get("token_expiry", 0) or 0) or decode_jwt_exp(tok2)
+        if tok2 and exp2 - time.time() > 180:
+            return tok2
+        try:
+            payload = {
+                "client_id": GOOGLE_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_tok,
+            }
+            if GOOGLE_CLIENT_SECRET:
+                payload["client_secret"] = GOOGLE_CLIENT_SECRET
+            resp = CLOUD_SESSION.post("https://oauth2.googleapis.com/token", data=payload, timeout=(5.0, 10.0))
+            if resp.ok:
+                tdata = resp.json()
+                new_id_tok = tdata.get("id_token", "")
+                expires_in = int(tdata.get("expires_in", 3600) or 3600)
+                if new_id_tok:
+                    new_exp = time.time() + expires_in
+                    db.set_user_profile(id_token=new_id_tok, token_expiry=new_exp)
+                    return new_id_tok
+        except Exception as e:
+            print(f"[Auth Refresh] Token refresh warning: {e}")
+    return tok
+
+def build_cloud_headers(token=None, extra=None):
+    prof = db.get_user_profile()
+    valid_tok = get_valid_id_token(token)
+    headers = {
+        "User-Agent": "WiFeY-Studio/2.0",
+        "ngrok-skip-browser-warning": "true",
+    }
+    if valid_tok:
+        headers["Authorization"] = f"Bearer {valid_tok}"
+    if prof.get("google_sub"):
+        headers["X-User-Sub"] = str(prof["google_sub"])
+    if prof.get("email"):
+        headers["X-User-Email"] = normalize_email(prof["email"])
+    if extra:
+        headers.update(extra)
+    return headers
+
+def cloud_request(method, url, retries=3, backoff=0.6, timeout=(5.0, 15.0), **kwargs):
+    """Executes an HTTP request against Cloud Worker / OAuth with exponential backoff + jitter."""
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            resp = CLOUD_SESSION.request(method, url, timeout=timeout, **kwargs)
+            if resp.status_code not in (408, 429, 500, 502, 503, 504):
+                return resp
+            last_exc = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:160]}")
+        except requests.RequestException as exc:
+            last_exc = exc
+        if attempt < retries - 1:
+            sleep_s = backoff * (2 ** attempt) + random.uniform(0.05, 0.25)
+            time.sleep(sleep_s)
+    if last_exc:
+        raise last_exc
+    return None
+
 _S3_CLIENT = None
 _S3_LOCK = threading.Lock()
+
+def reset_s3_client():
+    global _S3_CLIENT
+    with _S3_LOCK:
+        _S3_CLIENT = None
+
 def get_s3_client():
     global _S3_CLIENT
     with _S3_LOCK:
@@ -778,9 +947,29 @@ def get_s3_client():
                 endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
                 aws_access_key_id=R2_ACCESS_KEY,
                 aws_secret_access_key=R2_SECRET_KEY,
-                config=Config(signature_version="s3v4")
+                config=Config(
+                    signature_version="s3v4",
+                    connect_timeout=8,
+                    read_timeout=30,
+                    retries={"max_attempts": 4, "mode": "adaptive"},
+                    tcp_keepalive=True,
+                    max_pool_connections=20,
+                )
             )
         return _S3_CLIENT
+
+def s3_operation_with_retry(fn, retries=3):
+    last_err = None
+    for attempt in range(retries):
+        try:
+            s3 = get_s3_client()
+            return fn(s3)
+        except Exception as e:
+            last_err = e
+            reset_s3_client()
+            if attempt < retries - 1:
+                time.sleep(0.5 * (2 ** attempt))
+    raise last_err
 
 client = get_s3_client  # backwards-compatible alias
 
@@ -894,21 +1083,31 @@ def lan_monitor_thread():
             pass
 
 def nudge_devices(device_ids=None, fleet=None):
-    """Tells LAN nodes to check for updates right now (UDP), so they update without waiting or restarting."""
+    """Tells LAN nodes to check for updates right now (UDP), including the active LAN studio server URL."""
     now = time.time()
     with LAN_NODES_LOCK:
-        nodes = [dict(n) for n in LAN_NODES.values() if now - n.get("last_seen", 0) < LAN_ONLINE_SECS * 2]
-    registry = db.get_all().get("devices", {})
+        nodes = [dict(n) for n in LAN_NODES.values() if now - n.get("last_seen", 0) < LAN_ONLINE_SECS * 3]
+    registry = db.get_all_accessible_devices()
+    lan_srv = f"http://{get_local_ip()}:5050"
     sent = 0
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if hasattr(socket, "SO_BROADCAST"):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        except OSError:
+            pass
     try:
         for n in nodes:
             did = n.get("device_id")
             if device_ids is not None and did not in device_ids:
                 continue
-            if fleet is not None and registry.get(did, {}).get("fleet") != fleet:
+            if fleet is not None and registry.get(did, {}).get("fleet", n.get("fleet")) != fleet:
                 continue
-            msg = json.dumps({"cmd": "check_update", "token": n.get("device_token", "")}).encode("utf-8")
+            msg = json.dumps({
+                "cmd": "check_update",
+                "token": n.get("device_token", ""),
+                "server": lan_srv
+            }).encode("utf-8")
             try:
                 sock.sendto(msg, (n["ip"], UDP_PORT))
                 sent += 1
@@ -1143,6 +1342,7 @@ def prune_lan_firmware(keep=16):
 
 def upload_firmware_to_cloud(fleet_id, binary_bytes, build_num, id_token=None):
     build_num = int(build_num)
+    os.makedirs(LAN_FIRMWARE_DIR, exist_ok=True)
     # Always keep a LAN copy (own file per fleet/build, so deploys never overwrite each other)
     lan_name = f"{safe_name(fleet_id)}_build_{build_num}.bin"
     try:
@@ -1152,51 +1352,56 @@ def upload_firmware_to_cloud(fleet_id, binary_bytes, build_num, id_token=None):
     except Exception as e:
         print(f"[LAN Cache] Error saving binary: {e}")
 
-    token = id_token or db.get_user_profile().get("id_token")
+    token = get_valid_id_token(id_token)
+    prof = db.get_user_profile()
+    has_user = bool(token or prof.get("google_sub") or prof.get("email"))
 
-    # 1. Cloudflare Worker Gateway (Delegated Auth)
-    if WORKER_BASE_URL and token:
-        try:
-            worker_upload_url = f"{WORKER_BASE_URL}/api/firmware/upload"
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "X-Fleet-ID": fleet_id,
-                "X-Build-Num": str(build_num)
-            }
-            files = {"file": (f"{fleet_id}_build_{build_num}.bin", binary_bytes, "application/octet-stream")}
-            data = {"fleet": fleet_id, "build": str(build_num)}
-            resp = requests.post(worker_upload_url, headers=headers, files=files, data=data, timeout=60)
-            if resp.status_code in (200, 201):
-                res_json = resp.json()
-                url = res_json.get("download_url") or res_json.get("url")
-                if url:
-                    return url
-            else:
-                # FIX 3: Print the actual error from the Worker so we aren't flying blind
-                print(f"❌ [Worker] Upload failed! Status: {resp.status_code}, Response: {resp.text}")
-        except Exception as e:
-            print(f"[Worker] Upload error: {e}")
+    # 1. Cloudflare Worker Gateway (with retries & exponential backoff)
+    if WORKER_BASE_URL and has_user:
+        worker_upload_url = f"{WORKER_BASE_URL}/api/firmware/upload"
+        for attempt in range(3):
+            try:
+                headers = build_cloud_headers(token, {
+                    "X-Fleet-ID": safe_name(fleet_id),
+                    "X-Build-Num": str(build_num),
+                })
+                files = {"file": (f"{safe_name(fleet_id)}_build_{build_num}.bin", binary_bytes, "application/octet-stream")}
+                data = {"fleet": safe_name(fleet_id), "build": str(build_num)}
+                resp = CLOUD_SESSION.post(worker_upload_url, headers=headers, files=files, data=data, timeout=(8.0, 45.0))
+                if resp.status_code in (200, 201):
+                    res_json = resp.json()
+                    url = res_json.get("download_url") or res_json.get("url")
+                    if url:
+                        return url
+                print(f"[Worker] Upload attempt {attempt + 1}/3 returned {resp.status_code}: {resp.text[:160]}")
+            except Exception as e:
+                print(f"[Worker] Upload attempt {attempt + 1}/3 error: {e}")
+            if attempt < 2:
+                time.sleep(0.8 * (2 ** attempt))
 
-    # 2. Direct Cloudflare R2 S3 fallback (versioned key; manifest re-signs the link on every check-in)
+    # 2. Direct Cloudflare R2 S3 fallback (with adaptive retries)
     if R2_ACCOUNT_ID and R2_ACCESS_KEY and R2_SECRET_KEY:
         try:
-            s3 = get_s3_client()
             remote_key = f"{safe_name(fleet_id)}/build_{build_num}.bin"
-            s3.put_object(
-                Bucket=R2_BUCKET,
-                Key=remote_key,
-                Body=binary_bytes,
-                ContentType="application/octet-stream"
-            )
-            return s3.generate_presigned_url(
-                'get_object',
-                Params={'Bucket': R2_BUCKET, 'Key': remote_key},
-                ExpiresIn=86400
-            )
+            def _put_and_sign(s3):
+                s3.put_object(
+                    Bucket=R2_BUCKET,
+                    Key=remote_key,
+                    Body=binary_bytes,
+                    ContentType="application/octet-stream"
+                )
+                return s3.generate_presigned_url(
+                    'get_object',
+                    Params={'Bucket': R2_BUCKET, 'Key': remote_key},
+                    ExpiresIn=86400
+                )
+            return s3_operation_with_retry(_put_and_sign, retries=3)
         except Exception as e:
             print(f"[R2] Direct S3 upload error: {e}")
 
-    # 3. LAN HTTP fallback
+    # 3. LAN / Tunnel HTTP fallback
+    if NGROK_ACTIVE and NGROK_URL.startswith("https://"):
+        return f"{NGROK_URL.rstrip('/')}/api/lan/firmware/{lan_name}"
     return lan_firmware_url(lan_name)
 
 # =====================================================================
@@ -1216,71 +1421,81 @@ def _vault_path(slot_key):
     return os.path.join(CLOUD_VAULT_DIR, f"{safe}.json")
 
 def cloud_store_write_json(slot_key, payload_dict, token=None):
-    """Writes a JSON state object to Local Vault, Cloudflare Worker, and Cloudflare R2."""
+    """Writes a JSON state object to Local Vault, Cloudflare Worker, and Cloudflare R2 with retry logic."""
     if not slot_key:
         return False
     raw_bytes = json.dumps(payload_dict, indent=2).encode("utf-8")
-    wrote_any = False
+    wrote_local = False
+    remote_configured = False
+    wrote_remote = False
 
-    # 1. Always persist in local multi-account vault (enables instant local recovery & testing)
+    # 1. Always persist in local multi-account vault (enables instant local recovery & offline resilience)
     try:
+        os.makedirs(CLOUD_VAULT_DIR, exist_ok=True)
         vp = _vault_path(slot_key)
         tmp = f"{vp}.{secrets.token_hex(4)}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(raw_bytes.decode("utf-8"))
         os.replace(tmp, vp)
-        wrote_any = True
+        wrote_local = True
     except Exception as e:
         print(f"[CloudVault] Local write error for {slot_key}: {e}")
 
-    tok = token or db.get_user_profile().get("id_token")
+    prof = db.get_user_profile()
+    is_collab_slot = str(slot_key).endswith("_collab")
+    has_auth = bool(is_collab_slot or token or prof.get("id_token") or prof.get("google_sub") or prof.get("email"))
 
-    # 2. Cloudflare Worker Gateway
-    if WORKER_BASE_URL and tok:
+    # 2. Cloudflare Worker Gateway (with retries)
+    if WORKER_BASE_URL and has_auth:
+        remote_configured = True
         try:
             url = f"{WORKER_BASE_URL}/users/{slot_key}/wifey_db.json"
-            resp = requests.put(
-                url,
-                data=raw_bytes,
-                headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
-                timeout=(1.5, 3.0)
-            )
-            if resp.status_code in (200, 201, 204):
-                wrote_any = True
+            headers = build_cloud_headers(token, {"Content-Type": "application/json"})
+            resp = cloud_request("PUT", url, retries=3, backoff=0.5, timeout=(4.0, 10.0), data=raw_bytes, headers=headers)
+            if resp is not None and resp.status_code in (200, 201, 204):
+                wrote_remote = True
         except Exception as e:
             print(f"[CloudStore Worker PUT] {slot_key}: {e}")
 
     # 3. Direct Cloudflare R2 S3 fallback
     if R2_ACCOUNT_ID and R2_ACCESS_KEY and R2_SECRET_KEY:
+        remote_configured = True
         try:
-            s3 = get_s3_client()
-            s3.put_object(
-                Bucket=R2_BUCKET,
-                Key=f"users/{slot_key}/wifey_db.json",
-                Body=raw_bytes,
-                ContentType="application/json"
-            )
-            wrote_any = True
+            def _put_db(s3):
+                s3.put_object(
+                    Bucket=R2_BUCKET,
+                    Key=f"users/{slot_key}/wifey_db.json",
+                    Body=raw_bytes,
+                    ContentType="application/json"
+                )
+            s3_operation_with_retry(_put_db, retries=2)
+            wrote_remote = True
         except Exception as e:
             print(f"[CloudStore R2 PUT] {slot_key}: {e}")
 
-    return wrote_any
+    # If remote cloud is configured but failed due to transient network error, signal caller to retry later
+    if remote_configured and not wrote_remote:
+        db._cloud_dirty = True
+    return wrote_remote or wrote_local
 
 def cloud_store_read_json(slot_key, token=None):
     """Reads the freshest JSON state object from Cloudflare Worker, Cloudflare R2, or Local Vault."""
     if not slot_key:
         return None
     candidates = []
-    tok = token or db.get_user_profile().get("id_token")
+    prof = db.get_user_profile()
+    is_collab_slot = str(slot_key).endswith("_collab")
+    has_auth = bool(is_collab_slot or token or prof.get("id_token") or prof.get("google_sub") or prof.get("email"))
 
     # 1. Cloudflare Worker Gateway
-    if WORKER_BASE_URL and tok:
+    if WORKER_BASE_URL and has_auth:
         try:
             url = f"{WORKER_BASE_URL}/users/{slot_key}/wifey_db.json"
-            resp = requests.get(url, headers={"Authorization": f"Bearer {tok}"}, timeout=(1.5, 3.0))
-            if resp.status_code == 200:
+            headers = build_cloud_headers(token)
+            resp = cloud_request("GET", url, retries=2, backoff=0.4, timeout=(4.0, 8.0), headers=headers)
+            if resp is not None and resp.status_code == 200:
                 data = resp.json()
-                if isinstance(data, dict):
+                if isinstance(data, dict) and (data.get("devices") is not None or data.get("manifest") is not None or data.get("updated_at") or data.get("inbox_requests") is not None or data.get("public_catalog") is not None):
                     candidates.append(data)
         except Exception:
             pass
@@ -1288,9 +1503,10 @@ def cloud_store_read_json(slot_key, token=None):
     # 2. Cloudflare R2 S3
     if R2_ACCOUNT_ID and R2_ACCESS_KEY and R2_SECRET_KEY:
         try:
-            s3 = get_s3_client()
-            obj = s3.get_object(Bucket=R2_BUCKET, Key=f"users/{slot_key}/wifey_db.json")
-            data = json.loads(obj['Body'].read().decode('utf-8'))
+            def _get_db(s3):
+                obj = s3.get_object(Bucket=R2_BUCKET, Key=f"users/{slot_key}/wifey_db.json")
+                return json.loads(obj['Body'].read().decode('utf-8'))
+            data = s3_operation_with_retry(_get_db, retries=2)
             if isinstance(data, dict):
                 candidates.append(data)
         except Exception:
@@ -1309,9 +1525,13 @@ def cloud_store_read_json(slot_key, token=None):
 
     if not candidates:
         return None
-    # Pick candidate with latest updated_at timestamp (or richest device set)
     candidates.sort(
-        key=lambda d: (float(d.get("updated_at", 0) or 0), len(d.get("devices", {}) or {})),
+        key=lambda d: (
+            float(d.get("updated_at", 0) or 0),
+            len(d.get("inbox_requests", []) or []),
+            len(d.get("active_grants", []) or []),
+            len(d.get("devices", {}) or {})
+        ),
         reverse=True
     )
     return candidates[0]
@@ -1395,6 +1615,7 @@ def sync_account_to_cloud(force=False):
         existing_box = cloud_store_read_json(collab_slot, token=token) or {}
         existing_inbox = existing_box.get("inbox_requests", []) if isinstance(existing_box, dict) else []
         existing_mutations = existing_box.get("shared_mutations", []) if isinstance(existing_box, dict) else []
+        existing_grants = existing_box.get("active_grants", []) if isinstance(existing_box, dict) else []
 
         # Merge any local access_requests statuses back into the mailbox
         by_id = {r.get("request_id"): dict(r) for r in existing_inbox if isinstance(r, dict) and r.get("request_id")}
@@ -1402,10 +1623,14 @@ def sync_account_to_cloud(force=False):
             if isinstance(local_req, dict) and local_req.get("request_id"):
                 by_id[local_req["request_id"]] = dict(local_req)
 
-        # Refresh live snapshots inside active grants
-        active_grants = []
+        # Refresh live snapshots inside active grants (including push-delivered grants from other owners)
+        grants_map = {
+            g.get("grant_id"): dict(g)
+            for g in existing_grants
+            if isinstance(g, dict) and g.get("grant_id") and normalize_email(g.get("owner_email")) != email
+        }
         for g in snapshot.get("access_grants", []):
-            if not isinstance(g, dict):
+            if not isinstance(g, dict) or not g.get("grant_id"):
                 continue
             g_copy = dict(g)
             if g_copy.get("status") == "approved" and float(g_copy.get("expires_at", 0) or 0) > now:
@@ -1415,7 +1640,8 @@ def sync_account_to_cloud(force=False):
                 g_copy["owner_email"] = email
                 g_copy["owner_sub"] = sub
                 g_copy["owner_url"] = NGROK_URL
-            active_grants.append(g_copy)
+            grants_map[g_copy["grant_id"]] = g_copy
+        active_grants = list(grants_map.values())
 
         catalog_fleets = list((snapshot.get("manifest") or {}).keys())
         if "DefaultFleet" not in catalog_fleets and snapshot.get("devices"):
@@ -1625,6 +1851,25 @@ def poll_collaboration_updates():
                     changed_local = True
                     emit_ui_log(f"⏱ [Collab] Shared access for {g.get('grantee_email')} on '{g.get('target_id')}' has expired.")
 
+            # Also pick up any grants push-delivered directly into our own mailbox ({my_ekey}_collab)
+            cur_shared_map = {x.get("grant_id"): x for x in db._data.get("shared_with_me", []) if isinstance(x, dict) and x.get("grant_id")}
+            for g in (my_box.get("active_grants") or []):
+                if isinstance(g, dict) and normalize_email(g.get("grantee_email")) == my_email and g.get("grant_id"):
+                    gid = g["grant_id"]
+                    prev = cur_shared_map.get(gid)
+                    cur_shared_map[gid] = dict(g)
+                    if not prev or prev.get("status") != g.get("status") or prev.get("expires_at") != g.get("expires_at"):
+                        changed_local = True
+                    # Also sync corresponding outgoing_request status
+                    for out_r in db._data.get("outgoing_requests", []):
+                        if isinstance(out_r, dict) and out_r.get("request_id") == g.get("request_id"):
+                            if out_r.get("status") != g.get("status"):
+                                out_r["status"] = g.get("status", "approved")
+                                out_r["approved_duration_min"] = g.get("duration_min")
+                                out_r["expires_at"] = g.get("expires_at")
+                                changed_local = True
+            db._data["shared_with_me"] = list(cur_shared_map.values())
+
     # 2. Check outgoing requests & active shared grants from other owners
     with db.lock:
         tracked_owners = {
@@ -1694,13 +1939,44 @@ def poll_collaboration_updates():
         db.save(sync_cloud=True)
 
 def handle_lan_collab_packet(packet, sender_ip):
-    """Handles real-time UDP collaboration notifications on the same LAN."""
+    """Handles real-time UDP collaboration notifications and direct payload sync on the same LAN."""
     prof = db.get_user_profile()
     my_email = normalize_email(prof.get("email"))
     if not my_email:
         return
     target_email = normalize_email(packet.get("target_email"))
     if target_email and target_email == my_email:
+        req_obj = packet.get("request_obj")
+        grant_obj = packet.get("grant_obj")
+        decision_val = packet.get("decision")
+        req_id_val = packet.get("request_id")
+        changed = False
+        with db.lock:
+            if isinstance(req_obj, dict) and req_obj.get("request_id"):
+                known = {r.get("request_id"): r for r in db._data.get("access_requests", []) if isinstance(r, dict) and r.get("request_id")}
+                if req_obj["request_id"] not in known:
+                    emit_ui_log(f"🔔 [Collab] Incoming permission request from {req_obj.get('requester_email')} for {req_obj.get('scope_type')}: '{req_obj.get('target_id')}' ({req_obj.get('requested_duration_min')}m)")
+                known[req_obj["request_id"]] = dict(req_obj)
+                db._data["access_requests"] = list(known.values())
+                changed = True
+            if isinstance(grant_obj, dict) and grant_obj.get("grant_id"):
+                shared = {g.get("grant_id"): g for g in db._data.get("shared_with_me", []) if isinstance(g, dict) and g.get("grant_id")}
+                shared[grant_obj["grant_id"]] = dict(grant_obj)
+                db._data["shared_with_me"] = list(shared.values())
+                for out_r in db._data.get("outgoing_requests", []):
+                    if isinstance(out_r, dict) and out_r.get("request_id") == grant_obj.get("request_id"):
+                        out_r["status"] = grant_obj.get("status", "approved")
+                        out_r["approved_duration_min"] = grant_obj.get("duration_min")
+                        out_r["expires_at"] = grant_obj.get("expires_at")
+                emit_ui_log(f"🔓 [Collab] Shared access granted by {grant_obj.get('owner_email')} for '{grant_obj.get('target_id')}' ({grant_obj.get('duration_min')}m)!")
+                changed = True
+            elif decision_val == "deny" and req_id_val:
+                for out_r in db._data.get("outgoing_requests", []):
+                    if isinstance(out_r, dict) and out_r.get("request_id") == req_id_val:
+                        out_r["status"] = "denied"
+                        changed = True
+        if changed:
+            db.save(sync_cloud=False)
         threading.Thread(target=poll_collaboration_updates, daemon=True).start()
 
 def push_shared_mutation_to_owner(grant, mutation_dict):
@@ -1786,18 +2062,27 @@ def push_shared_mutation_to_owner(grant, mutation_dict):
     return True
 
 def background_cloud_collab_loop():
-    """Background daemon that syncs local account changes to the cloud and polls for collaboration updates."""
+    """Background daemon that syncs local account changes to the cloud with retry backoff and polls collaboration updates."""
     last_poll = 0
+    last_ngrok_check = 0
+    retry_delay = 3.0
     while True:
-        time.sleep(3)
+        time.sleep(min(retry_delay, 15.0))
         try:
+            now = time.time()
+            if NGROK_STATIC_DOMAIN and NGROK_AUTHTOKEN and (now - last_ngrok_check >= 45):
+                last_ngrok_check = now
+                ensure_ngrok_tunnel()
             if db._cloud_dirty:
                 sync_account_to_cloud(force=False)
-            if time.time() - last_poll >= 7:
-                last_poll = time.time()
+                retry_delay = 6.0 if db._cloud_dirty else 3.0
+            else:
+                retry_delay = 3.0
+            if now - last_poll >= 8:
+                last_poll = now
                 poll_collaboration_updates()
-        except Exception:
-            pass
+        except Exception as e:
+            retry_delay = min(retry_delay * 1.5, 20.0)
 
 # --- SERIAL COMMUNICATION STATE & LOCK ---
 SERIAL_LOCK = threading.Lock()
@@ -2028,6 +2313,12 @@ String wifey_urlencode(const String& s) {
   return out;
 }
 
+String wifey_runtime_server = "";
+
+String wifey_server_base() {
+  return wifey_runtime_server.length() > 0 ? wifey_runtime_server : String(api_base_url);
+}
+
 void wifey_load_identity() {
   wifey_prefs.begin("wifey", false);
   String sid = wifey_prefs.getString("dev_id", "");
@@ -2035,7 +2326,14 @@ void wifey_load_identity() {
   String sfleet = wifey_prefs.getString("fleet", "");
   wifey_applied_build = wifey_prefs.getInt("applied", 0);
 #if WIFEY_FORCE_IDENTITY
-  sid = ""; stok = ""; sfleet = ""; wifey_applied_build = 0;
+  if (wifey_prefs.getString("prov_id", "") != String(WIFEY_DEFAULT_DEVICE_ID) ||
+      wifey_prefs.getString("prov_tok", "") != String(WIFEY_DEFAULT_TOKEN) ||
+      wifey_prefs.getString("prov_flt", "") != String(WIFEY_DEFAULT_FLEET)) {
+    sid = ""; stok = ""; sfleet = ""; wifey_applied_build = CURRENT_BUILD;
+    wifey_prefs.putString("prov_id", String(WIFEY_DEFAULT_DEVICE_ID));
+    wifey_prefs.putString("prov_tok", String(WIFEY_DEFAULT_TOKEN));
+    wifey_prefs.putString("prov_flt", String(WIFEY_DEFAULT_FLEET));
+  }
 #endif
   if (sid.length() == 0) {
     if (strlen(WIFEY_DEFAULT_DEVICE_ID) > 0) {
@@ -2105,7 +2403,7 @@ void send_lan_beacon() {
   wifey_udp.endPacket();
 }
 
-// Commands from WiFeY Studio (unicast UDP): {"cmd":"check_update","token":"..."}
+// Commands from WiFeY Studio (unicast UDP): {"cmd":"check_update","token":"...","server":"http://..."}
 void wifey_udp_receive() {
   int guard = 0;
   while (wifey_udp.parsePacket() > 0 && guard++ < 8) {
@@ -2118,7 +2416,9 @@ void wifey_udp_receive() {
     if (deserializeJson(doc, buf)) continue;
     const char* cmd = doc["cmd"] | "";
     const char* tok = doc["token"] | "";
-    if (device_token.length() > 0 && device_token != String(tok)) continue;
+    const char* srv = doc["server"] | "";
+    if (device_token.length() > 0 && strlen(tok) > 0 && device_token != String(tok)) continue;
+    if (strlen(srv) > 0) wifey_runtime_server = String(srv);
     if (strcmp(cmd, "check_update") == 0) wifey_force_check = true;
   }
 }
@@ -2152,10 +2452,10 @@ bool wifey_http_get(const String& url, String& out, int& code) {
   WiFiClient* pc = NULL;
   HTTPClient http;
   http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   if (https) {
     sc = new WiFiClientSecure();
     sc->setInsecure();
-    sc->setTimeout(15);
     http.begin(*sc, url);
   } else {
     pc = new WiFiClient();
@@ -2174,7 +2474,7 @@ bool wifey_http_get(const String& url, String& out, int& code) {
 
 void notify_flash_completion(int new_build) {
   if (WiFi.status() != WL_CONNECTED) return;
-  String url = String(api_base_url) + "/api/device/notify_flash";
+  String url = wifey_server_base() + "/api/device/notify_flash";
   char body[224];
   snprintf(body, sizeof(body),
     "{\"device_id\":\"%s\",\"device_token\":\"%s\",\"status\":\"SUCCESS\",\"new_build\":%d}",
@@ -2183,11 +2483,11 @@ void notify_flash_completion(int new_build) {
   WiFiClientSecure* sc = NULL;
   WiFiClient* pc = NULL;
   HTTPClient http;
-  http.setTimeout(8000);
+  http.setTimeout(10000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   if (https) {
     sc = new WiFiClientSecure();
     sc->setInsecure();
-    sc->setTimeout(8);
     http.begin(*sc, url);
   } else {
     pc = new WiFiClient();
@@ -2258,13 +2558,12 @@ void process_manifest_and_update(const String& payload) {
     upgrade_detected_flash();
 
     httpUpdate.rebootOnUpdate(false);
-    httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
     t_httpUpdate_return ret;
 
     if (download_url.startsWith("https://")) {
       WiFiClientSecure* uc = new WiFiClientSecure();
       uc->setInsecure();
-      uc->setTimeout(30);
       ret = httpUpdate.update(*uc, download_url);
       uc->stop();
       delete uc;
@@ -2290,11 +2589,14 @@ void process_manifest_and_update(const String& payload) {
 
 void check_for_updates() {
   if (WiFi.status() != WL_CONNECTED) return;
-  String manifest_url = String(api_base_url) + "/api/manifest?fleet=" + wifey_urlencode(fleet_id)
-                        + "&device=" + wifey_urlencode(device_id) + "&build=" + String(wifey_effective_build());
+  String query = "/api/manifest?fleet=" + wifey_urlencode(fleet_id)
+                 + "&device=" + wifey_urlencode(device_id) + "&build=" + String(wifey_effective_build());
   String payload;
   int code = 0;
-  if (wifey_http_get(manifest_url, payload, code)) {
+  if (wifey_http_get(wifey_server_base() + query, payload, code)) {
+    process_manifest_and_update(payload);
+  } else if (wifey_runtime_server.length() > 0 && wifey_runtime_server != String(api_base_url) &&
+             wifey_http_get(String(api_base_url) + query, payload, code)) {
     process_manifest_and_update(payload);
   } else {
     Serial.printf("[WiFeY] Manifest check failed, HTTP %d\n", code);
@@ -2383,48 +2685,62 @@ void loop() {
   {USER_LOOP}
 }
 """
-# --- ESP8266 LITE OTA TEMPLATE (Compact, LittleFS identity, No Serial Mirror) ---
+# --- ESP8266 ULTRA-LITE OTA TEMPLATE (Zero String globals, EEPROM struct identity, BearSSL MFLN, PROGMEM strings) ---
 ESP8266_CPP_TEMPLATE = r"""#include <ESP8266WiFi.h>
 #include <WiFiUdp.h>
 #include <WiFiClient.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266httpUpdate.h>
-#include <WiFiClientSecure.h>
-#include <ArduinoJson.h>
-#include <LittleFS.h>
+#include <WiFiClientSecureBearSSL.h>
+#include <EEPROM.h>
 {USER_INCLUDES}
 
-const char* ssid = "{WIFI_SSID}";
-const char* password = "{WIFI_PASS}";
-const char* api_base_url = "{API_BASE_URL}";
-const char* WIFEY_DEFAULT_FLEET = "{FLEET_ID}";
-const char* WIFEY_DEFAULT_DEVICE_ID = "{DEVICE_ID}";
-const char* WIFEY_DEFAULT_TOKEN = "{DEVICE_TOKEN}";
-const int CURRENT_BUILD = {CURRENT_BUILD};
+// --- WiFeY Ultra-Lite ESP8266 Configuration (optimized for minimal RAM & Flash) ---
+static const char WIFI_SSID[] = "{WIFI_SSID}";
+static const char WIFI_PASS[] = "{WIFI_PASS}";
+static const char API_BASE_URL[] = "{API_BASE_URL}";
+static const char WIFEY_DEFAULT_FLEET[] = "{FLEET_ID}";
+static const char WIFEY_DEFAULT_DEVICE_ID[] = "{DEVICE_ID}";
+static const char WIFEY_DEFAULT_TOKEN[] = "{DEVICE_TOKEN}";
+static const int CURRENT_BUILD = {CURRENT_BUILD};
 
 #define WIFEY_FORCE_IDENTITY {FORCE_IDENTITY}
 #define WIFEY_POLL_SECONDS {POLL_SECONDS}
 #define WIFEY_UDP_PORT 53535
+#define WIFEY_BEACON_MS 5000UL
 #ifndef LED_BUILTIN
 #define LED_BUILTIN 2
 #endif
 #define WIFEY_LED LED_BUILTIN
 
-String device_id;
-String fleet_id;
-String device_token;
-int wifey_applied_build = 0;
+// Compact fixed-size identity buffers in BSS (avoids Arduino String heap fragmentation)
+struct WifeyIdentity {
+  uint32_t magic;
+  int32_t applied_build;
+  uint32_t prov_hash;
+  char device_id[24];
+  char device_token[28];
+  char fleet_id[24];
+};
 
-WiFiUDP wifey_udp;
-unsigned long wifey_last_beacon = 0;
-unsigned long wifey_last_poll = 0;
-bool wifey_force_check = false;
+static const uint32_t WIFEY_ID_MAGIC = 0x57465933UL;
+static char device_id[24];
+static char fleet_id[24];
+static char device_token[28];
+static char wifey_lan_server[80] = {0};
+static int32_t wifey_applied_build = 0;
+
+static WiFiUDP wifey_udp;
+static unsigned long wifey_last_beacon = 0;
+static unsigned long wifey_last_poll = 0;
+static bool wifey_force_check = false;
 
 #define WIFEY_PRINT(msg) do { \
   Serial.println(msg); \
   if (WiFi.status() == WL_CONNECTED) { \
     wifey_udp.beginPacket(IPAddress(255, 255, 255, 255), WIFEY_UDP_PORT); \
-    wifey_udp.print(String("[") + device_id + "] " + msg); \
+    wifey_udp.write('['); wifey_udp.write((const uint8_t*)device_id, strlen(device_id)); wifey_udp.write("] ", 2); \
+    wifey_udp.print(msg); \
     wifey_udp.endPacket(); \
   } \
 } while(0)
@@ -2433,134 +2749,265 @@ bool wifey_force_check = false;
 
 void wifey_service();
 
-int wifey_effective_build() { return CURRENT_BUILD > wifey_applied_build ? CURRENT_BUILD : wifey_applied_build; }
-
-String wifey_urlencode(const String& s) {
-  String out;
-  const char* hex = "0123456789ABCDEF";
-  for (size_t i = 0; i < s.length(); i++) {
-    unsigned char c = (unsigned char)s[i];
-    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += (char)c;
-    else { out += '%'; out += hex[c >> 4]; out += hex[c & 15]; }
-  }
-  return out;
+static inline int wifey_effective_build() {
+  return (CURRENT_BUILD > wifey_applied_build) ? CURRENT_BUILD : (int)wifey_applied_build;
 }
 
-void wifey_load_identity() {
-  LittleFS.begin();
+static uint32_t wifey_fnv1a(const char* s) {
+  uint32_t h = 2166136261UL;
+  while (*s) { h ^= (uint8_t)(*s++); h *= 16777619UL; }
+  return h;
+}
+
+static void wifey_save_identity(uint32_t prov_hash) {
+  WifeyIdentity id;
+  memset(&id, 0, sizeof(id));
+  id.magic = WIFEY_ID_MAGIC;
+  id.applied_build = wifey_applied_build;
+  id.prov_hash = prov_hash;
+  strncpy(id.device_id, device_id, sizeof(id.device_id) - 1);
+  strncpy(id.device_token, device_token, sizeof(id.device_token) - 1);
+  strncpy(id.fleet_id, fleet_id, sizeof(id.fleet_id) - 1);
+  EEPROM.begin(sizeof(WifeyIdentity));
+  EEPROM.put(0, id);
+  EEPROM.commit();
+  EEPROM.end(); // Immediately releases the RAM sector buffer
+}
+
+static void wifey_load_identity() {
+  WifeyIdentity id;
+  EEPROM.begin(sizeof(WifeyIdentity));
+  EEPROM.get(0, id);
+  EEPROM.end(); // Free RAM buffer immediately
+
+  uint32_t default_hash = wifey_fnv1a(WIFEY_DEFAULT_DEVICE_ID) ^ wifey_fnv1a(WIFEY_DEFAULT_TOKEN) ^ wifey_fnv1a(WIFEY_DEFAULT_FLEET);
+  bool valid = (id.magic == WIFEY_ID_MAGIC && id.device_id[0] != '\0' && id.device_token[0] != '\0');
+
 #if WIFEY_FORCE_IDENTITY
-  device_id = WIFEY_DEFAULT_DEVICE_ID;
-  device_token = WIFEY_DEFAULT_TOKEN;
-  fleet_id = WIFEY_DEFAULT_FLEET;
-  wifey_applied_build = 0;
-  
-  File f = LittleFS.open("/wifey_id.txt", "w");
-  if(f) {
-    f.println(device_id); f.println(device_token); f.println(fleet_id); f.println(wifey_applied_build);
-    f.close();
-  }
-#else
-  File f = LittleFS.open("/wifey_id.txt", "r");
-  if(f) {
-    device_id = f.readStringUntil('\n'); device_id.trim();
-    device_token = f.readStringUntil('\n'); device_token.trim();
-    fleet_id = f.readStringUntil('\n'); fleet_id.trim();
-    String b = f.readStringUntil('\n'); b.trim(); wifey_applied_build = b.toInt();
-    f.close();
-  } else {
-    device_id = String("node_8266_") + String(ESP.getChipId(), HEX);
-    device_token = "dt_fallback";
-    fleet_id = "DefaultFleet";
+  if (!valid || id.prov_hash != default_hash) {
+    strncpy(device_id, WIFEY_DEFAULT_DEVICE_ID[0] ? WIFEY_DEFAULT_DEVICE_ID : "node_8266", sizeof(device_id) - 1);
+    strncpy(device_token, WIFEY_DEFAULT_TOKEN[0] ? WIFEY_DEFAULT_TOKEN : "dt_8266", sizeof(device_token) - 1);
+    strncpy(fleet_id, WIFEY_DEFAULT_FLEET[0] ? WIFEY_DEFAULT_FLEET : "DefaultFleet", sizeof(fleet_id) - 1);
+    wifey_applied_build = CURRENT_BUILD;
+    wifey_save_identity(default_hash);
+    return;
   }
 #endif
+  if (valid) {
+    strncpy(device_id, id.device_id, sizeof(device_id) - 1);
+    strncpy(device_token, id.device_token, sizeof(device_token) - 1);
+    strncpy(fleet_id, id.fleet_id[0] ? id.fleet_id : "DefaultFleet", sizeof(fleet_id) - 1);
+    wifey_applied_build = id.applied_build;
+  } else {
+    if (WIFEY_DEFAULT_DEVICE_ID[0]) strncpy(device_id, WIFEY_DEFAULT_DEVICE_ID, sizeof(device_id) - 1);
+    else snprintf_P(device_id, sizeof(device_id), PSTR("node_%06x"), ESP.getChipId());
+    if (WIFEY_DEFAULT_TOKEN[0]) strncpy(device_token, WIFEY_DEFAULT_TOKEN, sizeof(device_token) - 1);
+    else snprintf_P(device_token, sizeof(device_token), PSTR("dt_%06x%04x"), ESP.getChipId(), (unsigned)(RANDOM_REG32 & 0xFFFF));
+    strncpy(fleet_id, WIFEY_DEFAULT_FLEET[0] ? WIFEY_DEFAULT_FLEET : "DefaultFleet", sizeof(fleet_id) - 1);
+    wifey_applied_build = CURRENT_BUILD;
+    wifey_save_identity(default_hash);
+  }
 }
 
 void smartDelay(unsigned long ms) {
   unsigned long start = millis();
   do {
     wifey_service();
+    yield();
     delay(1);
   } while (millis() - start < ms);
 }
 
-void send_lan_beacon() {
+static void send_lan_beacon() {
   if (WiFi.status() != WL_CONNECTED) return;
-  char beacon_buf[256];
-  snprintf(beacon_buf, sizeof(beacon_buf),
-    "{\"device_id\":\"%s\",\"device_token\":\"%s\",\"ip\":\"%s\",\"build\":%d,\"tcp\":0}",
-    device_id.c_str(), device_token.c_str(), WiFi.localIP().toString().c_str(), wifey_effective_build());
-  wifey_udp.beginPacket(IPAddress(255, 255, 255, 255), WIFEY_UDP_PORT);
-  wifey_udp.print(beacon_buf);
-  wifey_udp.endPacket();
+  IPAddress ip = WiFi.localIP();
+  char buf[180];
+  int n = snprintf_P(buf, sizeof(buf),
+    PSTR("{\"device_id\":\"%s\",\"device_token\":\"%s\",\"ip\":\"%u.%u.%u.%u\",\"build\":%d,\"tcp\":0}"),
+    device_id, device_token, ip[0], ip[1], ip[2], ip[3], wifey_effective_build());
+  if (n > 0) {
+    wifey_udp.beginPacket(IPAddress(255, 255, 255, 255), WIFEY_UDP_PORT);
+    wifey_udp.write((const uint8_t*)buf, (size_t)n);
+    wifey_udp.endPacket();
+  }
 }
 
-void wifey_udp_receive() {
+// Lightweight zero-allocation JSON field extractor for small UDP & manifest payloads
+static bool wifey_json_str(const char* json, const char* key, char* out, size_t out_sz) {
+  out[0] = '\0';
+  const char* p = strstr(json, key);
+  if (!p) return false;
+  p = strchr(p + strlen(key), ':');
+  if (!p) return false;
+  while (*++p == ' ' || *p == '\t') {}
+  if (*p != '"') return false;
+  p++;
+  size_t i = 0;
+  while (*p && *p != '"' && i + 1 < out_sz) {
+    if (*p == '\\' && *(p + 1)) p++;
+    out[i++] = *p++;
+  }
+  out[i] = '\0';
+  return i > 0;
+}
+
+static int wifey_json_int(const char* json, const char* key, int dflt) {
+  const char* p = strstr(json, key);
+  if (!p) return dflt;
+  p = strchr(p + strlen(key), ':');
+  if (!p) return dflt;
+  while (*++p == ' ' || *p == '\t') {}
+  return (*p == '-' || (*p >= '0' && *p <= '9')) ? atoi(p) : dflt;
+}
+
+static void wifey_udp_receive() {
   int guard = 0;
-  while (wifey_udp.parsePacket() > 0 && guard++ < 5) {
-    char buf[256];
+  while (wifey_udp.parsePacket() > 0 && guard++ < 4) {
+    char buf[192];
     int len = wifey_udp.read(buf, sizeof(buf) - 1);
-    if (len > 0) {
-      buf[len] = 0;
-      if (buf[0] == '{' && strstr(buf, "\"cmd\":\"check_update\"") != NULL) wifey_force_check = true;
+    if (len <= 0) continue;
+    buf[len] = '\0';
+    if (buf[0] != '{' || strstr_P(buf, PSTR("\"check_update\"")) == NULL) continue;
+    char tok[32];
+    if (wifey_json_str(buf, "\"token\"", tok, sizeof(tok))) {
+      if (device_token[0] && strcmp(tok, device_token) != 0) continue;
+    }
+    char srv[80];
+    if (wifey_json_str(buf, "\"server\"", srv, sizeof(srv))) {
+      strncpy(wifey_lan_server, srv, sizeof(wifey_lan_server) - 1);
+    }
+    wifey_force_check = true;
+  }
+}
+
+static bool wifey_fetch_manifest(const char* base_url, char* payload_buf, size_t buf_sz) {
+  if (!base_url || !base_url[0]) return false;
+  char url[220];
+  snprintf_P(url, sizeof(url), PSTR("%s/api/manifest?fleet=%s&device=%s&build=%d"),
+             base_url, fleet_id, device_id, wifey_effective_build());
+
+  HTTPClient http;
+  http.setTimeout(10000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setReuse(false);
+
+  int code = -1;
+  bool ok = false;
+  if (strncmp_P(url, PSTR("https://"), 8) == 0) {
+    BearSSL::WiFiClientSecure sc;
+    sc.setInsecure();
+    sc.setBufferSizes(1024, 512); // Reduces BearSSL heap footprint from 32KB to 1.5KB
+    if (http.begin(sc, url)) {
+      http.addHeader(F("Authorization"), String(F("Bearer ")) + device_token);
+      http.addHeader(F("ngrok-skip-browser-warning"), F("true"));
+      code = http.GET();
+      if (code == 200) {
+        int len = http.getStream().readBytes(payload_buf, buf_sz - 1);
+        payload_buf[len > 0 ? len : 0] = '\0';
+        ok = (len > 0);
+      }
+      http.end();
+    }
+  } else {
+    WiFiClient pc;
+    if (http.begin(pc, url)) {
+      http.addHeader(F("Authorization"), String(F("Bearer ")) + device_token);
+      http.addHeader(F("ngrok-skip-browser-warning"), F("true"));
+      code = http.GET();
+      if (code == 200) {
+        int len = http.getStream().readBytes(payload_buf, buf_sz - 1);
+        payload_buf[len > 0 ? len : 0] = '\0';
+        ok = (len > 0);
+      }
+      http.end();
+    }
+  }
+  return ok;
+}
+
+static void wifey_notify_flash(const char* base_url, int new_build) {
+  char url[160];
+  snprintf_P(url, sizeof(url), PSTR("%s/api/device/notify_flash"), base_url);
+  char body[160];
+  snprintf_P(body, sizeof(body),
+    PSTR("{\"device_id\":\"%s\",\"device_token\":\"%s\",\"status\":\"SUCCESS\",\"new_build\":%d}"),
+    device_id, device_token, new_build);
+
+  HTTPClient http;
+  http.setTimeout(6000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  if (strncmp_P(url, PSTR("https://"), 8) == 0) {
+    BearSSL::WiFiClientSecure sc;
+    sc.setInsecure();
+    sc.setBufferSizes(1024, 512);
+    if (http.begin(sc, url)) {
+      http.addHeader(F("Content-Type"), F("application/json"));
+      http.addHeader(F("Authorization"), String(F("Bearer ")) + device_token);
+      http.addHeader(F("ngrok-skip-browser-warning"), F("true"));
+      http.POST((uint8_t*)body, strlen(body));
+      http.end();
+    }
+  } else {
+    WiFiClient pc;
+    if (http.begin(pc, url)) {
+      http.addHeader(F("Content-Type"), F("application/json"));
+      http.addHeader(F("Authorization"), String(F("Bearer ")) + device_token);
+      http.addHeader(F("ngrok-skip-browser-warning"), F("true"));
+      http.POST((uint8_t*)body, strlen(body));
+      http.end();
     }
   }
 }
 
 void check_for_updates() {
   if (WiFi.status() != WL_CONNECTED) return;
-  String manifest_url = String(api_base_url) + "/api/manifest?fleet=" + wifey_urlencode(fleet_id) + "&device=" + wifey_urlencode(device_id) + "&build=" + String(wifey_effective_build());
-  
-  WiFiClient client;
-  HTTPClient http;
-  if (http.begin(client, manifest_url)) {
-    http.addHeader("Authorization", String("Bearer ") + device_token);
-    http.addHeader("ngrok-skip-browser-warning", "true");
-    int code = http.GET();
-    if (code == 200) {
-      String payload = http.getString();
-      JsonDocument doc;
-      if (!deserializeJson(doc, payload)) {
-        int target_build = doc["target_build"] | 0;
-        String download_url = doc["download_url"].as<String>();
-        if (target_build > wifey_effective_build() && download_url.length() > 0 && download_url != "null") {
-          Serial.printf("[WiFeY] OTA Build #%d available. Updating...\n", target_build);
-          ESPhttpUpdate.rebootOnUpdate(false);
-          t_httpUpdate_return ret;
-          
-          if (download_url.startsWith("https://")) {
-            std::unique_ptr<BearSSL::WiFiClientSecure> uc(new BearSSL::WiFiClientSecure);
-            uc->setInsecure();
-            ret = ESPhttpUpdate.update(*uc, download_url);
-          } else {
-            WiFiClient uc;
-            ret = ESPhttpUpdate.update(uc, download_url);
-          }
-          
-          if (ret == HTTP_UPDATE_OK) {
-            File f = LittleFS.open("/wifey_id.txt", "w");
-            if(f) {
-              f.println(device_id); f.println(device_token); f.println(fleet_id); f.println(target_build);
-              f.close();
-            }
-            Serial.println("[WiFeY] Update successful, rebooting...");
-            
-            // Notify flash success
-            String notify_url = String(api_base_url) + "/api/device/notify_flash";
-            char body[224];
-            snprintf(body, sizeof(body), "{\"device_id\":\"%s\",\"device_token\":\"%s\",\"status\":\"SUCCESS\",\"new_build\":%d}", device_id.c_str(), device_token.c_str(), target_build);
-            HTTPClient nhttp;
-            if(nhttp.begin(client, notify_url)) {
-                nhttp.addHeader("Content-Type", "application/json");
-                nhttp.POST(body);
-                nhttp.end();
-            }
-            delay(500);
-            ESP.restart();
-          }
-        }
-      }
+  yield();
+
+  const char* active_base = wifey_lan_server[0] ? wifey_lan_server : API_BASE_URL;
+  char payload[320];
+  if (!wifey_fetch_manifest(active_base, payload, sizeof(payload))) {
+    if (wifey_lan_server[0] && strcmp(wifey_lan_server, API_BASE_URL) != 0) {
+      active_base = API_BASE_URL;
+      if (!wifey_fetch_manifest(active_base, payload, sizeof(payload))) return;
+    } else {
+      return;
     }
-    http.end();
+  }
+
+  int target_build = wifey_json_int(payload, "\"target_build\"", 0);
+  char download_url[200];
+  if (target_build <= wifey_effective_build()) return;
+  if (!wifey_json_str(payload, "\"download_url\"", download_url, sizeof(download_url))) return;
+  if (strcmp(download_url, "null") == 0) return;
+
+  Serial.printf_P(PSTR("[WiFeY] OTA Build #%d -> Updating...\n"), target_build);
+  yield();
+
+  ESPhttpUpdate.rebootOnUpdate(false);
+  ESPhttpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  t_httpUpdate_return ret;
+
+  if (strncmp_P(download_url, PSTR("https://"), 8) == 0) {
+    BearSSL::WiFiClientSecure uc;
+    uc.setInsecure();
+    uc.setBufferSizes(2048, 512);
+    ret = ESPhttpUpdate.update(uc, download_url);
+  } else {
+    WiFiClient uc;
+    ret = ESPhttpUpdate.update(uc, download_url);
+  }
+
+  if (ret == HTTP_UPDATE_OK) {
+    wifey_applied_build = target_build;
+    uint32_t default_hash = wifey_fnv1a(WIFEY_DEFAULT_DEVICE_ID) ^ wifey_fnv1a(WIFEY_DEFAULT_TOKEN) ^ wifey_fnv1a(WIFEY_DEFAULT_FLEET);
+    wifey_save_identity(default_hash);
+    Serial.println(F("[WiFeY] Update OK, notifying & rebooting..."));
+    wifey_notify_flash(active_base, target_build);
+    delay(250);
+    ESP.restart();
+  } else if (ret == HTTP_UPDATE_FAILED) {
+    Serial.printf_P(PSTR("[WiFeY] OTA Error (%d): %s\n"),
+                    ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
   }
 }
 
@@ -2571,14 +3018,15 @@ void wifey_service() {
 
   if (WiFi.status() == WL_CONNECTED) {
     wifey_udp_receive();
-    if (millis() - wifey_last_beacon >= 5000) {
-      wifey_last_beacon = millis();
+    unsigned long now = millis();
+    if (now - wifey_last_beacon >= WIFEY_BEACON_MS) {
+      wifey_last_beacon = now;
       send_lan_beacon();
     }
-    bool due = (WIFEY_POLL_SECONDS > 0) && (millis() - wifey_last_poll >= (unsigned long)WIFEY_POLL_SECONDS * 1000UL);
+    bool due = (WIFEY_POLL_SECONDS > 0) && (now - wifey_last_poll >= (unsigned long)WIFEY_POLL_SECONDS * 1000UL);
     if (wifey_force_check || due) {
       wifey_force_check = false;
-      wifey_last_poll = millis();
+      wifey_last_poll = now;
       check_for_updates();
     }
   }
@@ -2588,15 +3036,26 @@ void wifey_service() {
 void setup() {
   Serial.begin(115200);
   wifey_load_identity();
-  
+
+  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) { delay(100); }
-  
-  wifey_udp.begin(WIFEY_UDP_PORT);
-  check_for_updates();
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleepMode(WIFI_MODEM_SLEEP);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000UL) {
+    delay(100);
+    yield();
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifey_udp.begin(WIFEY_UDP_PORT);
+    send_lan_beacon();
+    check_for_updates();
+  }
   wifey_last_poll = millis();
-  
+
   {USER_SETUP}
 }
 
@@ -2763,15 +3222,17 @@ def generate_wrapped_code(ssid, passw, api_url, topic, user_code, build_num=0, d
     return re.sub(r'\{([A-Z_]+)\}', lambda m: str(values.get(m.group(1), m.group(0))), active_template)
 
 def build_firmware_source(data):
-    """Returns (code, hash, info)."""
+    """Returns (code, hash, info) including any companion .h / .cpp files from the IDE tabs."""
     data = data or {}
     fqbn = apply_ota_partition(data.get('fqbn', DEFAULT_FQBN))
     opts = get_wrapper_options(data)
+    extra_files = data.get('extra_files') if isinstance(data.get('extra_files'), dict) else {}
     code = generate_wrapped_code(data.get('ssid'), data.get('pass'), data.get('api_url'), data.get('topic'),
                                  data.get('code'), build_num=0, opts=opts, fqbn=fqbn)
-    digest = hashlib.sha256((TEMPLATE_VERSION + "|" + fqbn + "|" + code).encode("utf-8")).hexdigest()
+    extra_blob = json.dumps(extra_files, sort_keys=True)
+    digest = hashlib.sha256((TEMPLATE_VERSION + "|" + fqbn + "|" + code + "|" + extra_blob).encode("utf-8")).hexdigest()
     net_mode = detect_net_mode(data.get('code') or "", opts.get("net_mode"))
-    return code, digest, {"net_mode": net_mode, "auto": (opts.get("net_mode") or "auto") == "auto", "opts": opts, "fqbn": fqbn}
+    return code, digest, {"net_mode": net_mode, "auto": (opts.get("net_mode") or "auto") == "auto", "opts": opts, "fqbn": fqbn, "extra_files": extra_files}
 
 # --- SPLASH SCREEN HTML ---
 SETUP_HTML = """<!DOCTYPE html>
@@ -2966,15 +3427,26 @@ IDE_HTML = """<!DOCTYPE html>
             </button>
             
             <!-- FALLBACK LINK CONTAINER -->
-            <div id="auth-fallback-container" class="hidden mt-4 text-center">
-                <p class="text-xs text-ardTextMuted mb-1">Browser didn't open automatically?</p>
-                <a id="auth-link" href="#" target="_blank" class="text-ardTeal text-xs underline font-mono break-all hover:text-white">Click here to sign in with Google</a>
+            <div id="auth-fallback-container" class="hidden mt-4 text-center w-full p-3 rounded-xl bg-ardBg border border-ardBorder">
+                <p class="text-xs text-ardTextMuted mb-1.5">Browser didn't open automatically?</p>
+                <a id="auth-link" href="#" target="_blank" onclick="openExternalAuthUrl(event)" class="text-ardTeal text-xs underline font-mono break-all hover:text-white">Click here to open Google Sign-In</a>
             </div>
             
-            <div id="auth-spinner" class="hidden flex-col items-center mt-6">
+            <div id="auth-spinner" class="hidden flex-col items-center mt-5">
                 <i class="ph-bold ph-spinner animate-spin text-2xl text-ardTeal mb-2"></i>
                 <span class="text-xs text-ardTextMuted font-mono">Waiting for browser authentication...</span>
             </div>
+
+            <div class="w-full flex items-center gap-3 my-4">
+                <div class="h-px bg-ardBorder flex-1"></div>
+                <span class="text-[11px] text-ardTextMuted uppercase tracking-wider">or</span>
+                <div class="h-px bg-ardBorder flex-1"></div>
+            </div>
+
+            <button type="button" onclick="continueOfflineMode()" class="w-full py-2.5 px-4 bg-ardCard hover:bg-ardHover border border-ardBorder hover:border-ardTeal text-ardTextMain hover:text-white text-xs font-semibold rounded-xl transition-all flex items-center justify-center gap-2 cursor-pointer">
+                <i class="ph-bold ph-desktop text-ardTeal text-sm"></i>
+                <span>Continue in Local / Offline Mode</span>
+            </button>
         </div>
     </div>
     <div id="drop-overlay" style="display:none" class="fixed inset-0 z-[90] bg-ardBg/80 backdrop-blur-sm items-center justify-center pointer-events-none">
@@ -2985,36 +3457,59 @@ IDE_HTML = """<!DOCTYPE html>
         </div>
     </div>
     <input type="file" id="bin-file-input" accept=".bin" class="hidden" onchange="handleBinLoad(event)">
-    <!-- LIBRARY MANAGER SIDEBAR PANE -->
-    <div id="lib-sidebar" class="hidden flex-col w-64 h-full bg-ardPanel border-r border-ardBorder transition-all duration-200 z-40 absolute left-14 top-0 bottom-0 shadow-xl">
-        <div class="flex items-center justify-between p-3 border-b border-ardBorder bg-ardCard">
-            <h2 class="text-sm font-bold text-white flex items-center gap-2 uppercase tracking-wider">
-                <i class="ph-bold ph-books text-ardTeal"></i> Libraries
-            </h2>
-            <div class="flex gap-2">
-                <button onclick="document.getElementById('lib-zip-input').click()" class="text-ardTextMuted hover:text-ardTeal transition-colors" title="Add .ZIP Library">
-                    <i class="ph-bold ph-plus text-lg"></i>
+    <!-- LIBRARY MANAGER SIDEBAR PANE (Quick Drawer in Editor View) -->
+    <div id="lib-sidebar" class="hidden flex-col w-80 h-full bg-ardPanel/95 backdrop-blur-md border-r border-ardBorder transition-all duration-200 z-40 absolute left-14 top-0 bottom-0 shadow-2xl">
+        <div class="flex items-center justify-between px-4 py-3 border-b border-ardBorder bg-gradient-to-r from-ardCard via-[#1e252d] to-ardCard">
+            <div class="flex items-center gap-2.5">
+                <div class="w-7 h-7 rounded-lg bg-ardTeal/15 border border-ardTeal/30 flex items-center justify-center text-ardTeal shadow-inner">
+                    <i class="ph-bold ph-books text-base"></i>
+                </div>
+                <div>
+                    <h2 class="text-xs font-bold text-white uppercase tracking-wider leading-none">Library Manager</h2>
+                    <p class="text-[10px] text-ardTextMuted mt-0.5"><span id="lib-count-drawer">0</span> packages indexed</p>
+                </div>
+            </div>
+            <div class="flex items-center gap-1.5">
+                <button onclick="fetchLibraries()" class="w-7 h-7 rounded-lg flex items-center justify-center text-ardTextMuted hover:text-ardTeal hover:bg-ardHover transition-colors" title="Refresh Libraries">
+                    <i class="ph-bold ph-arrows-clockwise text-sm"></i>
                 </button>
-                <button onclick="toggleLibrarySidebar()" class="text-ardTextMuted hover:text-white transition-colors" title="Close">
-                    <i class="ph-bold ph-x text-lg"></i>
+                <button onclick="document.getElementById('lib-zip-input').click()" class="px-2 py-1 rounded-lg bg-ardTeal/15 hover:bg-ardTeal text-ardTeal hover:text-white border border-ardTeal/30 text-[11px] font-semibold flex items-center gap-1 transition-all" title="Install .ZIP Library">
+                    <i class="ph-bold ph-plus text-xs"></i> ZIP
+                </button>
+                <button onclick="toggleLibrarySidebar()" class="w-7 h-7 rounded-lg flex items-center justify-center text-ardTextMuted hover:text-white hover:bg-ardHover transition-colors" title="Close Drawer">
+                    <i class="ph-bold ph-x text-sm"></i>
                 </button>
             </div>
         </div>
-        <div class="p-3 flex-1 overflow-y-auto flex flex-col gap-3">
-            <div class="border-2 border-dashed border-ardBorder rounded-lg p-3 text-center bg-ardBg cursor-pointer hover:border-ardTeal transition-colors" onclick="document.getElementById('lib-zip-input').click()" id="lib-drop-zone">
-                <i class="ph-bold ph-file-zip text-2xl text-ardTextMuted mb-1"></i>
-                <div class="text-[11px] text-white font-medium">Drop .zip Library here</div>
+        <div class="p-3.5 flex-1 overflow-hidden flex flex-col gap-3">
+            <!-- Animated ZIP Drop Zone -->
+            <div class="group relative border-2 border-dashed border-ardBorder hover:border-ardTeal rounded-xl p-3 text-center bg-gradient-to-b from-ardBg to-ardCard/60 cursor-pointer transition-all hover:shadow-[0_0_20px_rgba(0,180,182,0.12)]" onclick="document.getElementById('lib-zip-input').click()" id="lib-drop-zone">
+                <div class="w-8 h-8 mx-auto mb-1 rounded-full bg-ardTeal/10 border border-ardTeal/20 flex items-center justify-center text-ardTeal group-hover:scale-110 transition-transform">
+                    <i class="ph-bold ph-file-zip text-lg"></i>
+                </div>
+                <div class="text-xs text-white font-semibold group-hover:text-ardTeal transition-colors">Install .ZIP Library</div>
+                <div class="text-[10px] text-ardTextMuted">Click to browse or drag & drop archive</div>
                 <input type="file" id="lib-zip-input" accept=".zip" class="hidden" onchange="handleLibZipSelect(event)">
             </div>
 
-            <!-- LIBRARY SEARCH INPUT -->
-            <div class="relative">
-                <i class="ph-bold ph-magnifying-glass absolute left-2.5 top-2.5 text-ardTextMuted text-xs"></i>
-                <input type="text" id="lib-search-input" placeholder="Search libraries..." oninput="filterLibraries()" class="flat-input w-full pl-8 pr-2 py-1.5 rounded-lg text-xs font-mono text-white placeholder:text-gray-500">
+            <!-- Filter Tabs -->
+            <div class="grid grid-cols-3 gap-1 p-1 bg-ardBg rounded-lg border border-ardBorder text-[11px] font-medium">
+                <button onclick="setLibFilter('all')" id="lib-tab-all" class="lib-filter-btn py-1 rounded-md bg-ardTeal text-white font-semibold transition-all">All</button>
+                <button onclick="setLibFilter('user')" id="lib-tab-user" class="lib-filter-btn py-1 rounded-md text-ardTextMuted hover:text-white transition-all">Custom</button>
+                <button onclick="setLibFilter('core')" id="lib-tab-core" class="lib-filter-btn py-1 rounded-md text-ardTextMuted hover:text-white transition-all">ESP Core</button>
             </div>
 
-            <div id="lib-list-container" class="space-y-2 flex-1 overflow-y-auto">
-                <div class="text-center text-ardTextMuted text-sm py-4">Loading libraries...</div>
+            <!-- Search Input -->
+            <div class="relative">
+                <i class="ph-bold ph-magnifying-glass absolute left-3 top-2.5 text-ardTextMuted text-xs"></i>
+                <input type="text" id="lib-search-input" placeholder="Filter by library name..." oninput="syncLibSearch(this.value)" class="flat-input w-full pl-8 pr-7 py-1.5 rounded-lg text-xs font-mono text-white placeholder:text-gray-500">
+                <button onclick="syncLibSearch('')" class="absolute right-2 top-2 text-ardTextMuted hover:text-white text-xs" title="Clear search">
+                    <i class="ph-bold ph-x-circle"></i>
+                </button>
+            </div>
+
+            <div id="lib-list-container" class="space-y-2 flex-1 overflow-y-auto pr-0.5">
+                <div class="text-center text-ardTextMuted text-xs py-6">Loading libraries...</div>
             </div>
         </div>
     </div>
@@ -3094,9 +3589,9 @@ IDE_HTML = """<!DOCTYPE html>
                     <input type="text" id="top-wifi-ssid" placeholder="WiFi SSID" class="bg-transparent text-xs w-24 text-white outline-none placeholder:text-gray-500 font-mono" oninput="saveWifiConfig()">
                 </div>
                 <div class="flex items-center bg-ardCard border border-ardBorder rounded-lg px-2 h-8">
-                    <input type="password" id="top-wifi-pass" placeholder="Password" class="bg-transparent text-xs w-20 text-white outline-none placeholder:text-gray-500 font-mono" oninput="saveWifiConfig()">
-                    <button type="button" onclick="togglePassword('top-wifi-pass')" class="text-ardTextMuted hover:text-white ml-1">
-                        <i class="ph-bold ph-eye text-xs"></i>
+                    <input type="password" id="top-wifi-pass" placeholder="Password" class="bg-transparent text-xs w-24 text-white outline-none placeholder:text-gray-500 font-mono" oninput="saveWifiConfig()">
+                    <button type="button" id="btn-toggle-wifi-pass" onclick="togglePassword('top-wifi-pass', this)" class="text-ardTextMuted hover:text-white ml-1 px-1 py-0.5 rounded hover:bg-ardHover transition-colors cursor-pointer" title="Show / Hide Wi-Fi Password">
+                        <i class="ph-bold ph-eye text-xs pointer-events-none"></i>
                     </button>
                 </div>
             </div>
@@ -3151,11 +3646,11 @@ IDE_HTML = """<!DOCTYPE html>
             <button onclick="switchMainView('view-editor')" id="nav-editor" class="nav-btn p-2.5 rounded-xl text-ardTeal bg-ardHover border border-ardBorder relative group transition-all" title="Code Editor">
                 <i class="ph-bold ph-code text-xl"></i>
             </button>
-            <button onclick="toggleLibrarySidebar()" class="nav-btn p-2.5 rounded-xl text-ardTextMuted hover:text-white hover:bg-ardHover relative group transition-all" title="Library Manager">
-                <i class="ph-bold ph-books text-xl"></i>
-            </button>
-            <button onclick="switchMainView('view-usb')" id="nav-usb" class="nav-btn p-2.5 rounded-xl text-ardTextMuted hover:text-white hover:bg-ardHover relative group transition-all" title="USB Provisioning">
+            <button onclick="switchMainView('view-usb')" id="nav-usb" class="nav-btn p-2.5 rounded-xl text-ardTextMuted hover:text-white hover:bg-ardHover relative group transition-all" title="Direct USB Provisioning">
                 <i class="ph-bold ph-usb text-xl"></i>
+            </button>
+            <button onclick="switchMainView('view-libraries')" id="nav-libraries" class="nav-btn p-2.5 rounded-xl text-ardTextMuted hover:text-white hover:bg-ardHover relative group transition-all" title="Library Manager">
+                <i class="ph-bold ph-books text-xl"></i>
             </button>
             <button onclick="switchMainView('view-fleets')" id="nav-fleets" class="nav-btn p-2.5 rounded-xl text-ardTextMuted hover:text-white hover:bg-ardHover relative group transition-all" title="Fleet & Device Manager">
                 <i class="ph-bold ph-hard-drives text-xl"></i>
@@ -3174,11 +3669,17 @@ IDE_HTML = """<!DOCTYPE html>
                 <main id="view-editor" class="flex-1 flex flex-col overflow-hidden">
                     <!-- Editor Top Bar -->
                     <div class="flex items-center justify-between h-9 bg-ardBg border-b border-ardBorder select-none px-3">
-                        <div class="flex items-center h-full gap-1">
-                            <button onclick="switchEditorTab('tab-raw')" id="btn-tab-raw" class="editor-tab h-full flex items-center px-3 gap-1.5 text-xs font-medium text-white border-b-2 border-ardTeal transition-colors">
-                                <i class="ph-bold ph-file-code text-ardTeal"></i> Sketch.ino
+                        <div class="flex items-center h-full gap-1 overflow-x-auto">
+                            <div id="sketch-file-tabs" class="flex items-center h-full gap-1">
+                                <button onclick="selectSketchFileTab('Sketch.ino')" id="btn-tab-raw" class="editor-tab h-full flex items-center px-3 gap-1.5 text-xs font-medium text-white border-b-2 border-ardTeal transition-colors">
+                                    <i class="ph-bold ph-file-code text-ardTeal"></i> Sketch.ino
+                                </button>
+                            </div>
+                            <button onclick="promptNewSketchFile()" class="h-6 px-2 rounded-md bg-ardCard hover:bg-ardHover border border-ardBorder text-ardTextMuted hover:text-ardTeal text-[11px] font-mono flex items-center gap-1 ml-1 flex-shrink-0 transition-colors" title="Create a new .h or .cpp file in this sketch folder">
+                                <i class="ph-bold ph-plus"></i> .h / .cpp
                             </button>
-                            <button onclick="switchEditorTab('tab-wrap')" id="btn-tab-wrap" class="editor-tab h-full flex items-center px-3 gap-1.5 text-xs font-medium text-ardTextMuted hover:text-white border-b-2 border-transparent transition-colors">
+                            <div class="h-4 w-px bg-ardBorder mx-1 flex-shrink-0"></div>
+                            <button onclick="switchEditorTab('tab-wrap')" id="btn-tab-wrap" class="editor-tab h-full flex items-center px-3 gap-1.5 text-xs font-medium text-ardTextMuted hover:text-white border-b-2 border-transparent transition-colors flex-shrink-0">
                                 <i class="ph-bold ph-file-text"></i> OTA_Wrapped.cpp Preview
                             </button>
                         </div>
@@ -3232,16 +3733,23 @@ void loop() {
                     </div>
 
                     <!-- Editor Footer Status Bar -->
-                    <div class="h-6 bg-ardBg border-t border-ardBorder flex items-center justify-between px-3 text-[11px] text-ardTextMuted select-none font-mono flex-shrink-0">
-                        <div class="flex items-center gap-4">
-                            <span id="char-count">Lines: 12 | Length: 228</span>
-                            <span>Target: <span id="status-target" class="text-white">DefaultFleet/fleet</span></span>
+                    <div class="h-7 bg-ardBg border-t border-ardBorder flex items-center justify-between px-3 text-[11px] text-ardTextMuted select-none font-mono flex-shrink-0">
+                        <div class="flex items-center gap-3">
+                            <span id="cursor-pos" class="flex items-center gap-1 text-ardTextMain"><i class="ph-bold ph-Hash text-ardTeal text-xs"></i> Ln 1, Col 1</span>
+                            <span class="text-ardBorder">|</span>
+                            <span id="char-count">Lines: 12 | Chars: 228</span>
+                            <span class="text-ardBorder">|</span>
+                            <button onclick="toggleDropdown('fleet-dropdown', event)" class="flex items-center gap-1 hover:text-white transition-colors" title="Click to switch OTA deployment target">
+                                <i class="ph-bold ph-broadcast text-ardTeal text-xs"></i>
+                                <span>Target:</span>
+                                <span id="status-target" class="text-white font-semibold">DefaultFleet/fleet</span>
+                            </button>
                         </div>
-                        <div class="flex items-center gap-2">
+                        <div class="flex items-center gap-3">
                             <span id="warmup-chip" class="hidden"></span>
-                            <div class="flex items-center gap-1">
-                                <span>Board:</span>
-                                <select id="board-selector" class="bg-ardBg text-white outline-none cursor-pointer border border-transparent hover:border-ardBorder rounded px-1 -ml-1" onchange="syncBoardSelectors(this.value)">
+                            <div class="flex items-center gap-1.5 px-2 py-0.5 rounded bg-ardCard border border-ardBorder">
+                                <i class="ph-bold ph-cpu text-ardTeal text-xs"></i>
+                                <select id="board-selector" class="bg-transparent text-white outline-none cursor-pointer text-[11px]" onchange="syncBoardSelectors(this.value)">
                                     <option value="esp32:esp32:esp32" class="bg-ardBg">ESP32 Dev Module</option>
                                     <option value="esp32:esp32:esp32cam" class="bg-ardBg">ESP32-CAM (AI Thinker)</option>
                                     <option value="esp32:esp32:esp32s2" class="bg-ardBg">ESP32-S2</option>
@@ -3251,19 +3759,24 @@ void loop() {
                                     <option value="esp8266:esp8266:generic" class="bg-ardBg">Generic ESP8266</option>
                                 </select>
                             </div>
-                            <span>Speed: 115200</span>
+                            <span class="px-1.5 py-0.5 rounded bg-ardCard border border-ardBorder text-[10px] text-ardTextMain">115200 Bd</span>
                         </div>
                     </div>
                 </main>
 
-                <!-- VIEW 2: USB PROVISIONING -->
+                <!-- VIEW 2: DIRECT USB PROVISIONING -->
                 <main id="view-usb" class="flex-1 overflow-y-auto p-8 view-hidden">
-                    <div class="max-w-3xl mx-auto w-full flex flex-col gap-6 pb-8">
-                        <div class="border-b border-ardBorder pb-4">
-                            <h2 class="text-2xl font-bold text-white flex items-center gap-2.5">
-                                <i class="ph-bold ph-usb text-ardTeal"></i> Direct USB Provisioning
-                            </h2>
-                            <p class="text-xs text-ardTextMuted mt-1">Flash new ESP32 microcontrollers over USB to connect them to your WiFeY OTA Fleet.</p>
+                    <div class="max-w-4xl mx-auto w-full flex flex-col gap-6 pb-10">
+                        <div class="border-b border-ardBorder pb-4 flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                                <h2 class="text-2xl font-bold text-white flex items-center gap-2.5">
+                                    <i class="ph-bold ph-usb text-ardTeal"></i> Direct USB Provisioning
+                                </h2>
+                                <p class="text-xs text-ardTextMuted mt-1">Flash new ESP32, ESP32-CAM, or ESP8266 microcontrollers over USB to join your WiFeY OTA Fleet.</p>
+                            </div>
+                            <button onclick="switchMainView('view-libraries')" class="px-3 py-1.5 rounded-lg bg-ardCard hover:bg-ardHover border border-ardBorder text-xs text-ardTeal font-medium flex items-center gap-1.5 transition-colors">
+                                <i class="ph-bold ph-books"></i> Open Library Manager
+                            </button>
                         </div>
 
                         <div class="bg-ardCard border border-ardBorder rounded-xl p-6 shadow-xl space-y-5">
@@ -3320,12 +3833,103 @@ void loop() {
                                 <div class="font-semibold text-white flex items-center gap-1.5">
                                     <i class="ph-bold ph-info text-ardTeal"></i> Live Provisioning Progress:
                                 </div>
-                                <div>Compiles bootloader sketch and streams all Arduino CLI & esptool upload messages live in the Output box below.</div>
+                                <div>Compiles the hardware-specific Pull-OTA bootloader (NVS on ESP32/ESP32-CAM, EEPROM on ESP8266) and streams all upload messages live in the Output console below.</div>
                             </div>
 
                             <button onclick="flashDevice()" id="btn-flash-device" class="w-full flex items-center justify-center gap-2 py-3 px-4 bg-ardTeal hover:bg-[#009b9d] text-white text-sm font-semibold rounded-xl transition-all shadow-lg hover:shadow-[0_0_16px_rgba(0,180,182,0.4)] active:scale-[0.99]">
                                 <i class="ph-bold ph-lightning text-lg" id="icon-flash"></i> <span>Compile & Provision via USB</span>
                             </button>
+                        </div>
+                    </div>
+                </main>
+
+                <!-- VIEW 2B: INDEPENDENT LIBRARY MANAGER PAGE (Directly Below USB Provisioning in Nav Bar) -->
+                <main id="view-libraries" class="flex-1 overflow-y-auto p-8 view-hidden">
+                    <div class="max-w-5xl mx-auto w-full flex flex-col gap-6 pb-10">
+                        <div class="border-b border-ardBorder pb-4 flex flex-wrap items-center justify-between gap-3">
+                            <div class="flex items-center gap-3">
+                                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-ardTeal/25 to-cyan-500/10 border border-ardTeal/40 flex items-center justify-center text-ardTeal shadow-lg">
+                                    <i class="ph-bold ph-books text-2xl"></i>
+                                </div>
+                                <div>
+                                    <h2 class="text-2xl font-bold text-white flex items-center gap-2">
+                                        Library Manager
+                                        <span id="lib-stat-total" class="text-[11px] font-mono px-2 py-0.5 rounded-full bg-ardTeal/15 text-ardTeal border border-ardTeal/30">0 Total</span>
+                                    </h2>
+                                    <p class="text-xs text-ardTextMuted mt-0.5">Search & download official Arduino libraries directly from the registry, upload custom <code class="text-ardTeal font-mono">.zip</code> archives, or inject <code class="text-ardTeal font-mono">#include</code> headers into your sketch.</p>
+                                </div>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <span id="lib-stat-user" class="text-[11px] font-mono px-2.5 py-1 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">0 Custom</span>
+                                <span id="lib-stat-core" class="text-[11px] font-mono px-2.5 py-1 rounded-lg bg-indigo-500/10 text-indigo-300 border border-indigo-500/20">0 Core</span>
+                                <button onclick="switchMainView('view-editor'); setTimeout(() => toggleLibrarySidebar(true), 60);" class="px-3 py-1.5 rounded-lg bg-ardCard hover:bg-ardHover border border-ardBorder text-xs text-ardTeal font-medium flex items-center gap-1.5 transition-colors" title="Open side drawer in Code Editor">
+                                    <i class="ph-bold ph-sidebar-simple"></i> Editor Drawer
+                                </button>
+                                <button onclick="fetchLibraries()" class="px-3 py-1.5 rounded-lg bg-ardCard hover:bg-ardHover border border-ardBorder text-xs text-white flex items-center gap-1.5 transition-colors">
+                                    <i class="ph-bold ph-arrows-clockwise text-ardTeal"></i> Refresh
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- ONLINE ARDUINO LIBRARY REGISTRY SEARCH & ONE-CLICK DOWNLOAD -->
+                        <div class="bg-ardCard border border-ardBorder rounded-xl p-6 shadow-xl space-y-4">
+                            <div class="flex flex-wrap items-center justify-between gap-2">
+                                <div>
+                                    <h3 class="text-sm font-bold text-white flex items-center gap-2">
+                                        <i class="ph-bold ph-cloud-arrow-down text-ardTeal text-lg"></i>
+                                        Download Libraries from Official Arduino Registry
+                                    </h3>
+                                    <p class="text-xs text-ardTextMuted">Search and install official ESP32, ESP8266, and Arduino libraries directly without hunting for GitHub ZIP files.</p>
+                                </div>
+                            </div>
+                            <div class="flex gap-2">
+                                <div class="relative flex-1">
+                                    <i class="ph-bold ph-globe-hemisphere-west absolute left-3 top-2.5 text-ardTeal text-sm"></i>
+                                    <input type="text" id="online-lib-search-input" placeholder="Search online registry (e.g. PubSubClient, DHT sensor library, Adafruit NeoPixel, OneWire, Blynk)..." onkeydown="if(event.key==='Enter') searchOnlineLibraries()" class="flat-input w-full pl-9 pr-4 py-2 rounded-lg text-xs font-mono text-white placeholder:text-gray-500">
+                                </div>
+                                <button onclick="searchOnlineLibraries()" id="btn-online-lib-search" class="px-4 py-2 rounded-lg bg-ardTeal hover:bg-[#009b9d] text-white text-xs font-semibold flex items-center gap-1.5 transition-all shadow-md flex-shrink-0">
+                                    <i class="ph-bold ph-magnifying-glass"></i> Search & Download
+                                </button>
+                            </div>
+                            <div id="online-lib-results" class="grid grid-cols-1 md:grid-cols-2 gap-3 max-h-80 overflow-y-auto pr-1 hidden"></div>
+                        </div>
+
+                        <!-- INSTALLED LIBRARIES & ZIP UPLOADER -->
+                        <div class="bg-ardCard border border-ardBorder rounded-xl p-6 shadow-xl space-y-5">
+                            <div class="grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
+                                <div onclick="document.getElementById('lib-zip-input').click()" class="lg:col-span-5 group border-2 border-dashed border-ardBorder hover:border-ardTeal rounded-xl p-4 bg-gradient-to-br from-ardPanel via-ardBg to-ardPanel flex items-center gap-3.5 cursor-pointer transition-all hover:shadow-[0_0_24px_rgba(0,180,182,0.15)]">
+                                    <div class="w-11 h-11 rounded-xl bg-ardTeal/15 border border-ardTeal/30 flex items-center justify-center text-ardTeal flex-shrink-0 group-hover:scale-110 transition-transform">
+                                        <i class="ph-bold ph-cloud-arrow-up text-2xl"></i>
+                                    </div>
+                                    <div class="min-w-0">
+                                        <div class="text-xs font-bold text-white group-hover:text-ardTeal transition-colors">Add Custom .ZIP Library</div>
+                                        <div class="text-[11px] text-ardTextMuted mt-0.5">Drop a <span class="text-white font-mono">.zip</span> archive anywhere or click to browse</div>
+                                    </div>
+                                </div>
+
+                                <div class="lg:col-span-7 flex flex-col justify-between gap-3 bg-ardPanel border border-ardBorder rounded-xl p-3.5">
+                                    <div class="flex flex-wrap items-center justify-between gap-2">
+                                        <div class="flex items-center gap-1 bg-ardBg p-1 rounded-lg border border-ardBorder text-xs">
+                                            <button onclick="setLibFilter('all')" id="usb-lib-tab-all" class="px-3 py-1 rounded-md bg-ardTeal text-white font-semibold transition-all">All Packages</button>
+                                            <button onclick="setLibFilter('user')" id="usb-lib-tab-user" class="px-3 py-1 rounded-md text-ardTextMuted hover:text-white transition-all">User Installed</button>
+                                            <button onclick="setLibFilter('core')" id="usb-lib-tab-core" class="px-3 py-1 rounded-md text-ardTextMuted hover:text-white transition-all">ESP Core Built-in</button>
+                                        </div>
+                                        <span class="text-[11px] text-ardTextMuted font-mono hidden sm:inline">Click <span class="text-ardTeal">+ #include</span> to add to Sketch</span>
+                                    </div>
+
+                                    <div class="relative">
+                                        <i class="ph-bold ph-magnifying-glass absolute left-3 top-2.5 text-ardTextMuted text-xs"></i>
+                                        <input type="text" id="usb-lib-search-input" placeholder="Search installed libraries (e.g. ArduinoJson, WiFi, Wire, SPI)..." oninput="syncLibSearch(this.value)" class="flat-input w-full pl-8 pr-8 py-2 rounded-lg text-xs font-mono text-white placeholder:text-gray-500">
+                                        <button onclick="syncLibSearch('')" class="absolute right-2.5 top-2.5 text-ardTextMuted hover:text-white text-xs" title="Clear search">
+                                            <i class="ph-bold ph-x-circle"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div id="usb-lib-list-container" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 max-h-96 overflow-y-auto pr-1">
+                                <div class="col-span-full text-center text-ardTextMuted text-xs py-8">Loading libraries...</div>
+                            </div>
                         </div>
                     </div>
                 </main>
@@ -3468,29 +4072,29 @@ void loop() {
                                             <label class="block text-[11px] text-ardTextMuted mb-1">Permission Scope</label>
                                             <select id="collab_scope_type" onchange="onCollabScopeChange()" class="flat-input w-full p-2 rounded-lg text-xs text-white cursor-pointer">
                                                 <option value="all">Entire Project (All Fleets & Nodes)</option>
-                                                <option value="fleet" selected>Specific Fleet</option>
-                                                <option value="node">Specific Node</option>
+                                                <option value="fleet">Specific Fleet</option>
+                                                <option value="node" selected>Specific Node</option>
                                             </select>
                                         </div>
                                         <div>
-                                            <label class="block text-[11px] text-ardTextMuted mb-1">Requested Duration</label>
-                                            <select id="collab_duration_min" class="flat-input w-full p-2 rounded-lg text-xs text-white cursor-pointer font-mono">
-                                                <option value="15">15 Minutes</option>
-                                                <option value="30">30 Minutes</option>
-                                                <option value="60" selected>1 Hour</option>
-                                                <option value="120">2 Hours</option>
-                                                <option value="240">4 Hours</option>
-                                                <option value="480">8 Hours</option>
-                                                <option value="1440">24 Hours (1 Day)</option>
-                                                <option value="4320">3 Days</option>
-                                                <option value="10080">7 Days</option>
-                                            </select>
+                                            <label class="block text-[11px] text-ardTextMuted mb-1">Custom Duration</label>
+                                            <div class="flex gap-1.5">
+                                                <input type="number" id="collab_duration_val" min="1" max="100000" value="30" class="flat-input w-20 p-2 rounded-lg text-xs font-mono text-white" placeholder="30">
+                                                <select id="collab_duration_unit" class="flat-input flex-1 p-2 rounded-lg text-xs text-white cursor-pointer font-mono">
+                                                    <option value="1" selected>Minutes</option>
+                                                    <option value="60">Hours</option>
+                                                    <option value="1440">Days</option>
+                                                </select>
+                                            </div>
                                         </div>
                                     </div>
 
-                                    <div id="collab_target_row">
-                                        <label class="block text-[11px] text-ardTextMuted mb-1" id="collab_target_label">Target Fleet Name or Node ID</label>
-                                        <input type="text" id="collab_target_id" list="collab_target_suggestions" value="DefaultFleet" placeholder="e.g. DefaultFleet or node_1" class="flat-input w-full p-2 rounded-lg text-xs font-mono text-white">
+                                    <div id="collab_target_row" class="space-y-1.5">
+                                        <label class="block text-[11px] text-ardTextMuted" id="collab_target_label">Target Node / Fleet (Click Lookup to select from dropdown)</label>
+                                        <select id="collab_target_select" onchange="if(this.value) document.getElementById('collab_target_id').value = this.value;" class="flat-input w-full p-2 rounded-lg text-xs font-mono text-ardTeal font-semibold cursor-pointer hidden">
+                                            <option value="">-- Select discovered target --</option>
+                                        </select>
+                                        <input type="text" id="collab_target_id" list="collab_target_suggestions" value="node_1" placeholder="Select from dropdown above or type ID..." class="flat-input w-full p-2 rounded-lg text-xs font-mono text-white">
                                         <datalist id="collab_target_suggestions"></datalist>
                                     </div>
 
@@ -3702,91 +4306,126 @@ void loop() {
             <div class="w-full flex-shrink-0 z-20 flex flex-col">
                 
             <!-- DRAGGABLE RESIZER BAR -->
-            <div id="panel-resizer" class="w-full h-2 cursor-ns-resize bg-ardBorder hover:bg-ardTeal flex items-center justify-center transition-colors z-30 group" title="Drag to resize">
-                <div class="w-12 h-1 bg-gray-500 rounded-full group-hover:bg-white transition-colors"></div>
+            <div id="panel-resizer" ondblclick="toggleBottomPanelSize()" class="w-full h-2 cursor-ns-resize bg-ardBorder hover:bg-ardTeal flex items-center justify-center transition-colors z-30 group select-none" title="Drag to resize panel (Double-click to expand/restore)">
+                <div class="w-14 h-1 bg-gray-500 rounded-full group-hover:bg-white transition-colors"></div>
             </div>
             
             <!-- BOTTOM PANEL -->
-            <div id="bottom-panel" class="w-full flex-none flex flex-col bg-ardPanel z-20" style="height: 250px; min-height: 120px; max-height: 75vh; overflow: hidden;">
+            <div id="bottom-panel" class="w-full flex-none flex flex-col bg-ardPanel z-20 transition-[height] duration-75" style="height: 255px; min-height: 110px; max-height: 75vh; overflow: hidden;">
                 
-                <!-- Top Bar -->
-                <div class="flex items-center justify-between h-8 bg-ardBg px-2 border-b border-ardBorder select-none flex-shrink-0">
+                <!-- Bottom Bar Header -->
+                <div class="flex items-center justify-between h-9 bg-ardBg px-3 border-b border-ardBorder select-none flex-shrink-0">
                     <div class="flex items-center h-full gap-1">
-                        <button onclick="switchPanelTab('panel-out')" id="btn-panel-out" class="panel-tab flex items-center px-3 h-full text-xs font-medium text-white border-b-2 border-ardTeal transition-colors">
-                            <i class="ph-bold ph-terminal mr-1.5 text-xs"></i> Output
+                        <button onclick="switchPanelTab('panel-out')" id="btn-panel-out" class="panel-tab flex items-center gap-1.5 px-3 h-full text-xs font-semibold text-white border-b-2 border-ardTeal transition-colors">
+                            <i class="ph-bold ph-terminal-window text-sm text-ardTeal"></i>
+                            <span>Output Console</span>
+                            <span id="out-line-badge" class="ml-1 px-1.5 py-0.2 rounded-full text-[10px] font-mono bg-ardCard border border-ardBorder text-ardTextMuted">1</span>
                         </button>
-                        <button onclick="switchPanelTab('panel-serial')" id="btn-panel-serial" class="panel-tab flex items-center px-3 h-full text-xs font-medium text-ardTextMuted hover:text-white border-b-2 border-transparent transition-colors">
-                            <i class="ph-bold ph-cpu mr-1.5 text-xs"></i> Serial Monitor
+                        <button onclick="switchPanelTab('panel-serial')" id="btn-panel-serial" class="panel-tab flex items-center gap-1.5 px-3 h-full text-xs font-semibold text-ardTextMuted hover:text-white border-b-2 border-transparent transition-colors">
+                            <i class="ph-bold ph-waveform text-sm"></i>
+                            <span>Serial Monitor</span>
+                            <span id="serial-tab-dot" class="w-2 h-2 rounded-full bg-gray-500 ml-1" title="Disconnected"></span>
                         </button>
                     </div>
-                    <div class="flex items-center gap-2">
-                        <span id="output-spinner" class="hidden items-center gap-1.5 text-xs text-ardTeal font-mono">
+                    <div class="flex items-center gap-1.5">
+                        <span id="output-spinner" class="hidden items-center gap-1.5 text-xs text-ardTeal font-mono bg-ardTeal/10 border border-ardTeal/30 px-2.5 py-0.5 rounded-full mr-1">
                             <i class="ph-bold ph-spinner animate-spin"></i> Running CLI...
                         </span>
-                        <button onclick="clearCurrentPanel()" class="text-ardTextMuted hover:text-white text-xs px-2 py-0.5 rounded hover:bg-ardHover transition-colors" title="Clear Logs">
-                            <i class="ph-bold ph-prohibit mr-1"></i> Clear
+                        <button onclick="copyActivePanelLogs()" class="text-ardTextMuted hover:text-white text-xs px-2 py-1 rounded-md hover:bg-ardHover transition-colors flex items-center gap-1" title="Copy logs from active tab">
+                            <i class="ph-bold ph-copy"></i> <span class="hidden sm:inline">Copy</span>
+                        </button>
+                        <button onclick="clearCurrentPanel()" class="text-ardTextMuted hover:text-rose-300 text-xs px-2 py-1 rounded-md hover:bg-ardHover transition-colors flex items-center gap-1" title="Clear active console">
+                            <i class="ph-bold ph-trash"></i> <span class="hidden sm:inline">Clear</span>
+                        </button>
+                        <div class="h-3.5 w-px bg-ardBorder mx-0.5"></div>
+                        <button onclick="toggleBottomPanelSize()" id="btn-panel-expand" class="text-ardTextMuted hover:text-white p-1 rounded-md hover:bg-ardHover transition-colors" title="Maximize / Restore Bottom Panel">
+                            <i class="ph-bold ph-arrows-out-line-vertical text-xs"></i>
+                        </button>
+                        <button onclick="toggleBottomPanelCollapse()" id="btn-panel-collapse" class="text-ardTextMuted hover:text-white p-1 rounded-md hover:bg-ardHover transition-colors" title="Minimize / Restore Bottom Panel">
+                            <i class="ph-bold ph-caret-down text-xs" id="icon-panel-collapse"></i>
                         </button>
                     </div>
                 </div>
 
                 <!-- Panel Content: Live Output Logs -->
-                <div id="panel-out" class="panel-content flex-1 p-3 overflow-y-auto font-mono text-xs text-[#d4d4d4] bg-ardPanel space-y-0.5 select-text min-h-0">
-                    <div class="text-ardTextMuted">WiFeY Studio initialized. Toolchain loaded and ready.</div>
+                <div id="panel-out" class="panel-content flex-1 p-3 overflow-y-auto font-mono text-xs text-[#d4d4d4] bg-[#141519] space-y-1 select-text min-h-0">
+                    <div class="text-ardTextMuted">[System] WiFeY Studio initialized. Toolchain loaded and ready.</div>
                 </div>
 
-                <!-- Panel Content: Serial Monitor -->
-                <div id="panel-serial" class="panel-content flex-1 flex flex-col view-hidden bg-ardPanel min-h-0">
-                    <div class="flex items-center gap-2 p-1.5 border-b border-ardBorder bg-ardCard text-xs select-none flex-shrink-0">
-                        <div class="flex items-center rounded-lg border border-ardBorder overflow-hidden flex-shrink-0">
-                            <button id="serial-mode-usb" onclick="setSerialMode('usb')" class="px-2.5 py-1 text-[11px] font-semibold flex items-center gap-1 bg-ardTeal text-white"><i class="ph-bold ph-usb"></i> USB</button>
-                            <button id="serial-mode-lan" onclick="setSerialMode('lan')" class="px-2.5 py-1 text-[11px] font-semibold flex items-center gap-1 bg-ardPanel text-ardTextMuted hover:text-white" title="Read the Serial output of an ESP32 over Wi-Fi"><i class="ph-bold ph-wifi-high"></i> Wi-Fi (LAN)</button>
+                <!-- Panel Content: Redesigned Serial Monitor -->
+                <div id="panel-serial" class="panel-content flex-1 flex flex-col view-hidden bg-[#121316] min-h-0">
+                    <!-- Serial Control Toolbar -->
+                    <div class="flex flex-wrap items-center gap-2 px-3 py-1.5 border-b border-ardBorder bg-ardCard/90 text-xs select-none flex-shrink-0">
+                        <!-- Mode Segmented Switch -->
+                        <div class="flex items-center p-0.5 rounded-lg bg-ardBg border border-ardBorder flex-shrink-0">
+                            <button id="serial-mode-usb" onclick="setSerialMode('usb')" class="px-2.5 py-1 rounded-md text-[11px] font-semibold flex items-center gap-1 bg-ardTeal text-white transition-all"><i class="ph-bold ph-usb"></i> USB</button>
+                            <button id="serial-mode-lan" onclick="setSerialMode('lan')" class="px-2.5 py-1 rounded-md text-[11px] font-semibold flex items-center gap-1 text-ardTextMuted hover:text-white transition-all" title="Read the Serial output of an ESP32 over Wi-Fi"><i class="ph-bold ph-wifi-high"></i> Wi-Fi (LAN)</button>
                         </div>
-                        <select id="serial_port" class="flat-input text-xs py-1 px-2 rounded-lg text-white font-mono cursor-pointer w-36"></select>
-                        <select id="wserial_device" class="flat-input text-xs py-1 px-2 rounded-lg text-white font-mono cursor-pointer w-44" style="display:none"><option value="">No live LAN nodes</option></select>
-                        <input type="text" id="wserial_ip" placeholder="or IP, e.g. 192.168.4.1" class="flat-input text-xs py-1 px-2 rounded-lg text-white font-mono w-44" style="display:none">
-                        <select id="serial_baud" class="flat-input text-xs py-1 px-2 rounded-lg text-white font-mono cursor-pointer w-28">
-                            <option value="9600">9600 baud</option>
-                            <option value="19200">19200 baud</option>
-                            <option value="38400">38400 baud</option>
-                            <option value="57600">57600 baud</option>
-                            <option value="115200" selected>115200 baud</option>
-                            <option value="230400">230400 baud</option>
-                            <option value="460800">460800 baud</option>
-                            <option value="921600">921600 baud</option>
-                        </select>
 
-                        <div class="h-4 w-px bg-ardBorder mx-1"></div>
+                        <!-- USB Controls -->
+                        <div id="serial-usb-controls" class="flex items-center gap-1.5">
+                            <select id="serial_port" class="flat-input text-xs py-1 px-2.5 rounded-lg text-white font-mono cursor-pointer w-40 truncate"></select>
+                            <button onclick="loadSerialPorts()" title="Refresh COM ports" class="w-7 h-7 flex items-center justify-center rounded-lg border border-ardBorder bg-ardPanel hover:bg-ardHover text-ardTextMuted hover:text-ardTeal transition-colors flex-shrink-0">
+                                <i class="ph-bold ph-arrows-clockwise text-xs"></i>
+                            </button>
+                            <select id="serial_baud" class="flat-input text-xs py-1 px-2 rounded-lg text-white font-mono cursor-pointer w-28">
+                                <option value="9600">9600 Bd</option>
+                                <option value="19200">19200 Bd</option>
+                                <option value="38400">38400 Bd</option>
+                                <option value="57600">57600 Bd</option>
+                                <option value="115200" selected>115200 Bd</option>
+                                <option value="230400">230400 Bd</option>
+                                <option value="460800">460800 Bd</option>
+                                <option value="921600">921600 Bd</option>
+                            </select>
+                        </div>
 
-                        <button id="btn-serial-connect" onclick="connectSerial()" class="flex items-center gap-1.5 px-3 py-1 rounded-lg border border-emerald-500/30 text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/20 transition-colors font-medium">
+                        <!-- LAN Wireless Controls -->
+                        <div id="serial-lan-controls" class="hidden items-center gap-1.5">
+                            <select id="wserial_device" class="flat-input text-xs py-1 px-2.5 rounded-lg text-white font-mono cursor-pointer w-44"><option value="">No live LAN nodes</option></select>
+                            <input type="text" id="wserial_ip" placeholder="or IP (e.g. 192.168.4.1)" class="flat-input text-xs py-1 px-2.5 rounded-lg text-white font-mono w-40">
+                        </div>
+
+                        <!-- Connect / Disconnect + Live Status Pill -->
+                        <button id="btn-serial-connect" onclick="connectSerial()" class="flex items-center gap-1.5 px-3 py-1 rounded-lg border border-emerald-500/40 text-emerald-300 bg-emerald-500/15 hover:bg-emerald-500/25 transition-all font-semibold shadow-sm">
                             <i class="ph-bold ph-plug"></i> Connect
                         </button>
-                        <button id="btn-serial-disconnect" onclick="disconnectSerial()" class="flex items-center gap-1.5 px-3 py-1 rounded-lg border border-red-500/30 text-red-400 bg-red-500/10 hover:bg-red-500/20 transition-colors font-medium" style="display:none;">
+                        <button id="btn-serial-disconnect" onclick="disconnectSerial()" class="flex items-center gap-1.5 px-3 py-1 rounded-lg border border-rose-500/40 text-rose-300 bg-rose-500/15 hover:bg-rose-500/25 transition-all font-semibold shadow-sm" style="display:none;">
                             <i class="ph-bold ph-plugs"></i> Disconnect
                         </button>
 
+                        <span id="serial-status-pill" class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-mono bg-ardBg border border-ardBorder text-ardTextMuted">
+                            <span id="serial-status-dot" class="w-1.5 h-1.5 rounded-full bg-gray-500"></span>
+                            <span id="serial-status-text">Offline</span>
+                        </span>
+
                         <div class="flex-1"></div>
 
-                        <label class="flex items-center gap-1 text-[11px] text-ardTextMuted cursor-pointer">
-                            <input type="checkbox" id="serial-autoscroll" checked class="rounded border-ardBorder"> Autoscroll
+                        <!-- Right Toggles & RX Stats -->
+                        <span id="serial-rx-counter" class="text-[10px] font-mono text-ardTextMuted px-2 py-0.5 rounded bg-ardBg border border-ardBorder" title="Received bytes / lines">RX: 0 B</span>
+
+                        <label class="flex items-center gap-1.5 px-2 py-1 rounded-md bg-ardBg border border-ardBorder text-[11px] text-ardTextMain cursor-pointer hover:border-ardTeal/50 transition-colors">
+                            <input type="checkbox" id="serial-autoscroll" checked class="rounded border-ardBorder accent-[#00b4b6]"> Autoscroll
                         </label>
-                        <label class="flex items-center gap-1 text-[11px] text-ardTextMuted cursor-pointer">
-                            <input type="checkbox" id="serial-timestamps" class="rounded border-ardBorder"> Timestamps
+                        <label class="flex items-center gap-1.5 px-2 py-1 rounded-md bg-ardBg border border-ardBorder text-[11px] text-ardTextMain cursor-pointer hover:border-ardTeal/50 transition-colors">
+                            <input type="checkbox" id="serial-timestamps" class="rounded border-ardBorder accent-[#00b4b6]"> Timestamps
                         </label>
                     </div>
 
                     <!-- Serial Data Log View -->
-                    <div id="serial_out" class="flex-1 p-3 overflow-y-auto font-mono text-xs text-[#e0e2ec] leading-relaxed whitespace-pre-wrap select-text bg-[#121316] min-h-0" style="user-select: text; -webkit-user-select: text;"><span class="text-ardTextMuted italic">--- Serial Monitor Disconnected ---</span></div>
+                    <div id="serial_out" class="flex-1 p-3 overflow-y-auto font-mono text-xs text-[#e0e2ec] leading-relaxed whitespace-pre-wrap select-text bg-[#101115] min-h-0" style="user-select: text; -webkit-user-select: text;"><div id="serial-empty-state" class="h-full flex flex-col items-center justify-center text-ardTextMuted select-none py-6"><i class="ph-bold ph-waveform text-2xl text-ardBorder mb-1"></i><span class="text-xs">Serial Monitor Disconnected — Select a COM port or LAN node and click Connect.</span></div></div>
 
                     <!-- Serial Send Bar -->
-                    <div class="flex items-center gap-2 p-1.5 border-t border-ardBorder bg-ardCard flex-shrink-0">
-                        <input type="text" id="serial-input" placeholder="Send serial command to ESP32..." class="flat-input flex-1 px-3 py-1 rounded-lg text-xs font-mono text-white" onkeydown="if(event.key==='Enter') sendSerialCommand()">
-                        <select id="serial-line-ending" class="flat-input text-xs py-1 px-2 rounded-lg text-white font-mono cursor-pointer">
+                    <div class="flex items-center gap-2 px-3 py-1.5 border-t border-ardBorder bg-ardCard flex-shrink-0">
+                        <span class="text-ardTeal font-mono font-bold text-xs select-none flex items-center gap-1"><i class="ph-bold ph-caret-right"></i>TX</span>
+                        <input type="text" id="serial-input" placeholder="Send command to device (Enter to send, ↑/↓ for history)..." class="flat-input flex-1 px-3 py-1.5 rounded-lg text-xs font-mono text-white" onkeydown="handleSerialInputKey(event)">
+                        <select id="serial-line-ending" class="flat-input text-xs py-1.5 px-2.5 rounded-lg text-white font-mono cursor-pointer">
                             <option value="\r\n">Both NL & CR (\r\n)</option>
                             <option value="\n">Newline (\n)</option>
                             <option value="\r">Carriage Return (\r)</option>
                             <option value="">No line ending</option>
                         </select>
-                        <button onclick="sendSerialCommand()" class="px-3 py-1 rounded-lg bg-ardTeal hover:bg-[#009b9d] text-white text-xs font-semibold transition-colors flex items-center gap-1">
+                        <button onclick="sendSerialCommand()" class="px-3.5 py-1.5 rounded-lg bg-ardTeal hover:bg-[#009b9d] text-white text-xs font-semibold transition-all flex items-center gap-1.5 shadow-sm active:scale-95">
                             <i class="ph-bold ph-paper-plane-right"></i> Send
                         </button>
                     </div>
@@ -3832,28 +4471,66 @@ void loop() {
             
             cmEditor.on("change", function() {
                 const val = cmEditor.getValue();
-                document.getElementById('char-count').innerText = `Lines: ${cmEditor.lineCount()} | Length: ${val.length}`;
+                document.getElementById('char-count').innerText = `Lines: ${cmEditor.lineCount()} | Chars: ${val.length}`;
                 if (typeof setVerifyChip === 'function' && !activeBin) setVerifyChip('');
             });
+
+            cmEditor.on("cursorActivity", function() {
+                const pos = cmEditor.getCursor();
+                const curEl = document.getElementById('cursor-pos');
+                if (curEl) curEl.innerHTML = `<i class="ph-bold ph-hash text-ardTeal text-xs"></i> Ln ${pos.line + 1}, Col ${pos.ch + 1}`;
+            });
             
-            // Trigger initial char count
+            // Initialize multi-file sketch tabs & load libraries
+            initSketchFiles();
             CodeMirror.signal(cmEditor, "change", cmEditor);
+            fetchLibraries();
             
             // Check status badge
             if (NGROK_API_URL.includes("localhost") || NGROK_API_URL.includes("127.0.0.1")) {
-                document.getElementById('ngrok-text').innerText = "Localhost Only";
+                document.getElementById('ngrok-text').innerText = "LAN Local Server";
                 document.getElementById('ngrok-pill').querySelector('span').classList.remove('bg-emerald-500');
-                document.getElementById('ngrok-pill').querySelector('span').classList.add('bg-amber-500');
+                document.getElementById('ngrok-pill').querySelector('span').classList.add('bg-cyan-400');
             }
         };
-        // --- SEARCH STATE ---
+
+        function togglePassword(inputId, btnEl) {
+            const el = document.getElementById(inputId);
+            if (!el) return;
+            const isHidden = (el.type === 'password');
+            el.type = isHidden ? 'text' : 'password';
+            const btn = btnEl || document.getElementById('btn-toggle-wifi-pass');
+            if (btn) {
+                const icon = btn.querySelector('i');
+                if (icon) {
+                    icon.className = isHidden
+                        ? 'ph-bold ph-eye-slash text-xs text-ardTeal pointer-events-none'
+                        : 'ph-bold ph-eye text-xs pointer-events-none';
+                }
+            }
+        }
+
+        function copyNgrokUrl() {
+            navigator.clipboard.writeText(NGROK_API_URL);
+            logToOutput(`[System] Copied Server URL to clipboard: ${NGROK_API_URL}`);
+        }
+
+        // --- SEARCH & LIBRARY FILTER STATE ---
         let allFetchedLibraries = [];
         let allFetchedExamples = [];
+        let activeLibFilter = 'all';
+        let activeLibQuery = '';
         
-        // --- LIBRARY MANAGER SIDEBAR LOGIC ---
-        function toggleLibrarySidebar() {
+        // --- LIBRARY MANAGER LOGIC (Independent Page + Collapsible Drawer + Online Registry Install) ---
+        function openLibraryManagerSection() {
+            switchMainView('view-libraries');
+        }
+
+        function toggleLibrarySidebar(forceOpen) {
             const sidebar = document.getElementById('lib-sidebar');
-            if (sidebar.classList.contains('hidden')) {
+            if (!sidebar) return;
+            const shouldOpen = (forceOpen !== undefined) ? !!forceOpen : sidebar.classList.contains('hidden');
+            if (shouldOpen) {
                 sidebar.classList.remove('hidden');
                 sidebar.classList.add('flex');
                 fetchLibraries();
@@ -3862,63 +4539,260 @@ void loop() {
                 sidebar.classList.remove('flex');
             }
         }
+
+        function searchOnlineLibraries() {
+            const q = (document.getElementById('online-lib-search-input')?.value || '').trim();
+            const resultsBox = document.getElementById('online-lib-results');
+            const btn = document.getElementById('btn-online-lib-search');
+            if (!q || q.length < 2) return alert('Enter at least 2 characters to search the official Arduino Library Registry.');
+            if (!resultsBox) return;
+
+            resultsBox.classList.remove('hidden');
+            resultsBox.innerHTML = `<div class="col-span-full text-center text-ardTeal text-xs py-6"><i class="ph-bold ph-spinner animate-spin mr-1.5"></i> Searching official Arduino Registry for "${escHtml(q)}"...</div>`;
+            if (btn) btn.disabled = true;
+
+            fetch('/api/lib/search?q=' + encodeURIComponent(q))
+                .then(r => r.json())
+                .then(data => {
+                    if (btn) btn.disabled = false;
+                    if (data.error) {
+                        resultsBox.innerHTML = `<div class="col-span-full text-red-400 text-xs text-center py-4">${escHtml(data.error)}</div>`;
+                        return;
+                    }
+                    const libs = data.libraries || [];
+                    if (libs.length === 0) {
+                        resultsBox.innerHTML = `<div class="col-span-full text-ardTextMuted text-xs text-center py-6">No libraries found matching "${escHtml(q)}".</div>`;
+                        return;
+                    }
+                    resultsBox.innerHTML = '';
+                    libs.forEach(lib => {
+                        const card = document.createElement('div');
+                        card.className = 'p-3.5 rounded-xl bg-ardPanel border border-ardBorder hover:border-ardTeal/60 flex flex-col justify-between gap-2.5 transition-all';
+                        const verOpts = (lib.versions && lib.versions.length ? lib.versions : [lib.version || 'latest']).map(v => `<option value="${escHtml(v)}">v${escHtml(v)}</option>`).join('');
+                        card.innerHTML = `
+                            <div>
+                                <div class="flex items-start justify-between gap-2">
+                                    <div class="font-bold text-white text-xs truncate" title="${escHtml(lib.name)}">${escHtml(lib.name)}</div>
+                                    <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-ardCard border border-ardBorder text-ardTeal flex-shrink-0">${escHtml(lib.category || 'Library')}</span>
+                                </div>
+                                <div class="text-[10px] text-ardTextMuted truncate mt-0.5">by ${escHtml(lib.author || 'Community')}</div>
+                                <p class="text-[11px] text-ardTextMain mt-1.5 line-clamp-2">${escHtml(lib.sentence || 'Official Arduino library package.')}</p>
+                            </div>
+                            <div class="flex items-center justify-between gap-2 pt-2 border-t border-ardBorder/60">
+                                <select class="ver-sel flat-input text-[11px] py-1 px-2 rounded text-white font-mono">${verOpts}</select>
+                                <button class="act-install-online px-3 py-1 rounded-lg ${lib.installed ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' : 'bg-ardTeal hover:bg-[#009b9d] text-white'} text-xs font-semibold flex items-center gap-1 transition-all">
+                                    <i class="ph-bold ${lib.installed ? 'ph-check' : 'ph-download-simple'}"></i>
+                                    <span>${lib.installed ? 'Installed (' + escHtml(lib.installed_version || 'v' + lib.version) + ')' : 'Download & Install'}</span>
+                                </button>
+                            </div>
+                        `;
+                        const verSel = card.querySelector('.ver-sel');
+                        const instBtn = card.querySelector('.act-install-online');
+                        instBtn.onclick = () => installOnlineLibrary(lib.name, verSel.value, instBtn);
+                        resultsBox.appendChild(card);
+                    });
+                })
+                .catch(err => {
+                    if (btn) btn.disabled = false;
+                    resultsBox.innerHTML = `<div class="col-span-full text-red-400 text-xs text-center py-4">Search error: ${escHtml(err)}</div>`;
+                });
+        }
+
+        function installOnlineLibrary(name, version, btnEl) {
+            if (btnEl) {
+                btnEl.disabled = true;
+                btnEl.innerHTML = `<i class="ph-bold ph-spinner animate-spin"></i> Installing...`;
+            }
+            fetch('/api/lib/install', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({name: name, version: version === 'latest' ? '' : version})
+            })
+            .then(r => r.json())
+            .then(res => {
+                if (res.success) {
+                    if (btnEl) {
+                        btnEl.disabled = false;
+                        btnEl.className = 'act-install-online px-3 py-1 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-xs font-semibold flex items-center gap-1';
+                        btnEl.innerHTML = `<i class="ph-bold ph-check"></i> Installed`;
+                    }
+                    fetchLibraries();
+                    populateLibraryExamples();
+                } else {
+                    if (btnEl) {
+                        btnEl.disabled = false;
+                        btnEl.innerHTML = `<i class="ph-bold ph-download-simple"></i> Retry`;
+                    }
+                    alert('Failed to install ' + name + ': ' + (res.error || 'Unknown error'));
+                }
+            })
+            .catch(err => {
+                if (btnEl) {
+                    btnEl.disabled = false;
+                    btnEl.innerHTML = `<i class="ph-bold ph-download-simple"></i> Download & Install`;
+                }
+                alert('Network error installing library: ' + err);
+            });
+        }
         
         function fetchLibraries() {
-            const container = document.getElementById('lib-list-container');
-            container.innerHTML = '<div class="text-center text-ardTextMuted text-sm py-4"><i class="ph-bold ph-spinner animate-spin"></i> Loading...</div>';
+            const c1 = document.getElementById('lib-list-container');
+            const c2 = document.getElementById('usb-lib-list-container');
+            const loadingHtml = '<div class="col-span-full text-center text-ardTextMuted text-xs py-6"><i class="ph-bold ph-spinner animate-spin text-ardTeal mr-1"></i> Indexing installed libraries...</div>';
+            if (c1) c1.innerHTML = loadingHtml;
+            if (c2) c2.innerHTML = loadingHtml;
             
             fetch('/api/lib/list')
                 .then(r => r.json())
                 .then(data => {
                     if (data.error) {
-                        container.innerHTML = `<div class="text-red-400 text-sm text-center py-4">${escHtml(data.error)}</div>`;
+                        const errHtml = `<div class="col-span-full text-red-400 text-xs text-center py-4">${escHtml(data.error)}</div>`;
+                        if (c1) c1.innerHTML = errHtml;
+                        if (c2) c2.innerHTML = errHtml;
                         return;
                     }
                     allFetchedLibraries = data.libraries || [];
-                    allFetchedLibraries.sort((a, b) => a.name.localeCompare(b.name));
-                    renderLibraries(allFetchedLibraries);
+                    allFetchedLibraries.sort((a, b) => (b.deletable ? 1 : 0) - (a.deletable ? 1 : 0) || a.name.localeCompare(b.name));
+                    updateLibraryStats();
+                    applyLibraryFilters();
                 })
                 .catch(() => {
-                    container.innerHTML = `<div class="text-red-400 text-sm text-center py-4">Failed to load libraries.</div>`;
+                    const errHtml = `<div class="col-span-full text-red-400 text-xs text-center py-4">Failed to load libraries.</div>`;
+                    if (c1) c1.innerHTML = errHtml;
+                    if (c2) c2.innerHTML = errHtml;
                 });
+        }
+
+        function updateLibraryStats() {
+            const total = allFetchedLibraries.length;
+            const customCount = allFetchedLibraries.filter(l => l.deletable).length;
+            const coreCount = total - customCount;
+            const elDrawer = document.getElementById('lib-count-drawer');
+            const elTotal = document.getElementById('lib-stat-total');
+            const elUser = document.getElementById('lib-stat-user');
+            const elCore = document.getElementById('lib-stat-core');
+            if (elDrawer) elDrawer.innerText = total;
+            if (elTotal) elTotal.innerText = `${total} Total`;
+            if (elUser) elUser.innerText = `${customCount} Custom ZIP`;
+            if (elCore) elCore.innerText = `${coreCount} ESP Core`;
+        }
+
+        function setLibFilter(filter) {
+            activeLibFilter = filter;
+            ['all', 'user', 'core'].forEach(k => {
+                const b1 = document.getElementById('lib-tab-' + k);
+                const b2 = document.getElementById('usb-lib-tab-' + k);
+                const active = (k === filter);
+                if (b1) b1.className = active
+                    ? 'lib-filter-btn py-1 rounded-md bg-ardTeal text-white font-semibold transition-all shadow-sm'
+                    : 'lib-filter-btn py-1 rounded-md text-ardTextMuted hover:text-white transition-all';
+                if (b2) b2.className = active
+                    ? 'px-3 py-1 rounded-md bg-ardTeal text-white font-semibold transition-all shadow-sm'
+                    : 'px-3 py-1 rounded-md text-ardTextMuted hover:text-white transition-all';
+            });
+            applyLibraryFilters();
+        }
+
+        function syncLibSearch(val) {
+            activeLibQuery = (val || '');
+            const i1 = document.getElementById('lib-search-input');
+            const i2 = document.getElementById('usb-lib-search-input');
+            if (i1 && i1.value !== activeLibQuery) i1.value = activeLibQuery;
+            if (i2 && i2.value !== activeLibQuery) i2.value = activeLibQuery;
+            applyLibraryFilters();
+        }
+
+        function filterLibraries() {
+            const i1 = document.getElementById('lib-search-input');
+            syncLibSearch(i1 ? i1.value : '');
+        }
+
+        function applyLibraryFilters() {
+            const q = activeLibQuery.toLowerCase().trim();
+            const filtered = allFetchedLibraries.filter(lib => {
+                if (activeLibFilter === 'user' && !lib.deletable) return false;
+                if (activeLibFilter === 'core' && lib.deletable) return false;
+                if (q && !lib.name.toLowerCase().includes(q) && !(lib.version || '').toLowerCase().includes(q)) return false;
+                return true;
+            });
+            renderLibraries(filtered);
+        }
+
+        function insertLibraryInclude(libName) {
+            if (!cmEditor) return;
+            const headerName = libName.replace(/\\s+/g, '_') + '.h';
+            const includeLine = `#include <${headerName}>`;
+            saveCurrentTabBuffer();
+            const curIno = sketchFiles["Sketch.ino"] || cmEditor.getValue();
+            if (curIno.includes(includeLine)) {
+                logToOutput(`[Library] ${includeLine} is already present in Sketch.ino.`);
+                return;
+            }
+            sketchFiles["Sketch.ino"] = includeLine + '\\n' + curIno;
+            if (activeSketchFile === "Sketch.ino") {
+                cmEditor.setValue(sketchFiles["Sketch.ino"]);
+            }
+            logToOutput(`[Library] Injected ${includeLine} into Sketch.ino.`);
         }
         
         function renderLibraries(libs) {
-            const container = document.getElementById('lib-list-container');
-            container.innerHTML = '';
-        
-            if (libs.length === 0) {
-                container.innerHTML = '<div class="text-ardTextMuted text-sm text-center py-4">No matching libraries.</div>';
-                return;
-            }
-        
-            libs.forEach(lib => {
-                const libEl = document.createElement('div');
-                libEl.className = 'flex flex-col p-2.5 bg-ardCard border border-ardBorder rounded-lg hover:border-ardTeal transition-colors group';
-                
-                let deleteBtn = '';
-                if (lib.deletable) {
-                    deleteBtn = `
-                        <button class="p-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 rounded text-xs transition-colors opacity-0 group-hover:opacity-100" onclick="uninstallLibrary('${escHtml(lib.name)}')">
-                            <i class="ph-bold ph-trash"></i>
-                        </button>`;
+            const containers = [
+                document.getElementById('lib-list-container'),
+                document.getElementById('usb-lib-list-container')
+            ].filter(Boolean);
+
+            containers.forEach(container => {
+                container.innerHTML = '';
+                if (libs.length === 0) {
+                    container.innerHTML = '<div class="col-span-full text-ardTextMuted text-xs text-center py-8 bg-ardPanel/50 rounded-xl border border-ardBorder/60">No matching libraries found.</div>';
+                    return;
                 }
-        
-                libEl.innerHTML = `
-                    <div class="flex items-center justify-between mb-1">
-                        <div class="text-sm font-semibold text-white truncate pr-2" title="${escHtml(lib.name)}">${escHtml(lib.name)}</div>
-                        ${deleteBtn}
-                    </div>
-                    <div class="text-[10px] text-ardTextMuted">Version: ${escHtml(lib.version || 'Unknown')}</div>
-                `;
-                container.appendChild(libEl);
+
+                libs.forEach(lib => {
+                    const isCustom = !!lib.deletable;
+                    const card = document.createElement('div');
+                    card.className = 'flex flex-col justify-between p-3 bg-gradient-to-b from-ardPanel to-[#191b22] border border-ardBorder rounded-xl hover:border-ardTeal/70 hover:shadow-[0_4px_16px_rgba(0,180,182,0.1)] transition-all group';
+
+                    const badgeTone = isCustom
+                        ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                        : 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30';
+                    const iconTone = isCustom
+                        ? 'bg-ardTeal/15 text-ardTeal border-ardTeal/30'
+                        : 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30';
+                    const iconClass = isCustom ? 'ph-package' : 'ph-cpu';
+
+                    card.innerHTML = `
+                        <div class="flex items-start justify-between gap-2 mb-2.5">
+                            <div class="flex items-center gap-2.5 min-w-0">
+                                <div class="w-8 h-8 rounded-lg border ${iconTone} flex items-center justify-center flex-shrink-0">
+                                    <i class="ph-bold ${iconClass} text-sm"></i>
+                                </div>
+                                <div class="min-w-0">
+                                    <div class="text-xs font-bold text-white truncate group-hover:text-ardTeal transition-colors" title="${escHtml(lib.name)}">${escHtml(lib.name)}</div>
+                                    <div class="flex items-center gap-1.5 mt-0.5">
+                                        <span class="text-[10px] font-mono px-1.5 py-0.2 rounded border ${badgeTone}">${escHtml(lib.version || '1.0.0')}</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="flex items-center justify-between gap-1.5 pt-2 border-t border-ardBorder/60">
+                            <button class="act-inc flex-1 py-1 px-2 rounded-md bg-ardCard hover:bg-ardTeal/20 text-ardTextMain hover:text-ardTeal border border-ardBorder hover:border-ardTeal/40 text-[10px] font-mono font-semibold flex items-center justify-center gap-1 transition-all" title="Insert #include <${escHtml(lib.name)}.h> into editor">
+                                <i class="ph-bold ph-code"></i> + #include
+                            </button>
+                            ${isCustom ? `
+                            <button class="act-del py-1 px-2 rounded-md bg-rose-500/10 hover:bg-rose-500/25 text-rose-400 border border-rose-500/30 text-[10px] font-semibold flex items-center gap-1 transition-colors" title="Uninstall library">
+                                <i class="ph-bold ph-trash"></i>
+                            </button>` : `
+                            <span class="text-[10px] text-ardTextMuted font-mono px-1.5" title="Built-in hardware core library">Built-in</span>`}
+                        </div>
+                    `;
+
+                    card.querySelector('.act-inc').addEventListener('click', () => insertLibraryInclude(lib.name));
+                    const delBtn = card.querySelector('.act-del');
+                    if (delBtn) delBtn.addEventListener('click', () => uninstallLibrary(lib.name));
+                    container.appendChild(card);
+                });
             });
-        }
-        
-        function filterLibraries() {
-            const query = (document.getElementById('lib-search-input').value || '').toLowerCase().trim();
-            const filtered = allFetchedLibraries.filter(lib => lib.name.toLowerCase().includes(query));
-            renderLibraries(filtered);
         }
         
         function handleLibZipSelect(event) {
@@ -4043,42 +4917,168 @@ void loop() {
             renderExamples(filtered);
         }
         
-        function loadExampleFromPath(path) {
-            fetch('/api/lib/example/content', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({path: path})
-            })
-            .then(r => r.json())
-            .then(data => {
-                if (data.code) {
-                    document.getElementById('code-editor').value = data.code;
-                    updateLineNumbers();
-                    logToOutput(`[File] Loaded library example from disk.`);
-                } else {
-                    alert("Failed to load example: " + (data.error || "Unknown error"));
+        // --- MULTI-FILE SKETCH TABS (.ino + .h + .cpp) & EDITOR ACTIONS ---
+        let sketchFiles = { "Sketch.ino": "" };
+        let activeSketchFile = "Sketch.ino";
+
+        function initSketchFiles() {
+            if (cmEditor) {
+                sketchFiles["Sketch.ino"] = cmEditor.getValue();
+            }
+            renderSketchFileTabs();
+        }
+
+        function saveCurrentTabBuffer() {
+            if (cmEditor && activeSketchFile && Object.prototype.hasOwnProperty.call(sketchFiles, activeSketchFile)) {
+                sketchFiles[activeSketchFile] = cmEditor.getValue();
+            }
+        }
+
+        function getPrimaryInoCode() {
+            saveCurrentTabBuffer();
+            return sketchFiles["Sketch.ino"] || (cmEditor ? cmEditor.getValue() : "");
+        }
+
+        function getExtraSketchFiles() {
+            saveCurrentTabBuffer();
+            const extra = {};
+            Object.entries(sketchFiles).forEach(([fname, content]) => {
+                if (fname !== "Sketch.ino") extra[fname] = content;
+            });
+            return extra;
+        }
+
+        function renderSketchFileTabs() {
+            const container = document.getElementById('sketch-file-tabs');
+            if (!container) return;
+            container.innerHTML = '';
+            const isWrapVisible = !document.getElementById('tab-wrap').classList.contains('view-hidden');
+
+            Object.keys(sketchFiles).forEach(fname => {
+                const isActive = (!isWrapVisible && fname === activeSketchFile);
+                const btn = document.createElement('button');
+                btn.className = 'editor-tab h-full flex items-center px-3 gap-1.5 text-xs font-medium transition-colors border-b-2 flex-shrink-0 ' +
+                    (isActive ? 'text-white border-ardTeal bg-ardPanel/60' : 'text-ardTextMuted hover:text-white border-transparent');
+                const icon = fname.endsWith('.ino') ? 'ph-file-code text-ardTeal' : 'ph-file-cpp text-cyan-400';
+                btn.innerHTML = `<i class="ph-bold ${icon}"></i> <span>${escHtml(fname)}</span>`;
+                btn.onclick = () => selectSketchFileTab(fname);
+
+                if (fname !== 'Sketch.ino') {
+                    const renameIcon = document.createElement('i');
+                    renameIcon.className = 'ph-bold ph-pencil-simple text-[10px] text-ardTextMuted hover:text-ardTeal ml-1 p-0.5 rounded';
+                    renameIcon.title = `Rename ${fname}`;
+                    renameIcon.onclick = (e) => {
+                        e.stopPropagation();
+                        renameSketchFileTab(fname);
+                    };
+                    btn.appendChild(renameIcon);
+
+                    const closeIcon = document.createElement('i');
+                    closeIcon.className = 'ph-bold ph-x text-[10px] text-ardTextMuted hover:text-rose-400 ml-0.5 p-0.5 rounded';
+                    closeIcon.title = `Delete ${fname}`;
+                    closeIcon.onclick = (e) => {
+                        e.stopPropagation();
+                        deleteSketchFileTab(fname);
+                    };
+                    btn.appendChild(closeIcon);
                 }
+                container.appendChild(btn);
             });
         }
-        
-        // --- LINE NUMBERS & EDITOR INDENTATION ---
-        
+
+        function selectSketchFileTab(fname) {
+            if (!Object.prototype.hasOwnProperty.call(sketchFiles, fname)) return;
+            saveCurrentTabBuffer();
+            activeSketchFile = fname;
+            document.getElementById('tab-wrap').classList.add('view-hidden');
+            document.getElementById('tab-raw').classList.remove('view-hidden');
+            const wrapBtn = document.getElementById('btn-tab-wrap');
+            if (wrapBtn) {
+                wrapBtn.classList.remove('text-white', 'border-ardTeal');
+                wrapBtn.classList.add('text-ardTextMuted', 'border-transparent');
+            }
+            if (cmEditor) {
+                cmEditor.setValue(sketchFiles[fname] || "");
+            }
+            renderSketchFileTabs();
+        }
+
+        function promptNewSketchFile() {
+            let name = prompt("Enter file name to add to this sketch folder (e.g. config.h, sensors.h, helpers.cpp):", "config.h");
+            if (!name || !name.trim()) return;
+            name = name.trim().replace(/[^A-Za-z0-9_.-]/g, '_');
+            if (!/\.(h|hpp|cpp|c|ino)$/i.test(name)) {
+                name += ".h";
+            }
+            if (Object.prototype.hasOwnProperty.call(sketchFiles, name)) {
+                selectSketchFileTab(name);
+                return;
+            }
+            saveCurrentTabBuffer();
+            if (name.toLowerCase().endsWith('.h') || name.toLowerCase().endsWith('.hpp')) {
+                const guard = name.toUpperCase().replace(/[^A-Z0-9]/g, '_') + '_';
+                sketchFiles[name] = `#ifndef ${guard}\\n#define ${guard}\\n\\n#include <Arduino.h>\\n\\n// Add your header declarations & constants here\\n\\n#endif // ${guard}\\n`;
+                const inc = `#include "${name}"`;
+                if (!(sketchFiles["Sketch.ino"] || "").includes(inc)) {
+                    sketchFiles["Sketch.ino"] = inc + "\\n" + (sketchFiles["Sketch.ino"] || "");
+                }
+            } else {
+                sketchFiles[name] = `#include <Arduino.h>\\n\\n// ${name}\\n`;
+            }
+            selectSketchFileTab(name);
+            logToOutput(`[File] Created '${name}' tab in sketch folder.`);
+        }
+
+        function renameSketchFileTab(oldName) {
+            if (oldName === 'Sketch.ino') return;
+            let newName = prompt(`Rename '${oldName}' to:`, oldName);
+            if (!newName || !newName.trim() || newName.trim() === oldName) return;
+            newName = newName.trim().replace(/[^A-Za-z0-9_.-]/g, '_');
+            if (!/\.(h|hpp|cpp|c|ino)$/i.test(newName)) newName += ".h";
+            if (Object.prototype.hasOwnProperty.call(sketchFiles, newName)) {
+                return alert(`A file named '${newName}' already exists in this sketch.`);
+            }
+            saveCurrentTabBuffer();
+            sketchFiles[newName] = sketchFiles[oldName];
+            delete sketchFiles[oldName];
+            if (activeSketchFile === oldName) activeSketchFile = newName;
+            renderSketchFileTabs();
+            logToOutput(`[File] Renamed '${oldName}' to '${newName}'.`);
+        }
+
+        function deleteSketchFileTab(fname) {
+            if (fname === 'Sketch.ino') return;
+            if (!confirm(`Delete '${fname}' from this sketch?`)) return;
+            delete sketchFiles[fname];
+            if (activeSketchFile === fname) {
+                activeSketchFile = 'Sketch.ino';
+                if (cmEditor) cmEditor.setValue(sketchFiles['Sketch.ino'] || '');
+            }
+            renderSketchFileTabs();
+            logToOutput(`[File] Removed '${fname}' from sketch folder.`);
+        }
 
         function newSketch() {
-            if (confirm("Reset editor to empty starter sketch?")) {
-                cmEditor.setValue(`void setup() {\\n  Serial.begin(115200);\\n  Serial.println("WiFeY Sketch Initialized");\\n}\\n\\nvoid loop() {\\n  delay(1000);\\n}`);
+            if (confirm("Reset editor to empty starter sketch? (Clears extra tabs)")) {
+                const starter = `void setup() {\\n  Serial.begin(115200);\\n  Serial.println("WiFeY Sketch Initialized");\\n}\\n\\nvoid loop() {\\n  delay(1000);\\n}`;
+                sketchFiles = { "Sketch.ino": starter };
+                activeSketchFile = "Sketch.ino";
+                if (cmEditor) cmEditor.setValue(starter);
+                renderSketchFileTabs();
                 logToOutput("[File] Created new starter sketch.");
             }
         }
 
         function copyEditorCode() {
             navigator.clipboard.writeText(cmEditor.getValue());
-            logToOutput("[File] Code copied to clipboard.");
+            logToOutput(`[File] Copied ${activeSketchFile} to clipboard.`);
         }
 
         function loadExampleSketch(key) {
             if (EXAMPLE_SKETCHES[key]) {
-                cmEditor.setValue(EXAMPLE_SKETCHES[key].replace(/\\n/g, '\\n'));
+                sketchFiles = { "Sketch.ino": EXAMPLE_SKETCHES[key] };
+                activeSketchFile = "Sketch.ino";
+                selectSketchFileTab("Sketch.ino");
                 logToOutput(`[File] Loaded example sketch: ${key}`);
             }
         }
@@ -4088,8 +5088,19 @@ void loop() {
                 method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({path: path})
             })
             .then(r => r.json()).then(data => {
-                if (data.code) {
-                    cmEditor.setValue(data.code);
+                if (data.files && typeof data.files === 'object') {
+                    sketchFiles = Object.assign({}, data.files);
+                    if (!sketchFiles['Sketch.ino']) {
+                        sketchFiles['Sketch.ino'] = data.code || '';
+                    }
+                    activeSketchFile = 'Sketch.ino';
+                    selectSketchFileTab('Sketch.ino');
+                    const fnames = Object.keys(sketchFiles);
+                    logToOutput(`[File] Loaded full example folder (${fnames.length} file${fnames.length > 1 ? 's' : ''}: ${fnames.join(', ')}).`);
+                } else if (data.code) {
+                    sketchFiles = { "Sketch.ino": data.code };
+                    activeSketchFile = "Sketch.ino";
+                    selectSketchFileTab("Sketch.ino");
                     logToOutput(`[File] Loaded library example from disk.`);
                 } else {
                     alert("Failed to load example: " + (data.error || "Unknown error"));
@@ -4098,13 +5109,14 @@ void loop() {
         }
         
         function fetchPreview() {
-            const rawCode = cmEditor.getValue();
+            const rawCode = getPrimaryInoCode();
             const payload = {
                 ssid: document.getElementById('top-wifi-ssid').value,
                 pass: document.getElementById('top-wifi-pass').value,
                 api_url: NGROK_API_URL, 
                 topic: currentTopic, 
-                code: rawCode
+                code: rawCode,
+                fqbn: document.getElementById('prov_board_selector').value
             };
             document.getElementById('preview-textarea').value = "Generating smart OTA preview...";
             fetch('/preview', { 
@@ -4115,24 +5127,62 @@ void loop() {
         }
         
         function buildPayload(extra) {
+            const codeVal = getPrimaryInoCode();
+            const extraFiles = getExtraSketchFiles();
             return Object.assign({
                 ssid: document.getElementById('top-wifi-ssid').value,
                 pass: document.getElementById('top-wifi-pass').value,
                 api_url: NGROK_API_URL,
                 topic: currentTopic,
-                code: cmEditor.getValue(),
+                code: codeVal,
+                extra_files: extraFiles,
                 fqbn: document.getElementById('prov_board_selector').value
             }, extra || {});
         }
-        // --- Bottom Panel Resizer Logic ---
+
+        // --- Bottom Panel Resizer & Expand/Collapse Logic ---
         const resizer = document.getElementById('panel-resizer');
         const bottomPanel = document.getElementById('bottom-panel');
         let isResizing = false;
+        let savedPanelHeight = 255;
+        let isPanelCollapsed = false;
         
         resizer.addEventListener('mousedown', function(e) {
-            e.preventDefault(); 
+            e.preventDefault();
+            isResizing = true;
+            isPanelCollapsed = false;
             document.body.style.cursor = 'ns-resize'; 
         });
+
+        function toggleBottomPanelCollapse() {
+            const icon = document.getElementById('icon-panel-collapse');
+            if (!isPanelCollapsed) {
+                savedPanelHeight = bottomPanel.offsetHeight || 255;
+                bottomPanel.style.minHeight = '36px';
+                bottomPanel.style.height = '36px';
+                isPanelCollapsed = true;
+                if (icon) icon.className = 'ph-bold ph-caret-up text-xs';
+            } else {
+                bottomPanel.style.minHeight = '110px';
+                bottomPanel.style.height = Math.max(180, savedPanelHeight) + 'px';
+                isPanelCollapsed = false;
+                if (icon) icon.className = 'ph-bold ph-caret-down text-xs';
+            }
+        }
+
+        function toggleBottomPanelSize() {
+            const maxH = Math.floor(window.innerHeight * 0.62);
+            bottomPanel.style.minHeight = '110px';
+            isPanelCollapsed = false;
+            const icon = document.getElementById('icon-panel-collapse');
+            if (icon) icon.className = 'ph-bold ph-caret-down text-xs';
+            if (bottomPanel.offsetHeight < maxH - 40) {
+                savedPanelHeight = bottomPanel.offsetHeight || 255;
+                bottomPanel.style.height = maxH + 'px';
+            } else {
+                bottomPanel.style.height = (savedPanelHeight || 255) + 'px';
+            }
+        }
         
         window.addEventListener('mousemove', function(e) {
             if (!isResizing) return;
@@ -4158,11 +5208,19 @@ void loop() {
 
         // --- NAVIGATION & TABS ---
         function switchMainView(viewId) {
-            document.getElementById('view-editor').classList.add('view-hidden');
-            document.getElementById('view-usb').classList.add('view-hidden');
-            document.getElementById('view-fleets').classList.add('view-hidden');
-            document.getElementById('view-settings').classList.add('view-hidden');
-            document.getElementById(viewId).classList.remove('view-hidden');
+            ['view-editor', 'view-usb', 'view-libraries', 'view-fleets', 'view-settings'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.classList.add('view-hidden');
+            });
+            const target = document.getElementById(viewId);
+            if (target) target.classList.remove('view-hidden');
+
+            // Auto-collapse the floating library sidebar drawer when navigating
+            const sidebar = document.getElementById('lib-sidebar');
+            if (sidebar && !sidebar.classList.contains('hidden')) {
+                sidebar.classList.add('hidden');
+                sidebar.classList.remove('flex');
+            }
 
             document.querySelectorAll('.nav-btn').forEach(btn => {
                 btn.classList.remove('text-ardTeal', 'bg-ardHover', 'border', 'border-ardBorder');
@@ -4175,21 +5233,30 @@ void loop() {
             }
 
             if (viewId === 'view-usb') loadSerialPorts();
+            if (viewId === 'view-libraries') fetchLibraries();
             if (viewId === 'view-fleets') { loadFleetDashboard(); loadCollabState(); }
             if (viewId === 'view-settings') loadSettings();
         }
 
         function switchEditorTab(tabId) {
+            saveCurrentTabBuffer();
             document.querySelectorAll('.editor-content').forEach(el => el.classList.add('view-hidden'));
-            document.querySelectorAll('.editor-tab').forEach(el => {
-                el.classList.remove('text-white', 'border-ardTeal');
-                el.classList.add('text-ardTextMuted', 'border-transparent');
-            });
             document.getElementById(tabId).classList.remove('view-hidden');
-            const activeBtn = document.getElementById('btn-' + tabId);
-            activeBtn.classList.remove('text-ardTextMuted', 'border-transparent');
-            activeBtn.classList.add('text-white', 'border-ardTeal');
-            if (tabId === 'tab-wrap') fetchPreview();
+            const wrapBtn = document.getElementById('btn-tab-wrap');
+            if (tabId === 'tab-wrap') {
+                if (wrapBtn) {
+                    wrapBtn.classList.remove('text-ardTextMuted', 'border-transparent');
+                    wrapBtn.classList.add('text-white', 'border-ardTeal');
+                }
+                renderSketchFileTabs();
+                fetchPreview();
+            } else {
+                if (wrapBtn) {
+                    wrapBtn.classList.remove('text-white', 'border-ardTeal');
+                    wrapBtn.classList.add('text-ardTextMuted', 'border-transparent');
+                }
+                renderSketchFileTabs();
+            }
         }
 
         function switchPanelTab(tabId) {
@@ -4219,13 +5286,23 @@ void loop() {
             for (var i = 0; i < dropdowns.length; i++) dropdowns[i].classList.remove('show');
         }
 
-        window.onclick = function(event) {
+        window.addEventListener('mousedown', function(event) {
             if (!event.target.closest('#fleet-selector-btn') && !event.target.closest('.dropdown-content') && !event.target.closest('button')) {
                 closeAllMenus();
             }
-        };
+            // Collapse #lib-sidebar when clicking anywhere outside of it
+            const sidebar = document.getElementById('lib-sidebar');
+            if (sidebar && !sidebar.classList.contains('hidden')) {
+                if (!event.target.closest('#lib-sidebar')) {
+                    sidebar.classList.add('hidden');
+                    sidebar.classList.remove('flex');
+                }
+            }
+        });
 
         // --- REAL-TIME STREAMING & OUTPUT LOGGING ---
+        let outputLineCount = 1;
+
         function logToOutput(msg) {
             const outputPanel = document.getElementById('panel-out');
             const logEntry = document.createElement('div');
@@ -4236,13 +5313,13 @@ void loop() {
             else if (msg.includes("[Deploy]")) color = "text-cyan-400 font-medium";
             else if (msg.includes("[Hardware]") || msg.includes("[Upload]")) color = "text-amber-400 font-medium";
             else if (msg.includes("[CLI]") || msg.includes("Sketch uses") || msg.includes("Global variables")) color = "text-[#9cdcfe]";
-            else if (msg.includes("[System]")) color = "text-emerald-400";
+            else if (msg.includes("[System]") || msg.includes("[Library]")) color = "text-emerald-400";
             else if (msg.includes("[File]")) color = "text-yellow-400";
             else if (msg.includes("Error") || msg.includes("❌") || msg.includes("[ERROR]") || msg.includes("FAILED") || msg.includes("error:")) color = "text-red-400 font-medium";
             
             logEntry.className = color + " font-mono text-xs whitespace-pre-wrap leading-5";
             
-            if (msg.startsWith("[CLI]") || msg.startsWith("  ") || msg.startsWith("\t")) {
+            if (msg.startsWith("[CLI]") || msg.startsWith("  ") || msg.startsWith("\\t")) {
                 logEntry.textContent = msg;
             } else {
                 logEntry.textContent = `[${now}] ${msg}`;
@@ -4250,12 +5327,32 @@ void loop() {
             
             outputPanel.appendChild(logEntry);
             outputPanel.scrollTop = outputPanel.scrollHeight;
+            outputLineCount++;
+            const badge = document.getElementById('out-line-badge');
+            if (badge) badge.innerText = outputLineCount;
             switchPanelTab('panel-out');
         }
 
         function clearCurrentPanel() {
-            document.getElementById('panel-out').innerHTML = '<div class="text-ardTextMuted">Logs cleared.</div>';
-            document.getElementById('serial_out').innerHTML = '';
+            const isSerialActive = !document.getElementById('panel-serial').classList.contains('view-hidden');
+            if (isSerialActive) {
+                document.getElementById('serial_out').innerHTML = '';
+                serialRxBytes = 0;
+                updateSerialRxCounter();
+            } else {
+                document.getElementById('panel-out').innerHTML = '<div class="text-ardTextMuted">[System] Output console cleared.</div>';
+                outputLineCount = 1;
+                const badge = document.getElementById('out-line-badge');
+                if (badge) badge.innerText = '1';
+            }
+        }
+
+        function copyActivePanelLogs() {
+            const isSerialActive = !document.getElementById('panel-serial').classList.contains('view-hidden');
+            const targetEl = document.getElementById(isSerialActive ? 'serial_out' : 'panel-out');
+            if (!targetEl) return;
+            navigator.clipboard.writeText(targetEl.innerText || '');
+            logToOutput(`[System] Copied ${isSerialActive ? 'Serial Monitor' : 'Output Console'} logs to clipboard.`);
         }
 
         // Generic stream reader: reads chunks from a streaming response and feeds lines to logToOutput
@@ -4879,55 +5976,66 @@ void loop() {
             }
         }
 
-        // --- PREVIEW WRAPPED CODE ---
-        function fetchPreview() {
-            const rawCode = document.getElementById('code-editor').value;
-            const payload = {
-                ssid: document.getElementById('top-wifi-ssid').value,
-                pass: document.getElementById('top-wifi-pass').value,
-                api_url: NGROK_API_URL, 
-                topic: currentTopic, 
-                code: rawCode
-            };
-            document.getElementById('preview-textarea').value = "Generating smart OTA preview...";
-            fetch('/preview', { 
-                method: 'POST', 
-                headers: { 'Content-Type': 'application/json' }, 
-                body: JSON.stringify(payload) 
-            })
-            .then(res => res.json()).then(data => { 
-                document.getElementById('preview-textarea').value = data.code; 
-            })
-            .catch(err => { 
-                document.getElementById('preview-textarea').value = "// Error: " + err; 
-            });
-        }
-
-        // --- SERIAL PORT OPERATIONS (USB + wireless LAN serial monitor) ---
+        // --- SERIAL PORT OPERATIONS (USB + wireless LAN serial monitor with RX counter & command history) ---
         let serialMode = 'usb';
         let wserialSource = null;
         let wserialKey = null;
+        let serialRxBytes = 0;
+        let serialCmdHistory = [];
+        let serialHistoryIdx = -1;
 
-        function appendSerialText(text) {
+        function updateSerialRxCounter() {
+            const el = document.getElementById('serial-rx-counter');
+            if (!el) return;
+            if (serialRxBytes < 1024) el.innerText = `RX: ${serialRxBytes} B`;
+            else el.innerText = `RX: ${(serialRxBytes / 1024).toFixed(1)} KB`;
+        }
+
+        function appendSerialText(text, isTx = false) {
             const out = document.getElementById('serial_out');
-            out.appendChild(document.createTextNode(text));
+            const emptyState = document.getElementById('serial-empty-state');
+            if (emptyState) emptyState.remove();
+            if (!isTx) {
+                serialRxBytes += (text || '').length;
+                updateSerialRxCounter();
+            }
+            const span = document.createElement('span');
+            if (isTx) span.className = 'text-ardTeal font-semibold';
+            else if (text.includes('[*]') || text.includes('[WiFeY]')) span.className = 'text-cyan-300';
+            span.textContent = text;
+            out.appendChild(span);
             if (document.getElementById('serial-autoscroll').checked) out.scrollTop = out.scrollHeight;
         }
 
-        function setSerialConnectedUI(connected) {
+        function setSerialConnectedUI(connected, labelText = '') {
             document.getElementById('btn-serial-connect').style.display = connected ? 'none' : 'inline-flex';
             document.getElementById('btn-serial-disconnect').style.display = connected ? 'inline-flex' : 'none';
+            const dot = document.getElementById('serial-status-dot');
+            const tabDot = document.getElementById('serial-tab-dot');
+            const txt = document.getElementById('serial-status-text');
+            const pill = document.getElementById('serial-status-pill');
+            if (connected) {
+                if (dot) dot.className = 'w-1.5 h-1.5 rounded-full bg-emerald-400 pulse-live';
+                if (tabDot) tabDot.className = 'w-2 h-2 rounded-full bg-emerald-400 pulse-live ml-1';
+                if (txt) txt.innerText = labelText || 'Connected';
+                if (pill) pill.className = 'inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-mono bg-emerald-500/15 border border-emerald-500/30 text-emerald-300';
+            } else {
+                if (dot) dot.className = 'w-1.5 h-1.5 rounded-full bg-gray-500';
+                if (tabDot) tabDot.className = 'w-2 h-2 rounded-full bg-gray-500 ml-1';
+                if (txt) txt.innerText = 'Offline';
+                if (pill) pill.className = 'inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-mono bg-ardBg border border-ardBorder text-ardTextMuted';
+            }
         }
 
         function setSerialMode(mode) {
             serialMode = mode;
             const lan = mode === 'lan';
-            document.getElementById('serial_port').style.display = lan ? 'none' : '';
-            document.getElementById('serial_baud').style.display = lan ? 'none' : '';
-            document.getElementById('wserial_device').style.display = lan ? '' : 'none';
-            document.getElementById('wserial_ip').style.display = lan ? '' : 'none';
-            document.getElementById('serial-mode-usb').className = 'px-2.5 py-1 text-[11px] font-semibold flex items-center gap-1 ' + (lan ? 'bg-ardPanel text-ardTextMuted hover:text-white' : 'bg-ardTeal text-white');
-            document.getElementById('serial-mode-lan').className = 'px-2.5 py-1 text-[11px] font-semibold flex items-center gap-1 ' + (lan ? 'bg-ardTeal text-white' : 'bg-ardPanel text-ardTextMuted hover:text-white');
+            const usbCtrl = document.getElementById('serial-usb-controls');
+            const lanCtrl = document.getElementById('serial-lan-controls');
+            if (usbCtrl) usbCtrl.className = lan ? 'hidden items-center gap-1.5' : 'flex items-center gap-1.5';
+            if (lanCtrl) lanCtrl.className = lan ? 'flex items-center gap-1.5' : 'hidden items-center gap-1.5';
+            document.getElementById('serial-mode-usb').className = 'px-2.5 py-1 rounded-md text-[11px] font-semibold flex items-center gap-1 transition-all ' + (lan ? 'text-ardTextMuted hover:text-white' : 'bg-ardTeal text-white');
+            document.getElementById('serial-mode-lan').className = 'px-2.5 py-1 rounded-md text-[11px] font-semibold flex items-center gap-1 transition-all ' + (lan ? 'bg-ardTeal text-white' : 'text-ardTextMuted hover:text-white');
             setSerialConnectedUI(lan ? !!wserialSource : !!serialEventSource);
             if (lan && liveData) populateWserialDevices(liveData);
         }
@@ -4989,8 +6097,8 @@ void loop() {
                     alert("Serial connection error: " + res.error);
                     return;
                 }
-                setSerialConnectedUI(true);
-                appendSerialText(`\\n[*] Connected to ${port} @ ${baud} baud\\n`);
+                setSerialConnectedUI(true, `${port} @ ${baud}`);
+                appendSerialText(`[*] Connected to ${port} @ ${baud} baud\\n`, true);
 
                 serialEventSource = new EventSource('/api/serial/stream');
                 serialEventSource.onmessage = function(e) {
@@ -5018,7 +6126,7 @@ void loop() {
                     serialEventSource = null;
                 }
                 setSerialConnectedUI(false);
-                if (!quiet) appendSerialText('\\n[*] Serial Connection Terminated.\\n');
+                if (!quiet) appendSerialText('\\n[*] Serial Connection Terminated.\\n', true);
             });
         }
 
@@ -5033,12 +6141,12 @@ void loop() {
             }).then(r => r.json().then(j => ({ok: r.ok, j: j}))).then(({ok, j}) => {
                 if (!ok || j.error) { alert(j.error || 'Could not open the wireless serial connection.'); return; }
                 wserialKey = j.key;
-                setSerialConnectedUI(true);
-                appendSerialText(`\\n[*] Wireless serial connected to ${j.key} (${j.ip}:${j.port})\\n`);
+                setSerialConnectedUI(true, `LAN ${j.key} (${j.ip})`);
+                appendSerialText(`[*] Wireless serial connected to ${j.key} (${j.ip}:${j.port})\\n`, true);
                 wserialSource = new EventSource('/api/wserial/stream?key=' + encodeURIComponent(j.key));
                 wserialSource.onmessage = function(e) {
                     const data = JSON.parse(e.data);
-                    if (data.closed) { disconnectWirelessSerial(true); appendSerialText('\\n[*] Wireless serial ended.\\n'); return; }
+                    if (data.closed) { disconnectWirelessSerial(true); appendSerialText('\\n[*] Wireless serial ended.\\n', true); return; }
                     let text = data.text;
                     if (document.getElementById('serial-timestamps').checked) {
                         text = `[${new Date().toLocaleTimeString()}] ${text}`;
@@ -5060,7 +6168,31 @@ void loop() {
                     body: JSON.stringify({key: key})
                 }).catch(() => {});
             }
-            if (!quiet) appendSerialText('\\n[*] Wireless serial disconnected.\\n');
+            if (!quiet) appendSerialText('\\n[*] Wireless serial disconnected.\\n', true);
+        }
+
+        function handleSerialInputKey(e) {
+            const input = document.getElementById('serial-input');
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                sendSerialCommand();
+            } else if (e.key === 'ArrowUp') {
+                if (serialCmdHistory.length > 0 && serialHistoryIdx < serialCmdHistory.length - 1) {
+                    e.preventDefault();
+                    serialHistoryIdx++;
+                    input.value = serialCmdHistory[serialCmdHistory.length - 1 - serialHistoryIdx];
+                }
+            } else if (e.key === 'ArrowDown') {
+                if (serialHistoryIdx > 0) {
+                    e.preventDefault();
+                    serialHistoryIdx--;
+                    input.value = serialCmdHistory[serialCmdHistory.length - 1 - serialHistoryIdx];
+                } else if (serialHistoryIdx === 0) {
+                    e.preventDefault();
+                    serialHistoryIdx = -1;
+                    input.value = '';
+                }
+            }
         }
 
         function sendSerialCommand() {
@@ -5071,6 +6203,12 @@ void loop() {
             const lan = serialMode === 'lan';
             if (lan && !wserialKey) return alert('Connect to a LAN node first.');
 
+            if (!serialCmdHistory.length || serialCmdHistory[serialCmdHistory.length - 1] !== text) {
+                serialCmdHistory.push(text);
+                if (serialCmdHistory.length > 50) serialCmdHistory.shift();
+            }
+            serialHistoryIdx = -1;
+
             fetch(lan ? '/api/wserial/send' : '/api/serial/send', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -5079,7 +6217,7 @@ void loop() {
                 if (res.error) logToOutput(`[Serial] Send Error: ${res.error}`);
                 else {
                     input.value = '';
-                    appendSerialText(`> ${text}\\n`);
+                    appendSerialText(`TX > ${text}\\n`, true);
                 }
             });
         }
@@ -5156,16 +6294,7 @@ void loop() {
         // --- COMPILATION & OTA DEPLOYMENT (Verify once, deploy without recompiling) ---
         let activeBin = null;   // staged binary: {file, path, name, size}
 
-        function buildPayload(extra) {
-            return Object.assign({
-                ssid: document.getElementById('top-wifi-ssid').value,
-                pass: document.getElementById('top-wifi-pass').value,
-                api_url: NGROK_API_URL,
-                topic: currentTopic,
-                code: document.getElementById('code-editor').value,
-                fqbn: document.getElementById('prov_board_selector').value
-            }, extra || {});
-        }
+
 
         function setVerifyChip(text, kind) {
             const chip = document.getElementById('verify-chip');
@@ -5524,19 +6653,35 @@ void loop() {
         // --- GOOGLE OAUTH & PROFILE MANAGEMENT ---
         var authPollInterval = null;
 
+        let currentAuthUrl = '';
+
+        function openExternalAuthUrl(e) {
+            if (e) e.preventDefault();
+            if (!currentAuthUrl) return;
+            if (window.pywebview && window.pywebview.api && window.pywebview.api.open_url) {
+                window.pywebview.api.open_url(currentAuthUrl);
+            } else {
+                window.open(currentAuthUrl, '_blank', 'noopener,noreferrer');
+            }
+        }
+
         function startGoogleAuth() {
             const spinner = document.getElementById('auth-spinner');
-            if (spinner) spinner.classList.remove('hidden');
+            if (spinner) {
+                spinner.classList.remove('hidden');
+                spinner.classList.add('flex');
+            }
 
             fetch('/api/auth/login', { method: 'POST' })
                 .then(r => r.json())
                 .then(data => {
                     if (!data.success || !data.auth_url) {
-                        if (spinner) spinner.classList.add('hidden');
+                        if (spinner) { spinner.classList.add('hidden'); spinner.classList.remove('flex'); }
                         alert('Authentication Notice: ' + (data.error || 'Failed to initiate login.'));
                         return;
                     }
 
+                    currentAuthUrl = data.auth_url;
                     const fallbackContainer = document.getElementById('auth-fallback-container');
                     const authLink = document.getElementById('auth-link');
                     if (fallbackContainer && authLink) {
@@ -5544,13 +6689,42 @@ void loop() {
                         fallbackContainer.classList.remove('hidden');
                     }
 
+                    // If backend did not open browser directly (e.g. remote browser session), open via pywebview/window.open
+                    if (!data.opened_by_server) {
+                        if (window.pywebview && window.pywebview.api && window.pywebview.api.open_url) {
+                            window.pywebview.api.open_url(data.auth_url);
+                        } else {
+                            window.open(data.auth_url, '_blank', 'noopener,noreferrer');
+                        }
+                    }
+
                     logToOutput('[Auth] Google OAuth authorization URL opened. Awaiting login...');
                     if (authPollInterval) clearInterval(authPollInterval);
                     authPollInterval = setInterval(() => checkAuthStatus(false), 1500);
                 })
                 .catch(err => {
-                    if (spinner) spinner.classList.add('hidden');
+                    if (spinner) { spinner.classList.add('hidden'); spinner.classList.remove('flex'); }
                     alert('Error starting Google Login: ' + err);
+                });
+        }
+
+        function continueOfflineMode() {
+            fetch('/api/auth/local_bypass', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    if (authPollInterval) { clearInterval(authPollInterval); authPollInterval = null; }
+                    if (data.user) updateUserProfileUI(data.user);
+                    const overlay = document.getElementById('auth-overlay');
+                    if (overlay) {
+                        overlay.classList.add('opacity-0', 'pointer-events-none');
+                        setTimeout(() => overlay.classList.add('hidden'), 300);
+                    }
+                    logToOutput('[Auth] Entered Local / Offline Studio Mode.');
+                    refreshLiveNow();
+                })
+                .catch(() => {
+                    const overlay = document.getElementById('auth-overlay');
+                    if (overlay) overlay.classList.add('hidden');
                 });
         }
         
@@ -5668,6 +6842,54 @@ void loop() {
                 });
         }
 
+        let lastLookedUpCatalog = { fleets: [], nodes: [] };
+
+        function populateCollabTargetDropdown() {
+            const scope = document.getElementById('collab_scope_type').value;
+            const sel = document.getElementById('collab_target_select');
+            const input = document.getElementById('collab_target_id');
+            if (!sel) return;
+
+            const fleets = lastLookedUpCatalog.fleets || [];
+            const nodes = lastLookedUpCatalog.nodes || [];
+
+            if (scope === 'all' || (fleets.length === 0 && nodes.length === 0)) {
+                sel.classList.add('hidden');
+                return;
+            }
+
+            sel.innerHTML = '';
+            if (scope === 'fleet') {
+                if (fleets.length === 0) {
+                    sel.classList.add('hidden');
+                    return;
+                }
+                fleets.forEach(f => {
+                    const opt = document.createElement('option');
+                    opt.value = f;
+                    opt.textContent = `Fleet: ${f}`;
+                    sel.appendChild(opt);
+                });
+                sel.classList.remove('hidden');
+                sel.value = fleets[0];
+                if (input) input.value = fleets[0];
+            } else if (scope === 'node') {
+                if (nodes.length === 0) {
+                    sel.classList.add('hidden');
+                    return;
+                }
+                nodes.forEach(n => {
+                    const opt = document.createElement('option');
+                    opt.value = n.id;
+                    opt.textContent = `Node: ${n.id} (Fleet: ${n.fleet} • Build #${n.build})`;
+                    sel.appendChild(opt);
+                });
+                sel.classList.remove('hidden');
+                sel.value = nodes[0].id;
+                if (input) input.value = nodes[0].id;
+            }
+        }
+
         function onCollabScopeChange() {
             const scope = document.getElementById('collab_scope_type').value;
             const row = document.getElementById('collab_target_row');
@@ -5679,12 +6901,13 @@ void loop() {
             } else {
                 row.classList.remove('hidden');
                 if (scope === 'fleet') {
-                    label.innerText = 'Target Fleet Name';
-                    if (input.value === '*' || !input.value) input.value = 'DefaultFleet';
+                    label.innerText = 'Target Fleet (Select from Lookup dropdown or type)';
+                    if (input.value === '*' || !input.value || input.value === 'node_1') input.value = 'DefaultFleet';
                 } else {
-                    label.innerText = 'Target Node / Device ID';
+                    label.innerText = 'Target Node (Select from Lookup dropdown or type)';
                     if (input.value === '*' || input.value === 'DefaultFleet') input.value = 'node_1';
                 }
+                populateCollabTargetDropdown();
             }
         }
 
@@ -5697,25 +6920,37 @@ void loop() {
                 .then(r => r.json())
                 .then(res => {
                     hint.classList.remove('hidden');
-                    datalist.innerHTML = '';
+                    if (datalist) datalist.innerHTML = '';
                     if (res.success && res.catalog) {
                         const fleets = res.catalog.fleets || [];
                         const nodes = res.catalog.nodes || [];
+                        lastLookedUpCatalog = { fleets: fleets, nodes: nodes };
                         hint.className = 'text-[10px] text-emerald-400 mt-1 font-mono';
-                        hint.innerText = `Found ${fleets.length} fleet(s) and ${nodes.length} node(s) for ${email}.`;
-                        fleets.forEach(f => {
-                            const opt = document.createElement('option');
-                            opt.value = f;
-                            opt.label = `Fleet: ${f}`;
-                            datalist.appendChild(opt);
-                        });
-                        nodes.forEach(n => {
-                            const opt = document.createElement('option');
-                            opt.value = n.id;
-                            opt.label = `Node: ${n.id} (${n.fleet})`;
-                            datalist.appendChild(opt);
-                        });
+                        hint.innerText = `Loaded ${nodes.length} node(s) and ${fleets.length} fleet(s) for ${email} — select directly from the dropdown below!`;
+                        if (datalist) {
+                            fleets.forEach(f => {
+                                const opt = document.createElement('option');
+                                opt.value = f;
+                                opt.label = `Fleet: ${f}`;
+                                datalist.appendChild(opt);
+                            });
+                            nodes.forEach(n => {
+                                const opt = document.createElement('option');
+                                opt.value = n.id;
+                                opt.label = `Node: ${n.id} (${n.fleet})`;
+                                datalist.appendChild(opt);
+                            });
+                        }
+                        // If owner has nodes and scope was fleet/node, auto-populate the dropdown
+                        if (nodes.length > 0 && document.getElementById('collab_scope_type').value === 'all') {
+                            document.getElementById('collab_scope_type').value = 'node';
+                            onCollabScopeChange();
+                        } else {
+                            populateCollabTargetDropdown();
+                        }
                     } else {
+                        lastLookedUpCatalog = { fleets: [], nodes: [] };
+                        populateCollabTargetDropdown();
                         hint.className = 'text-[10px] text-amber-300 mt-1';
                         hint.innerText = res.error || 'Could not fetch catalog; enter target name manually.';
                     }
@@ -5730,12 +6965,16 @@ void loop() {
         function sendCollabAccessRequest() {
             const ownerEmail = (document.getElementById('collab_owner_email').value || '').trim();
             const scopeType = document.getElementById('collab_scope_type').value;
-            const targetId = scopeType === 'all' ? '*' : (document.getElementById('collab_target_id').value || '').trim();
-            const durationMin = parseInt(document.getElementById('collab_duration_min').value, 10) || 60;
+            const selVal = document.getElementById('collab_target_select')?.value || '';
+            const inputVal = (document.getElementById('collab_target_id').value || '').trim();
+            const targetId = scopeType === 'all' ? '*' : (inputVal || selVal);
+            const durVal = parseFloat(document.getElementById('collab_duration_val')?.value || '30');
+            const durUnit = parseInt(document.getElementById('collab_duration_unit')?.value || '1', 10);
+            const durationMin = Math.max(1, Math.round((isNaN(durVal) ? 30 : durVal) * (isNaN(durUnit) ? 1 : durUnit)));
             const note = (document.getElementById('collab_note').value || '').trim();
 
             if (!ownerEmail) return alert("Please enter the owner's Google email address.");
-            if (scopeType !== 'all' && !targetId) return alert("Please enter the target Fleet name or Node ID.");
+            if (scopeType !== 'all' && !targetId) return alert("Please select or enter the target Fleet name or Node ID.");
 
             fetch('/api/collab/request', {
                 method: 'POST',
@@ -5762,13 +7001,13 @@ void loop() {
         }
 
         function respondCollabRequest(requestId, decision) {
-            const sel = document.getElementById('dur_sel_' + requestId);
-            let durationMin = sel ? parseInt(sel.value, 10) : 60;
-            if (sel && sel.value === 'custom') {
-                const customStr = prompt('Enter assigned permission duration in minutes:', '90');
-                if (!customStr) return;
-                durationMin = parseInt(customStr.trim(), 10);
-                if (isNaN(durationMin) || durationMin <= 0) return alert('Please enter a valid number of minutes.');
+            const valEl = document.getElementById('dur_val_' + requestId);
+            const unitEl = document.getElementById('dur_unit_' + requestId);
+            const rawVal = valEl ? parseFloat(valEl.value) : 60;
+            const unitMult = unitEl ? parseInt(unitEl.value, 10) : 1;
+            const durationMin = Math.max(1, Math.round((isNaN(rawVal) ? 60 : rawVal) * (isNaN(unitMult) ? 1 : unitMult)));
+            if (decision === 'approve' && (!durationMin || durationMin <= 0)) {
+                return alert('Please enter a valid duration greater than 0.');
             }
             fetch('/api/collab/respond', {
                 method: 'POST',
@@ -5842,11 +7081,6 @@ void loop() {
             } else {
                 inList.innerHTML = incoming.map(r => {
                     const reqMin = parseInt(r.requested_duration_min, 10) || 60;
-                    const presets = [15, 30, 60, 120, 240, 480, 1440, 10080];
-                    const opts = presets.map(m => {
-                        const lbl = m < 60 ? `${m}m` : (m < 1440 ? `${m/60}h` : `${m/1440}d`);
-                        return `<option value="${m}" ${m === reqMin ? 'selected' : ''}>Permit ${lbl}</option>`;
-                    }).join('') + `<option value="custom">Custom mins...</option>`;
                     return `
                         <div class="p-2.5 rounded-lg bg-ardCard border border-amber-500/30 flex flex-wrap items-center justify-between gap-2">
                             <div class="min-w-0">
@@ -5854,7 +7088,12 @@ void loop() {
                                 <div class="text-[11px] text-ardTextMuted">Requested: ${reqMin} mins${r.note ? ' • "' + escHtml(r.note) + '"' : ''}</div>
                             </div>
                             <div class="flex items-center gap-1.5 flex-shrink-0">
-                                <select id="dur_sel_${escHtml(r.request_id)}" class="flat-input text-[11px] py-1 px-2 rounded text-white font-mono">${opts}</select>
+                                <input type="number" id="dur_val_${escHtml(r.request_id)}" min="1" max="100000" value="${reqMin}" class="flat-input w-16 text-[11px] py-1 px-2 rounded text-white font-mono" title="Enter custom duration">
+                                <select id="dur_unit_${escHtml(r.request_id)}" class="flat-input text-[11px] py-1 px-1.5 rounded text-white font-mono">
+                                    <option value="1" selected>Mins</option>
+                                    <option value="60">Hours</option>
+                                    <option value="1440">Days</option>
+                                </select>
                                 <button onclick="respondCollabRequest('${escHtml(r.request_id)}', 'approve')" class="px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 font-semibold text-[11px]">Permit</button>
                                 <button onclick="respondCollabRequest('${escHtml(r.request_id)}', 'deny')" class="px-2 py-1 rounded bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30 text-[11px]">Deny</button>
                             </div>
@@ -6013,9 +7252,28 @@ def auth_login():
     }
     auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(params)}"
 
-    import webbrowser
-    webbrowser.open_new_tab(auth_url)
-    return jsonify({"success": True, "auth_url": auth_url, "state": state})
+    opened = False
+    try:
+        if os.name == 'nt':
+            os.startfile(auth_url)
+            opened = True
+        else:
+            opened = bool(webbrowser.open_new_tab(auth_url))
+    except Exception as e:
+        print(f"[Auth] Browser launch fallback: {e}")
+    return jsonify({"success": True, "auth_url": auth_url, "state": state, "opened_by_server": opened})
+
+@app.route('/api/auth/local_bypass', methods=['POST'])
+def auth_local_bypass():
+    prof = db.get_user_profile()
+    if not prof.get("google_sub") and not prof.get("email"):
+        db.set_user_profile(
+            google_sub="local_workspace",
+            email="local@wifey.studio",
+            id_token="local_mode_token",
+            picture=""
+        )
+    return jsonify({"success": True, "status": True, "authenticated": True, "user": db.get_user_profile()})
 
 @app.route('/api/auth/callback')
 def auth_callback():
@@ -6060,6 +7318,9 @@ def auth_callback():
     token_data = token_resp.json()
     id_token = token_data.get("id_token", "")
     access_token = token_data.get("access_token", "")
+    refresh_token = token_data.get("refresh_token", "")
+    expires_in = int(token_data.get("expires_in", 3600) or 3600)
+    token_expiry = time.time() + expires_in
 
     # Fetch user profile data from Google UserInfo endpoint
     user_info = {}
@@ -6099,12 +7360,14 @@ def auth_callback():
     except Exception as e:
         print(f"[Auth Callback Recovery] {e}")
 
-    # Save to database
+    # Save to database (including refresh_token and token_expiry for uninterrupted cloud sessions)
     db.set_user_profile(
         google_sub=google_sub,
         email=email,
         id_token=id_token,
-        picture=picture
+        picture=picture,
+        refresh_token=refresh_token,
+        token_expiry=token_expiry
     )
     threading.Thread(target=sync_account_to_cloud, kwargs={"force": True}, daemon=True).start()
 
@@ -6208,9 +7471,10 @@ def serial_stream():
 def preview_code():
     data = request.json or {}
     try:
+        fqbn = apply_ota_partition(data.get('fqbn', DEFAULT_FQBN))
         wrapped = generate_wrapped_code(
             data.get('ssid'), data.get('pass'), data.get('api_url'),
-            data.get('topic'), data.get('code')
+            data.get('topic'), data.get('code'), fqbn=fqbn
         )
         return jsonify({"code": wrapped})
     except Exception as e:
@@ -6256,6 +7520,13 @@ def refresh_presigned_url(url):
         print(f"[R2] Re-sign error: {e}")
         return url
 
+def _is_lan_request(req):
+    """Returns True when the request arrived directly from a private LAN IP (not via a remote proxy)."""
+    if req.headers.get("X-Forwarded-For") or "ngrok" in (req.host or "").lower():
+        return False
+    addr = str(req.remote_addr or "")
+    return addr.startswith(("127.", "10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31."))
+
 @app.route('/api/manifest', methods=['GET'])
 def api_manifest():
     fleet_id = request.args.get('fleet', 'DefaultFleet')
@@ -6271,7 +7542,7 @@ def api_manifest():
     device_info = db.get_device(device_id) if device_id else None
     if device_info:
         expected_token = device_info.get("device_token")
-        if expected_token and token and token != expected_token and token != "secret_abc123":
+        if expected_token and token and token not in (expected_token, "secret_abc123", "dt_fallback"):
             return jsonify({"error": "Unauthorized: invalid device token"}), 401
         fleet_id = device_info.get("fleet", fleet_id)
         db.update_device_seen(device_id, current_build=reported_build)
@@ -6295,6 +7566,18 @@ def api_manifest():
                     firmware_url = s_fl.get("firmware_url") or firmware_url
                 break
     firmware_url = refresh_presigned_url(firmware_url)
+
+    # Smart LAN / Tunnel URL adaptation so OTA always succeeds on both LAN and WAN
+    lan_name = f"{safe_name(fleet_id)}_build_{int(target_build)}.bin"
+    lan_file = os.path.join(LAN_FIRMWARE_DIR, lan_name)
+    if _is_lan_request(request) and os.path.isfile(lan_file):
+        # Serving directly over LAN HTTP avoids TLS RAM overhead on ESP8266/ESP32 and is 10x faster
+        firmware_url = lan_firmware_url(lan_name)
+    elif not _is_lan_request(request) and firmware_url and "/api/lan/firmware/" in firmware_url:
+        # Remote node querying via Ngrok tunnel: rewrite local LAN IP to the public tunnel host
+        fname = firmware_url.split("/api/lan/firmware/")[-1]
+        scheme = request.headers.get("X-Forwarded-Proto", request.scheme or "https")
+        firmware_url = f"{scheme}://{request.host}/api/lan/firmware/{fname}"
 
     return jsonify({"target_build": int(target_build), "download_url": firmware_url or ""})
 
@@ -6432,46 +7715,26 @@ def lan_firmware_route(filename):
 def cloud_sync():
     global db
     user_prof = db.get_user_profile()
-    token = request.headers.get('Authorization', '').replace('Bearer ', '').strip() or user_prof.get("id_token")
+    raw_token = request.headers.get('Authorization', '').replace('Bearer ', '').strip() or user_prof.get("id_token")
+    token = get_valid_id_token(raw_token)
     google_sub = request.args.get('google_sub') or user_prof.get("google_sub")
 
     if request.method == 'GET':
         if not google_sub:
             return jsonify({"error": "Missing google_sub for cloud sync"}), 400
 
-        # Try Cloudflare Worker Gateway first
-        if WORKER_BASE_URL and token:
-            try:
-                sync_url = f"{WORKER_BASE_URL}/users/{google_sub}/wifey_db.json"
-                resp = requests.get(sync_url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
-                if resp.status_code == 200:
-                    remote_db = resp.json()
-                    with db.lock:
-                        db._data = remote_db
-                    db.save()
-                    emit_ui_log("[Cloud Sync] Successfully downloaded database from Cloudflare Worker.")
-                    return jsonify({"success": True, "db": db.get_all()})
-            except Exception as e:
-                print(f"[Worker Sync GET] Error: {e}")
+        remote_db = cloud_store_read_json(google_sub, token=token)
+        if isinstance(remote_db, dict) and (remote_db.get("devices") is not None or remote_db.get("manifest") is not None):
+            with db.lock:
+                db._data = remote_db
+            db.load()
+            db.save(sync_cloud=False)
+            emit_ui_log("[Cloud Sync] Successfully downloaded and verified database from cloud storage.")
+            return jsonify({"success": True, "db": db.get_all()})
 
-        # Fallback to direct R2 S3 client
-        if R2_ACCOUNT_ID and R2_ACCESS_KEY and R2_SECRET_KEY:
-            try:
-                s3 = get_s3_client()
-                obj = s3.get_object(Bucket=R2_BUCKET, Key=f"users/{google_sub}/wifey_db.json")
-                remote_db = json.loads(obj['Body'].read().decode('utf-8'))
-                with db.lock:
-                    db._data = remote_db
-                db.save()
-                emit_ui_log("[Cloud Sync] Successfully downloaded database from Cloudflare R2.")
-                return jsonify({"success": True, "db": db.get_all()})
-            except Exception as e:
-                return jsonify({"error": f"Cloud download failed: {str(e)}"}), 500
-
-        return jsonify({"error": "No cloud credentials configured for download"}), 400
+        return jsonify({"error": "Cloud database not found or cloud credentials not configured."}), 404
 
     else:
-        # POST - Upload wifey_db.json
         data = request.json or {}
         sub = data.get('google_sub') or google_sub
         email = data.get('email') or user_prof.get("email")
@@ -6479,48 +7742,19 @@ def cloud_sync():
         if sub:
             db.set_user_profile(google_sub=sub, email=email, id_token=new_token)
             google_sub = sub
-            token = new_token
+            token = get_valid_id_token(new_token)
 
         if not google_sub:
             return jsonify({"error": "Missing google_sub for cloud sync"}), 400
 
-        db_json_bytes = json.dumps(db.get_all(), indent=2).encode('utf-8')
+        ok = cloud_store_write_json(google_sub, db.get_all(), token=token)
+        if email:
+            cloud_store_write_json(email_storage_key(email), db.get_all(), token=token)
+        if ok:
+            emit_ui_log("[Cloud Sync] Successfully synchronized database to cloud storage.")
+            return jsonify({"success": True})
 
-        # Try Cloudflare Worker Gateway first
-        if WORKER_BASE_URL and token:
-            try:
-                sync_url = f"{WORKER_BASE_URL}/users/{google_sub}/wifey_db.json"
-                resp = requests.put(
-                    sync_url,
-                    data=db_json_bytes,
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json"
-                    },
-                    timeout=15
-                )
-                if resp.status_code in (200, 201, 204):
-                    emit_ui_log("[Cloud Sync] Successfully uploaded database to Cloudflare Worker.")
-                    return jsonify({"success": True})
-            except Exception as e:
-                print(f"[Worker Sync POST] Error: {e}")
-
-        # Fallback to direct R2 S3 client
-        if R2_ACCOUNT_ID and R2_ACCESS_KEY and R2_SECRET_KEY:
-            try:
-                s3 = get_s3_client()
-                s3.put_object(
-                    Bucket=R2_BUCKET,
-                    Key=f"users/{google_sub}/wifey_db.json",
-                    Body=db_json_bytes,
-                    ContentType="application/json"
-                )
-                emit_ui_log("[Cloud Sync] Successfully uploaded database to Cloudflare R2.")
-                return jsonify({"success": True})
-            except Exception as e:
-                return jsonify({"error": f"Cloud upload failed: {str(e)}"}), 500
-
-        return jsonify({"error": "No cloud credentials configured for upload"}), 400
+        return jsonify({"error": "Cloud upload failed across all configured providers."}), 500
 
 @app.route('/api/events/stream')
 def events_stream():
@@ -6560,9 +7794,36 @@ void loop() { delay(1000); }
 """
 WARMUP_FALLBACK_CODE = "void setup() { Serial.println(\"warm-up\"); }\nvoid loop() { delay(1000); }\n"
 
-def write_sketch_if_changed(code):
-    """Only touches the sketch when its text changed, so the compiler keeps its cached objects."""
+def write_sketch_if_changed(code, extra_files=None):
+    """Writes WiFeYSketch.ino and any companion .h/.cpp/.c files into SKETCH_DIR."""
     os.makedirs(SKETCH_DIR, exist_ok=True)
+    extra_files = extra_files if isinstance(extra_files, dict) else {}
+
+    valid_aux_names = set()
+    for fname, content in extra_files.items():
+        clean_name = os.path.basename(str(fname or "").strip())
+        if not clean_name or clean_name in ("Sketch.ino", "WiFeYSketch.ino"):
+            continue
+        if clean_name.lower().endswith((".h", ".hpp", ".cpp", ".c", ".ino")):
+            valid_aux_names.add(clean_name)
+            aux_path = os.path.join(SKETCH_DIR, clean_name)
+            try:
+                old_c = open(aux_path, "r", encoding="utf-8").read() if os.path.exists(aux_path) else None
+                if old_c != str(content):
+                    with open(aux_path, "w", encoding="utf-8", newline="\n") as af:
+                        af.write(str(content))
+            except Exception as e:
+                print(f"[Sketch Aux Write] {clean_name}: {e}")
+
+    for existing in os.listdir(SKETCH_DIR):
+        if existing == "WiFeYSketch.ino":
+            continue
+        if existing.lower().endswith((".h", ".hpp", ".cpp", ".c", ".ino")) and existing not in valid_aux_names:
+            try:
+                os.remove(os.path.join(SKETCH_DIR, existing))
+            except OSError:
+                pass
+
     try:
         with open(SKETCH_FILE, "r", encoding="utf-8") as f:
             if f.read() == code:
@@ -6587,8 +7848,9 @@ def warmup_toolchain():
             try:
                 code = generate_wrapped_code("", "", "http://127.0.0.1:5050", "", user_code, build_num=0)
                 write_sketch_if_changed(code)
+                fqbn_warm = apply_ota_partition(DEFAULT_FQBN)
                 res = subprocess.run(
-                    [cli, "compile", "--fqbn", apply_ota_partition(DEFAULT_FQBN), "--build-path", BUILD_CACHE_DIR, "-j", "0", SKETCH_FILE],
+                    [cli, "compile", "--fqbn", fqbn_warm, "--build-path", get_board_build_dir(fqbn_warm), "-j", "0", SKETCH_FILE],
                     capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
                 if res.returncode == 0:
                     ok = True
@@ -6660,11 +7922,13 @@ def get_current_binary():
         return f.read(), src
 
 def validate_firmware_image(data):
-    """OTA needs the app-only image (starts with the ESP image magic 0xE9), not a merged flash image."""
+    """OTA needs an ESP32/ESP8266 app image (starts with 0xE9 magic or 0x1F 0x8B GZIP magic)."""
     if not data or len(data) < 4096:
-        return "That file is too small to be an ESP32 firmware image."
-    if data[0] != 0xE9:
-        return ("This does not look like an OTA app image (ESP32 app images start with byte 0xE9). "
+        return "That file is too small to be a valid ESP32/ESP8266 firmware image."
+    is_esp_bin = (data[0] == 0xE9)
+    is_gzip_bin = (len(data) > 2 and data[0] == 0x1F and data[1] == 0x8B)
+    if not (is_esp_bin or is_gzip_bin):
+        return ("This does not look like an OTA app image (ESP app images start with byte 0xE9 or GZIP 0x1F8B). "
                 "Use the app-only .bin (e.g. Sketch.ino.bin), not a .merged.bin / full flash image.")
     return ""
 
@@ -6709,7 +7973,7 @@ def compile_stream_route():
         proc = None
         try:
             try:
-                write_sketch_if_changed(final_code)
+                write_sketch_if_changed(final_code, info.get("extra_files"))
             except Exception as e:
                 yield f"[Build] [ERROR] Failed writing sketch: {e}\n"
                 return
@@ -6726,10 +7990,12 @@ def compile_stream_route():
             else:
                 yield "[Build] Launching arduino-cli compiler... (first run takes ~2 mins)\n"
 
+            board_build_dir = get_board_build_dir(info["fqbn"])
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
             compile_cmd = [
                 cli_path, "compile",
                 "--fqbn", info["fqbn"],
-                "--build-path", BUILD_CACHE_DIR,
+                "--build-path", board_build_dir,
                 "--output-dir", OUTPUT_DIR,
                 "-j", "0",
                 SKETCH_FILE
@@ -7108,23 +8374,56 @@ def collab_catalog_route():
     if not owner_email:
         return jsonify({"error": "Enter the owner's Google email address first."}), 400
     o_ekey = email_storage_key(owner_email)
-    box = cloud_store_read_json(f"{o_ekey}_collab")
-    if isinstance(box, dict) and isinstance(box.get("public_catalog"), dict):
-        return jsonify({"success": True, "owner_email": owner_email, "catalog": box["public_catalog"]})
 
-    # Fallback: read owner's primary email slot if available
+    # Check both the owner's collab mailbox and primary email slot and merge all discovered fleets & nodes
+    box = cloud_store_read_json(f"{o_ekey}_collab")
     owner_db = cloud_store_read_json(o_ekey)
+
+    fleets_set = []
+    nodes_map = {}
+
+    if isinstance(box, dict) and isinstance(box.get("public_catalog"), dict):
+        for f in (box["public_catalog"].get("fleets") or []):
+            if f and f not in fleets_set:
+                fleets_set.append(f)
+        for n in (box["public_catalog"].get("nodes") or []):
+            if isinstance(n, dict) and n.get("id"):
+                nodes_map[n["id"]] = {
+                    "id": n["id"],
+                    "fleet": n.get("fleet", "DefaultFleet"),
+                    "build": int(n.get("build", 100))
+                }
+
     if isinstance(owner_db, dict):
-        fleets = list((owner_db.get("manifest") or {}).keys())
-        nodes = [
-            {"id": did, "fleet": d.get("fleet", "DefaultFleet"), "build": int(d.get("current_build", 100))}
-            for did, d in (owner_db.get("devices") or {}).items() if isinstance(d, dict)
-        ]
-        return jsonify({"success": True, "owner_email": owner_email, "catalog": {"fleets": fleets, "nodes": nodes}})
+        for f in (owner_db.get("manifest") or {}).keys():
+            if f and f not in fleets_set:
+                fleets_set.append(f)
+        for did, d in (owner_db.get("devices") or {}).items():
+            if isinstance(d, dict):
+                fl = d.get("fleet", "DefaultFleet")
+                if fl and fl not in fleets_set:
+                    fleets_set.append(fl)
+                nodes_map[did] = {
+                    "id": did,
+                    "fleet": fl,
+                    "build": int(d.get("current_build", 100))
+                }
+
+    if fleets_set or nodes_map:
+        if "DefaultFleet" not in fleets_set:
+            fleets_set.insert(0, "DefaultFleet")
+        return jsonify({
+            "success": True,
+            "owner_email": owner_email,
+            "catalog": {
+                "fleets": fleets_set,
+                "nodes": list(nodes_map.values())
+            }
+        })
 
     return jsonify({
         "success": False,
-        "error": f"No published fleet catalog found yet for '{owner_email}'. You can still type the Fleet or Node ID manually and send the request."
+        "error": f"No published fleet/node catalog found yet for '{owner_email}'. Ensure '{owner_email}' has signed in or synced at least once, or enter the Fleet/Node ID manually."
     })
 
 @app.route('/api/collab/request', methods=['POST'])
@@ -7150,7 +8449,7 @@ def collab_request_route():
         return jsonify({"error": f"Please specify the target {scope_type} name/ID."}), 400
 
     try:
-        duration_min = max(1, min(43200, int(data.get("duration_min", 60))))
+        duration_min = max(1, min(525600, int(data.get("duration_min", 60))))
     except Exception:
         duration_min = 60
 
@@ -7192,7 +8491,7 @@ def collab_request_route():
         db._data.setdefault("outgoing_requests", []).append(req_obj)
     db.save(sync_cloud=True)
     threading.Thread(target=sync_account_to_cloud, kwargs={"force": True}, daemon=True).start()
-    broadcast_lan_collab({"target_email": owner_email, "event": "access_request"})
+    broadcast_lan_collab({"target_email": owner_email, "event": "access_request", "request_obj": req_obj})
 
     msg = f"[Collab] Sent permission request to {owner_email} for {scope_type}: '{target_id}' ({duration_min} mins)."
     emit_ui_log(msg)
@@ -7207,7 +8506,7 @@ def collab_respond_route():
         return jsonify({"error": "Invalid request_id or decision."}), 400
 
     try:
-        assigned_duration_min = max(1, min(43200, int(data.get("duration_min", 60))))
+        assigned_duration_min = max(1, min(525600, int(data.get("duration_min", 60))))
     except Exception:
         assigned_duration_min = 60
 
@@ -7261,7 +8560,31 @@ def collab_respond_route():
     sync_account_to_cloud(force=True)
 
     requester_email = normalize_email(target_req.get("requester_email"))
-    broadcast_lan_collab({"target_email": requester_email, "event": "request_responded"})
+    # Push grant directly into requester's collaboration mailbox so requester receives it immediately
+    if requester_email and grant_obj:
+        req_ekey = email_storage_key(requester_email)
+        req_box = cloud_store_read_json(f"{req_ekey}_collab") or {
+            "owner_email": requester_email,
+            "owner_sub": target_req.get("requester_sub", ""),
+            "updated_at": now,
+            "public_catalog": {"fleets": [], "nodes": []},
+            "inbox_requests": [],
+            "active_grants": [],
+            "shared_mutations": []
+        }
+        grants_by_id = {g.get("grant_id"): g for g in (req_box.get("active_grants") or []) if isinstance(g, dict) and g.get("grant_id")}
+        grants_by_id[grant_obj["grant_id"]] = grant_obj
+        req_box["active_grants"] = list(grants_by_id.values())
+        req_box["updated_at"] = now
+        cloud_store_write_json(f"{req_ekey}_collab", req_box)
+
+    broadcast_lan_collab({
+        "target_email": requester_email,
+        "event": "request_responded",
+        "decision": decision,
+        "request_id": request_id,
+        "grant_obj": grant_obj
+    })
 
     if decision == "approve":
         msg = f"✅ [Collab] Permitted {requester_email} to access {target_req.get('scope_type')} '{target_req.get('target_id')}' for {assigned_duration_min} minute(s)."
@@ -7482,8 +8805,9 @@ def flash_stream_route():
                 yield f"[Hardware] [ERROR] Failed to write provisioning sketch: {e}\n"
                 return
 
-            yield f"[Build] Compiling Pull-OTA bootloader sketch for {fqbn} (shared build cache)...\n"
-            compile_cmd = [cli_path, "compile", "--fqbn", fqbn, "--build-path", BUILD_CACHE_DIR, "-j", "0", SKETCH_FILE]
+            board_build_dir = get_board_build_dir(fqbn)
+            yield f"[Build] Compiling Pull-OTA bootloader sketch for {fqbn} (board build cache)...\n"
+            compile_cmd = [cli_path, "compile", "--fqbn", fqbn, "--build-path", board_build_dir, "-j", "0", SKETCH_FILE]
             proc_comp = subprocess.Popen(compile_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                          encoding='utf-8', errors='replace', bufsize=1, creationflags=CREATE_NO_WINDOW)
             for line in proc_comp.stdout:
@@ -7496,7 +8820,7 @@ def flash_stream_route():
                 return
 
             yield f"[Upload] Starting USB upload to {port} @ {baud} baud...\n"
-            upload_cmd = [cli_path, "upload", "-p", port, "--fqbn", fqbn, "--input-dir", BUILD_CACHE_DIR,
+            upload_cmd = [cli_path, "upload", "-p", port, "--fqbn", fqbn, "--input-dir", board_build_dir,
                           "--upload-property", f"upload.speed={baud}", SKETCH_FILE]
             proc_up = subprocess.Popen(upload_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                        encoding='utf-8', errors='replace', bufsize=1, creationflags=CREATE_NO_WINDOW)
@@ -7744,14 +9068,100 @@ def get_library_examples():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/lib/search', methods=['GET'])
+def search_online_libraries():
+    query = (request.args.get('q') or '').strip()
+    if not query or len(query) < 2:
+        return jsonify({"libraries": []})
+    cli_path = SETUP_STATE.get("cli_path") or find_arduino_cli()
+    if not cli_path:
+        return jsonify({"error": "Arduino CLI not found"}), 500
+    try:
+        res = subprocess.run(
+            [cli_path, "lib", "search", query, "--format", "json"],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=25, creationflags=CREATE_NO_WINDOW
+        )
+        data = json.loads(res.stdout or "{}")
+        results = []
+        installed_map = get_user_libraries()
+        for item in (data.get("libraries") or [])[:40]:
+            name = item.get("name", "")
+            latest = item.get("latest", {}) or {}
+            versions = item.get("available_versions") or []
+            if not versions and latest.get("version"):
+                versions = [latest.get("version")]
+            versions = list(reversed(versions[-12:]))
+            results.append({
+                "name": name,
+                "author": latest.get("author", "Community"),
+                "version": latest.get("version", ""),
+                "versions": versions,
+                "sentence": latest.get("sentence", "") or latest.get("paragraph", ""),
+                "website": latest.get("website", ""),
+                "category": latest.get("category", "General"),
+                "installed": name in installed_map,
+                "installed_version": installed_map.get(name, {}).get("version", "")
+            })
+        return jsonify({"libraries": results})
+    except Exception as e:
+        return jsonify({"error": f"Library search failed: {str(e)}"}), 500
+
+@app.route('/api/lib/install', methods=['POST'])
+def install_online_library():
+    data = request.json or {}
+    name = (data.get('name') or '').strip()
+    version = (data.get('version') or '').strip()
+    if not name:
+        return jsonify({"success": False, "error": "Library name is required"}), 400
+    cli_path = SETUP_STATE.get("cli_path") or find_arduino_cli()
+    if not cli_path:
+        return jsonify({"success": False, "error": "Arduino CLI not found"}), 500
+    target_spec = f"{name}@{version}" if version else name
+    try:
+        emit_ui_log(f"[Library] Downloading & installing '{target_spec}' from Arduino Library Registry...")
+        res = subprocess.run(
+            [cli_path, "lib", "install", target_spec],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=120, creationflags=CREATE_NO_WINDOW
+        )
+        if res.returncode == 0:
+            emit_ui_log(f"🎉 [Library] Installed '{target_spec}' successfully!")
+            return jsonify({"success": True, "installed": target_spec})
+        err_msg = (res.stderr or "").strip() or (res.stdout or "").strip() or "Installation failed"
+        return jsonify({"success": False, "error": err_msg}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route('/api/lib/example/content', methods=['POST'])
 def get_example_content():
     path = (request.json or {}).get('path', '')
     if not path or not os.path.exists(path) or not (path.endswith('.ino') or path.endswith('.pde')):
         return jsonify({"error": "Invalid example file path"}), 400
     try:
+        example_dir = os.path.dirname(os.path.abspath(path))
+        main_filename = os.path.basename(path)
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
-            return jsonify({"code": f.read()})
+            main_code = f.read()
+
+        # Fetch all companion files (.h, .hpp, .cpp, .c, extra .ino) from the example folder
+        files = {"Sketch.ino": main_code}
+        for fname in sorted(os.listdir(example_dir)):
+            fpath = os.path.join(example_dir, fname)
+            if not os.path.isfile(fpath) or fname == main_filename:
+                continue
+            if fname.lower().endswith(('.h', '.hpp', '.cpp', '.c', '.ino', '.pde')):
+                try:
+                    with open(fpath, 'r', encoding='utf-8', errors='replace') as af:
+                        files[fname] = af.read()
+                except Exception:
+                    pass
+
+        return jsonify({
+            "code": main_code,
+            "main_file": main_filename,
+            "files": files
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
@@ -7774,9 +9184,10 @@ class DesktopApi:
     def open_url(self, url):
         import webbrowser
         try:
-            # Use webbrowser for all OS types; it safely handles URL encoding
-            webbrowser.open_new_tab(url)
-            return True
+            if os.name == 'nt':
+                os.startfile(url)
+                return True
+            return bool(webbrowser.open_new_tab(url))
         except Exception as e:
             print(f"[DesktopApi] Error opening URL: {e}")
             return False
